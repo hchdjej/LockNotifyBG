@@ -145,16 +145,29 @@ jobs:
         run: |
           DEB=$(cat /tmp/deb_path.txt)
           echo "包路径: $DEB"
-          dpkg-deb -I "$DEB"
-          echo "---- 文件清单 ----"
-          dpkg-deb -c "$DEB"
-          cp "$DEB" ./LockNotifyBG.deb
-          echo "已复制到:", ./LockNotifyBG.deb
+          ls -lh "$DEB"
+          if command -v dpkg-deb >/dev/null 2>&1; then
+            dpkg-deb -I "$DEB"
+            echo "---- 文件清单 ----"
+            dpkg-deb -c "$DEB"
+          else
+            echo "(macOS 无 dpkg-deb，改用 ar 解包查看 control)"
+            cd /tmp && rm -rf debcheck && mkdir debcheck && cd debcheck
+            ar x "$OLDPWD/$DEB" 2>/dev/null || ar x "$GITHUB_WORKSPACE/$DEB"
+            ls -la
+            if [ -f control.tar.gz ]; then
+              tar -xzf control.tar.gz -O ./control 2>/dev/null | head -20 || true
+            fi
+          fi
+          cp "$DEB" "$GITHUB_WORKSPACE/LockNotifyBG.deb" 2>/dev/null || cp "$DEB" ./LockNotifyBG.deb
+          ls -lh "$GITHUB_WORKSPACE/LockNotifyBG.deb" 2>/dev/null || ls -lh ./LockNotifyBG.deb
 
       - name: Upload deb artifact
         uses: actions/upload-artifact@v4
         with:
           name: LockNotifyBG-rootless
-          path: LockNotifyBG.deb
+          path: |
+            LockNotifyBG.deb
+            packages/*.deb
           if-no-files-found: error
           retention-days: 90
