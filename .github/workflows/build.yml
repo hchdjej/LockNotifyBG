@@ -142,25 +142,48 @@ jobs:
           echo "找到: $DEB"
 
       - name: Show package info
+        id: show
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          exec > >(tee /tmp/show.log) 2>&1
           DEB=$(cat /tmp/deb_path.txt)
           echo "包路径: $DEB"
           ls -lh "$DEB"
           if command -v dpkg-deb >/dev/null 2>&1; then
             dpkg-deb -I "$DEB"
-            echo "---- 文件清单 ----"
             dpkg-deb -c "$DEB"
           else
-            echo "(macOS 无 dpkg-deb，改用 ar 解包查看 control)"
-            cd /tmp && rm -rf debcheck && mkdir debcheck && cd debcheck
-            ar x "$OLDPWD/$DEB" 2>/dev/null || ar x "$GITHUB_WORKSPACE/$DEB"
+            echo "(无 dpkg-deb，用 ar 解包)"
+            mkdir -p /tmp/debcheck && cd /tmp/debcheck
+            ar x "$GITHUB_WORKSPACE/$DEB"
             ls -la
-            if [ -f control.tar.gz ]; then
-              tar -xzf control.tar.gz -O ./control 2>/dev/null | head -20 || true
-            fi
+            for f in control.tar.* data.tar.*; do
+              [ -f "$f" ] && echo "--- $f ---" && tar -tf "$f" | head -20
+            done
           fi
-          cp "$DEB" "$GITHUB_WORKSPACE/LockNotifyBG.deb" 2>/dev/null || cp "$DEB" ./LockNotifyBG.deb
-          ls -lh "$GITHUB_WORKSPACE/LockNotifyBG.deb" 2>/dev/null || ls -lh ./LockNotifyBG.deb
+          cp "$GITHUB_WORKSPACE/$DEB" "$GITHUB_WORKSPACE/LockNotifyBG.deb"
+          echo "复制完成"
+          exit 0
+
+      - name: Report show-step diag on failure
+        if: steps.show.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "Show package info 失败 — run ${{ github.run_id }}"
+            echo ""
+            echo "### deb_path.txt"
+            cat /tmp/deb_path.txt 2>/dev/null || echo "(不存在)"
+            echo ""
+            echo "### show.log"
+            cat /tmp/show.log 2>/dev/null || echo "(不存在)"
+          } > /tmp/showdiag.txt
+          gh issue create --repo "${{ github.repository }}" \
+            --title "show-fail-${{ github.run_id }}" --body-file /tmp/showdiag.txt || true
+          exit 1
 
       - name: Upload deb artifact
         uses: actions/upload-artifact@v4
