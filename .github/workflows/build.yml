@@ -52,10 +52,18 @@ jobs:
           set +e
           make clean > /tmp/build.log 2>&1
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless >> /tmp/build.log 2>&1
-          echo "BUILD_EXIT=$?" >> /tmp/build.log
+          RC=$?
           set -e
+          echo "make package 退出码: $RC"
           echo "===== 构建日志（尾部 120 行）====="
           tail -120 /tmp/build.log
+          echo ""
+          echo "===== packages 目录 ====="
+          ls -lah packages/ 2>&1 || echo "packages 目录不存在"
+          if [ "$RC" -ne 0 ] || ! ls packages/*.deb >/dev/null 2>&1; then
+            echo "::error::构建未产出 deb（make 退出码 $RC）"
+            exit 1
+          fi
 
       - name: Publish build log to summary
         if: always()
@@ -85,13 +93,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BODY=$(tail -c 60000 /tmp/build.log | sed 's/`/'"'"'/g')
           {
-            echo "构建失败日志（run ${{ github.run_id }}）"
+            echo "构建失败诊断 — run ${{ github.run_id }}"
             echo ""
-            echo '```'
-            echo "$BODY"
-            echo '```'
+            echo "### 关键错误"
+            grep -iE "error|fatal|No such|not found|Error [0-9]|undefined" /tmp/build.log 2>/dev/null | head -60 || echo "(无匹配)"
+            echo ""
+            echo "### 完整日志尾部"
+            tail -100 /tmp/build.log 2>/dev/null
           } > /tmp/issue_body.txt
           gh issue create \
             --repo "${{ github.repository }}" \
