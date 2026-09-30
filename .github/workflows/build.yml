@@ -115,7 +115,6 @@ jobs:
 
       - name: Locate deb output
         id: locate
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -123,15 +122,13 @@ jobs:
           find . -name "*.deb" -not -path "./.git/*" 2>/dev/null || true
           echo "---- packages 目录 ----"
           ls -lah packages/ 2>&1 || echo "packages 不存在"
-          echo "---- .theos 目录 ----"
-          ls -lah .theos/ 2>&1 | head -20 || echo ".theos 不存在"
           DEB=$(find . -name "*.deb" -not -path "./.git/*" 2>/dev/null | head -n1)
           if [ -z "$DEB" ]; then
-            echo "::warning::未找到 deb，收集诊断信息"
+            echo "::error::未找到 deb 产物"
             {
               echo "未找到 deb 产物 — run ${{ github.run_id }}"
               echo ""
-              echo "### find 结果"
+              echo "### 目录结构"
               find . -maxdepth 3 -type d -not -path "./.git*" 2>/dev/null | head -40
               echo ""
               echo "### 构建日志尾部"
@@ -141,23 +138,23 @@ jobs:
               --title "no-deb-${{ github.run_id }}" --body-file /tmp/diag.txt || true
             exit 1
           fi
-          echo "DEB_PATH=$DEB" >> $GITHUB_OUTPUT
+          echo "$DEB" > /tmp/deb_path.txt
           echo "找到: $DEB"
 
       - name: Show package info
-        if: steps.locate.outputs.DEB_PATH != ''
         run: |
-          DEB="${{ steps.locate.outputs.DEB_PATH }}"
+          DEB=$(cat /tmp/deb_path.txt)
           echo "包路径: $DEB"
           dpkg-deb -I "$DEB"
           echo "---- 文件清单 ----"
           dpkg-deb -c "$DEB"
+          cp "$DEB" ./LockNotifyBG.deb
+          echo "已复制到:", ./LockNotifyBG.deb
 
       - name: Upload deb artifact
-        if: steps.locate.outputs.DEB_PATH != ''
         uses: actions/upload-artifact@v4
         with:
           name: LockNotifyBG-rootless
-          path: ${{ steps.locate.outputs.DEB_PATH }}
+          path: LockNotifyBG.deb
           if-no-files-found: error
           retention-days: 90
