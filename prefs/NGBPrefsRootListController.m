@@ -72,6 +72,7 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 @property (nonatomic, retain) NSMutableArray *specifiers;
 - (PSSpecifier *)specifierAtIndexPath:(NSIndexPath *)indexPath;
 - (void)reloadSpecifiers;
+- (void)reloadSpecifier:(PSSpecifier *)specifier animated:(BOOL)animated;
 @end
 
 #define kPrefsDomain        @"com.hchdjej.locknotifybg"
@@ -151,7 +152,11 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 
 #pragma mark - 诊断日志
 
+// 采集开关：设置为 0 即可出无日志的正式版
+#define LNB_DEBUG_LOG 0
+
 static void LNBLog(NSString *fmt, ...) {
+#if LNB_DEBUG_LOG
     va_list args;
     va_start(args, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
@@ -173,6 +178,7 @@ static void LNBLog(NSString *fmt, ...) {
         [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
         [fh closeFile];
     }
+#endif
 }
 
 #pragma mark - specifier 构造辅助
@@ -183,32 +189,35 @@ static PSSpecifier *LNBGroup(NSString *header, NSString *footer) {
     return s;
 }
 
-// 开关行：set/get 传 nil，值读写走 PSViewController 的
-// readPreferenceValue: / setPreferenceValue:specifier: 钩子
-static PSSpecifier *LNBSwitch(NSString *label, NSString *key) {
+// 开关行。
+//
+// 【踩坑】set/get 传 nil 时，偏好设置框架自己去找取值路径：
+// 它只认 `defaults` + `key` 这套「框架内建 plist 托管」，并**不会**回头调用
+// 控制器的 setPreferenceValue:specifier: —— 结果就是开关能拨但值不落盘，
+// 表现为「点了没反应」。必须显式把 target/set/get 绑到控制器上。
+// set: 的签名固定为 setPreferenceValue:specifier:（PSSpecifier 作为第二参数传入）。
+static PSSpecifier *LNBSwitch(id target, NSString *label, NSString *key) {
     PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:label
-                                                    target:nil
-                                                       set:nil
-                                                       get:nil
+                                                    target:target
+                                                       set:@selector(setPreferenceValue:specifier:)
+                                                       get:@selector(readPreferenceValue:)
                                                     detail:nil
                                                       cell:PSSwitchCell
                                                       edit:nil];
     [s setProperty:key forKey:@"key"];
-    [s setProperty:kPrefsDomain forKey:@"defaults"];
     [s setProperty:@YES forKey:@"default"];
     return s;
 }
 
-static PSSpecifier *LNBSlider(NSString *label, NSString *key, double min, double max) {
+static PSSpecifier *LNBSlider(id target, NSString *label, NSString *key, double min, double max) {
     PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:label
-                                                    target:nil
-                                                       set:nil
-                                                       get:nil
+                                                    target:target
+                                                       set:@selector(setPreferenceValue:specifier:)
+                                                       get:@selector(readPreferenceValue:)
                                                     detail:nil
                                                       cell:PSSliderCell
                                                       edit:nil];
     [s setProperty:key forKey:@"key"];
-    [s setProperty:kPrefsDomain forKey:@"defaults"];
     [s setProperty:@(min) forKey:@"min"];
     [s setProperty:@(max) forKey:@"max"];
     [s setProperty:@YES forKey:@"showValue"];
@@ -233,6 +242,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 #pragma mark - 主设置控制器
 
 @interface NGBPrefsRootListController : PSListController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+- (void)mirrorPreferencesToFile;
 @end
 
 @implementation NGBPrefsRootListController
@@ -287,6 +297,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         if ([d objectForKey:key] == nil) [d setObject:defaults[key] forKey:key];
     }
     [d synchronize];
+    [self mirrorPreferencesToFile];
 }
 
 #pragma mark 值读写（PSViewController 标准钩子）
@@ -304,15 +315,33 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
     NSString *key = [specifier propertyForKey:@"key"];
     if (!key) return;
 
+    LNBLog(@"[SET] %@ = %@", key, value);
+
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
     [d setObject:value forKey:key];
     [d synchronize];
 
+    // 同步一份 plist 到 /var/mobile/Library/LockNotifyBG/。
+    // SpringBoard 与设置面板是两个进程，走 NSUserDefaults suite 需要 entitlement 与
+    // cfprefsd 缓存配合，隐根环境偶发读不到；直接落 plist 是最稳的跨进程通道，
+    // tweak 侧 LNBPrefs 也是优先读这个文件。
+    [self mirrorPreferencesToFile];
+
     [LNBFileManager postReload];
 
+    // 只刷新当前 cell 的显示值，避免整表 reload 打断滑动
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self.table reloadData];
+        [self reloadSpecifier:specifier animated:NO];
     });
+}
+
+// 把当前 defaults 全量落盘为 plist
+- (void)mirrorPreferencesToFile {
+    [LNBFileManager ensureDirectory];
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
+    NSDictionary *all = [d dictionaryRepresentation];
+    if (!all) return;
+    [all writeToFile:[LNBFileManager pathForFile:@"prefs.plist"] atomically:YES];
 }
 
 #pragma mark specifiers
@@ -324,37 +353,37 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 
         // ---- 0. 总开关 ----
         [specs addObject:LNBGroup(@"功能开关", @"关闭后所有背景设置立即失效，但资源文件会保留。")];
-        [specs addObject:LNBSwitch(@"启用插件", @"enabled")];
+        [specs addObject:LNBSwitch(self, @"启用插件", @"enabled")];
 
         // ---- 1. 全局背景 ----
         [specs addObject:LNBGroup(@"全局背景（通知列表整块）",
                                   @"作用于锁屏通知列表整体区域。视频模式会在系统刷新时重新挂载播放层，可能出现短暂闪烁。")];
-        [specs addObject:LNBSwitch(@"全局背景开关", @"globalEnabled")];
+        [specs addObject:LNBSwitch(self, @"全局背景开关", @"globalEnabled")];
         [specs addObject:LNBButton(self, @"选择背景图片", @selector(lnbPickGlobalImage:), @"pickGlobalImage")];
         [specs addObject:LNBButton(self, @"选择背景视频", @selector(lnbPickGlobalVideo:), @"pickGlobalVideo")];
-        [specs addObject:LNBSwitch(@"使用视频作为背景", @"globalUseVideo")];
-        [specs addObject:LNBSlider(@"背景透明度", @"globalAlpha", 0.2, 1.0)];
+        [specs addObject:LNBSwitch(self, @"使用视频作为背景", @"globalUseVideo")];
+        [specs addObject:LNBSlider(self, @"背景透明度", @"globalAlpha", 0.2, 1.0)];
 
         // ---- 2. 声音 ----
         [specs addObject:LNBGroup(@"声音",
                                   @"背景视频默认静音。打开声音后，若同时开启「与其他音频混音」，播放背景视频不会中断你正在听的音乐。")];
-        [specs addObject:LNBSwitch(@"静音", @"videoMuted")];
-        [specs addObject:LNBSlider(@"音量", @"videoVolume", 0.0, 1.0)];
-        [specs addObject:LNBSwitch(@"与其他音频混音", @"mixWithOthers")];
+        [specs addObject:LNBSwitch(self, @"静音", @"videoMuted")];
+        [specs addObject:LNBSlider(self, @"音量", @"videoVolume", 0.0, 1.0)];
+        [specs addObject:LNBSwitch(self, @"与其他音频混音", @"mixWithOthers")];
 
         // ---- 3. 卡片背景 ----
         [specs addObject:LNBGroup(@"通知卡片背景（单条）",
                                   @"作用于每一条通知。卡片仅支持静态图片。")];
-        [specs addObject:LNBSwitch(@"卡片背景开关", @"cardEnabled")];
+        [specs addObject:LNBSwitch(self, @"卡片背景开关", @"cardEnabled")];
         [specs addObject:LNBButton(self, @"选择卡片图片", @selector(lnbPickCardImage:), @"pickCardImage")];
-        [specs addObject:LNBSlider(@"卡片透明度", @"cardAlpha", 0.2, 1.0)];
-        [specs addObject:LNBSwitch(@"暗色遮罩（提升可读性）", @"cardBlurOverlay")];
+        [specs addObject:LNBSlider(self, @"卡片透明度", @"cardAlpha", 0.2, 1.0)];
+        [specs addObject:LNBSwitch(self, @"暗色遮罩（提升可读性）", @"cardBlurOverlay")];
 
         // ---- 4. 其它 ----
         [specs addObject:LNBGroup(@"其它", @"所有修改即时生效，无需注销。")];
 
         PSSpecifier *status = [PSSpecifier preferenceSpecifierNamed:@"资源状态"
-                                                             target:nil
+                                                             target:self
                                                                 set:nil
                                                                 get:@selector(lnbStatusDetail:)
                                                              detail:nil
@@ -461,6 +490,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         if (ok) {
             [LNBFileManager postReload];
             [self.table reloadData];
+            [self mirrorPreferencesToFile];
             [self lnbShowAlert:@"设置成功" message:[NSString stringWithFormat:@"已保存为 %@", targetName]];
         } else {
             [self lnbShowAlert:@"设置失败" message:error.localizedDescription ?: @"无法写入文件"];

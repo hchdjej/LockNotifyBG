@@ -156,7 +156,12 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
         [self addSubview:_imageView];
 
         _dimView = [[UIView alloc] initWithFrame:self.bounds];
-        _dimView.backgroundColor = [UIColor blackColor];
+        // 【踩坑】这里曾写成 [UIColor blackColor]，即 alpha=1.0 的纯黑。
+        // 加上 applyConfig: 里又叠了 0.25~0.35 的黑，整张背景被压暗，
+        // 用户看到的就是「一层黑色阴影」。默认必须全透明，且不参与布局遮挡。
+        _dimView.backgroundColor = [UIColor clearColor];
+        _dimView.hidden = YES;
+        _dimView.userInteractionEnabled = NO;
         _dimView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [self addSubview:_dimView];
     }
@@ -169,12 +174,12 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
     if (prefs.globalUseVideo) {
         // 视频模式：隐藏图片，用 AVPlayerLayer 循环播放
         self.imageView.hidden = YES;
-        self.dimView.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
+        self.dimView.hidden = YES;   // 不再额外压黑，可读性交给系统原生的模糊层
         [self setupPlayerIfNeeded];
     } else {
         // 图片模式：优先 global.jpg，若不存在则回退到视频首帧
         [self teardownPlayerIfNeeded];
-        self.dimView.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.25];
+        self.dimView.hidden = YES;
 
         UIImage *image = [UIImage imageWithContentsOfFile:LNBPathForResource(kBGGlobalImage)];
         if (!image) {
@@ -290,13 +295,71 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 
 #pragma mark - 全局背景注入逻辑
 
-// 在给定的宿主视图上确保背景容器存在，并刷新配置
-static void LNBEnsureGlobalBackground(UIView *hostView) {
+// 背景容器的**唯一宿主**。这里不用「每个宿主各挂一份」的做法，原因见下：
+//
+// 【踩坑】早期实现是给每个调用 LNBEnsureGlobalBackground 的视图都插一份 bgView。
+// 于是 NCNotificationListView（列表本体）和它内部的 NCNotificationListSectionView
+//（每个通知分组）各自持有一份背景，且各自按自己的 bounds 做 ScaleAspectFill，
+// 表现为：同一张图被重复显示多次、分块错位。
+// 正确做法是全局只维护**一个**背景视图，并且把它挂在最外层的列表容器上。
+static UIView *LNBGlobalBackgroundHost(void) {
+    NSArray *windows = [UIApplication sharedApplication].windows;
+    for (UIWindow *window in windows) {
+        if (window.isHidden || window.alpha < 0.01) continue;
+
+        // 由内向外广度遍历，命中第一个通知列表视图后立刻向上归一到
+        // 不再属于通知体系的外层祖先，保证背景覆盖整块列表而不是某个分组。
+        NSMutableArray *queue = [NSMutableArray arrayWithObject:window];
+        while (queue.count > 0) {
+            UIView *view = queue.firstObject;
+            [queue removeObjectAtIndex:0];
+
+            if ([NSStringFromClass(view.class) hasPrefix:@"NCNotificationList"]) {
+                UIView *host = view;
+                while (host.superview) {
+                    NSString *name = NSStringFromClass(host.superview.class);
+                    // 继续向上，直到父视图不再属于 NotificationCenter 体系
+                    if ([name hasPrefix:@"NC"] || [name hasPrefix:@"UINotification"]) {
+                        host = host.superview;
+                    } else {
+                        break;
+                    }
+                }
+                return host;
+            }
+
+            for (UIView *sub in view.subviews) {
+                [queue addObject:sub];
+            }
+        }
+    }
+    return nil;
+}
+
+// 在唯一宿主上确保背景容器存在，并刷新配置
+static void LNBEnsureGlobalBackground(UIView *candidateHost) {
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+
+    // 找到全局唯一的宿主；找不到就传进来的候选视图兜底
+    UIView *hostView = LNBGlobalBackgroundHost() ?: candidateHost;
     if (!hostView) return;
 
-    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    // 清理：任何不在 hostView 上的历史背景全部移除，杜绝「同一张图多处显示」
+    for (UIWindow *window in [UIApplication sharedApplication].windows) {
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+        while (stack.count > 0) {
+            UIView *view = stack.lastObject;
+            [stack removeLastObject];
+            if (view.tag == kGlobalBGViewTag && view != hostView) {
+                // 只有直接挂在 hostView 上的那一份才保留
+                UIView *keeper = [hostView viewWithTag:kGlobalBGViewTag];
+                if (view != keeper) [view removeFromSuperview];
+            }
+            for (UIView *sub in view.subviews) [stack addObject:sub];
+        }
+    }
+
     if (!prefs.enabled || !prefs.globalEnabled) {
-        // 配置关闭时移除已有背景
         UIView *existing = [hostView viewWithTag:kGlobalBGViewTag];
         if (existing) [existing removeFromSuperview];
         return;
@@ -312,6 +375,7 @@ static void LNBEnsureGlobalBackground(UIView *hostView) {
     } else if (bgView.superview != hostView) {
         [hostView insertSubview:bgView atIndex:0];
     }
+    bgView.frame = hostView.bounds;
     [bgView applyConfig:prefs];
 }
 
