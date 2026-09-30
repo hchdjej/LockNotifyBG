@@ -60,8 +60,10 @@ jobs:
           echo ""
           echo "===== packages 目录 ====="
           ls -lah packages/ 2>&1 || echo "packages 目录不存在"
-          if [ "$RC" -ne 0 ] || ! ls packages/*.deb >/dev/null 2>&1; then
-            echo "::error::构建未产出 deb（make 退出码 $RC）"
+          echo "===== 全仓 deb 查找 ====="
+          find . -name "*.deb" -not -path "./.git/*" 2>&1 || echo "无 deb"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::make 失败，退出码 $RC"
             exit 1
           fi
 
@@ -111,27 +113,51 @@ jobs:
         if: steps.build.outcome == 'failure'
         run: exit 1
 
-      - name: Show package info
+      - name: Locate deb output
+        id: locate
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          echo "---- 查找所有 deb ----"
+          find . -name "*.deb" -not -path "./.git/*" 2>/dev/null || true
           echo "---- packages 目录 ----"
-          ls -lah packages/ 2>&1 || echo "packages 目录不存在"
-          echo "---- 工程根目录 ----"
-          ls -lah . | head -30
-          DEB=$(ls packages/*.deb 2>/dev/null | head -n1)
+          ls -lah packages/ 2>&1 || echo "packages 不存在"
+          echo "---- .theos 目录 ----"
+          ls -lah .theos/ 2>&1 | head -20 || echo ".theos 不存在"
+          DEB=$(find . -name "*.deb" -not -path "./.git/*" 2>/dev/null | head -n1)
           if [ -z "$DEB" ]; then
-            echo "!! 未找到 deb 产物，输出构建日志尾部供诊断"
-            tail -60 /tmp/build.log
+            echo "::warning::未找到 deb，收集诊断信息"
+            {
+              echo "未找到 deb 产物 — run ${{ github.run_id }}"
+              echo ""
+              echo "### find 结果"
+              find . -maxdepth 3 -type d -not -path "./.git*" 2>/dev/null | head -40
+              echo ""
+              echo "### 构建日志尾部"
+              tail -80 /tmp/build.log 2>/dev/null
+            } > /tmp/diag.txt
+            gh issue create --repo "${{ github.repository }}" \
+              --title "no-deb-${{ github.run_id }}" --body-file /tmp/diag.txt || true
             exit 1
           fi
+          echo "DEB_PATH=$DEB" >> $GITHUB_OUTPUT
+          echo "找到: $DEB"
+
+      - name: Show package info
+        if: steps.locate.outputs.DEB_PATH != ''
+        run: |
+          DEB="${{ steps.locate.outputs.DEB_PATH }}"
           echo "包路径: $DEB"
           dpkg-deb -I "$DEB"
           echo "---- 文件清单 ----"
           dpkg-deb -c "$DEB"
 
       - name: Upload deb artifact
+        if: steps.locate.outputs.DEB_PATH != ''
         uses: actions/upload-artifact@v4
         with:
           name: LockNotifyBG-rootless
-          path: packages/*.deb
+          path: ${{ steps.locate.outputs.DEB_PATH }}
           if-no-files-found: error
           retention-days: 90
