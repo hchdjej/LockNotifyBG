@@ -51,9 +51,15 @@
 - (id)propertyForKey:(NSString *)key;
 @end
 
-@interface PSListController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@interface PSListController : UIViewController <UITableViewDataSource, UITableViewDelegate> {
+    // PSListController 内部直接访问 _specifiers 来生成分组索引与 cell 元数据，
+    // 因此必须把 specifier 数组写进这个 ivar，而不是自己的缓存变量。
+    NSMutableArray *_specifiers;
+}
 @property (nonatomic, strong) NSMutableArray *specifiers;
+@property (nonatomic, strong) UITableView *table;
 - (void)reloadSpecifiers;
+- (NSArray *)loadSpecifiersFromPlistName:(NSString *)name target:(id)target;
 @end
 
 #define kPrefsDomain        @"com.hchdjej.locknotifybg"
@@ -156,7 +162,7 @@ static PSSpecifier *LNBSwitch(NSString *label, NSString *key, id target, SEL act
     PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:label
                                                     target:target
                                                        set:action
-                                                       get:@selector(readPref:)
+                                                       get:@selector(readPreferenceValue:)
                                                     detail:nil
                                                       cell:kCellSwitch
                                                       edit:nil];
@@ -171,7 +177,7 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
     PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:label
                                                     target:target
                                                        set:action
-                                                       get:@selector(readPref:)
+                                                       get:@selector(readPreferenceValue:)
                                                     detail:nil
                                                       cell:kCellSlider
                                                       edit:nil];
@@ -185,9 +191,7 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
 
 #pragma mark - 主设置控制器
 
-@interface NGBPrefsRootListController : PSListController <UIImagePickerControllerDelegate, UINavigationControllerDelegate> {
-    NSArray *_cachedSpecifiers;
-}
+@interface NGBPrefsRootListController : PSListController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @end
 
 @implementation NGBPrefsRootListController
@@ -203,8 +207,10 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    // 从文件选择器返回后刷新「已设置 / 未设置」状态
-    [self reloadSpecifiers];
+    // 从文件选择器返回后刷新「已设置 / 未设置」状态。
+    // 用 reloadData 而非 reloadSpecifiers：后者会重建 specifier 数组，
+    // 在 view 尚未完全就绪时容易与父类的索引计算冲突。
+    [self.table reloadData];
 }
 
 // 首次进入时把默认值写进 prefs domain，避免 tweak 侧读到 nil
@@ -228,9 +234,10 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
     [d synchronize];
 }
 
-#pragma mark 取值（供 PSSpecifier 的 get 使用）
+#pragma mark 偏好读写（PSListController 原生扩展点）
 
-- (id)readPref:(PSSpecifier *)specifier {
+// 框架读取开关/滑块当前值时会调用这里
+- (id)readPreferenceValue:(PSSpecifier *)specifier {
     NSString *key = [specifier propertyForKey:@"key"];
     if (!key) return @NO;
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
@@ -239,20 +246,40 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
     return v ?: @NO;
 }
 
+// 用户改动开关/滑块时框架调用这里
+- (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
+    NSString *key = [specifier propertyForKey:@"key"];
+    if (!key) return;
+
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
+    [d setObject:value forKey:key];
+    [d synchronize];
+
+    [LNBFileManager postReload];
+
+    // 让依赖该值的行（如音量滑块）立即刷新
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.table reloadData];
+    });
+}
+
 #pragma mark specifiers
 
 - (NSArray *)specifiers {
-    if (_cachedSpecifiers == nil) {
+    // 必须写入 PSListController 的 _specifiers：
+    // 父类靠它生成分组索引、cell 高度等元数据；若为 nil 会去加载同名 plist
+    // （本 bundle 没有该文件），随后在取索引时越界崩溃。
+    if (_specifiers == nil) {
         NSMutableArray *specs = [NSMutableArray array];
 
         // ---- 0. 总开关 ----
         [specs addObject:LNBGroup(@"功能开关", @"关闭后所有背景设置立即失效，但资源文件会保留。")];
-        [specs addObject:LNBSwitch(@"启用插件", @"enabled", self, @selector(setPref:forSpecifier:))];
+        [specs addObject:LNBSwitch(@"启用插件", @"enabled", self, @selector(setPreferenceValue:specifier:))];
 
         // ---- 1. 全局背景 ----
         [specs addObject:LNBGroup(@"全局背景（通知列表整块）",
                                   @"作用于锁屏通知列表整体区域。视频模式会在系统刷新时重新挂载播放层，可能出现短暂闪烁。")];
-        [specs addObject:LNBSwitch(@"全局背景开关", @"globalEnabled", self, @selector(setPref:forSpecifier:))];
+        [specs addObject:LNBSwitch(@"全局背景开关", @"globalEnabled", self, @selector(setPreferenceValue:specifier:))];
 
         PSSpecifier *pickImage = [PSSpecifier preferenceSpecifierNamed:@"选择背景图片"
                                                                 target:self
@@ -274,23 +301,23 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
         pickVideo.action = @selector(pickGlobalVideo);
         [specs addObject:pickVideo];
 
-        [specs addObject:LNBSwitch(@"使用视频作为背景", @"globalUseVideo", self, @selector(setPref:forSpecifier:))];
-        [specs addObject:LNBSlider(@"背景透明度", @"globalAlpha", self, @selector(setPref:forSpecifier:), 0.2, 1.0)];
+        [specs addObject:LNBSwitch(@"使用视频作为背景", @"globalUseVideo", self, @selector(setPreferenceValue:specifier:))];
+        [specs addObject:LNBSlider(@"背景透明度", @"globalAlpha", self, @selector(setPreferenceValue:specifier:), 0.2, 1.0)];
 
         // ---- 2. 声音 ----
         [specs addObject:LNBGroup(@"声音",
                                   @"背景视频默认静音。打开声音后，若同时开启「与其他音频混音」，播放背景视频不会中断你正在听的音乐；关闭混音则背景视频独占音频通道。")];
-        [specs addObject:LNBSwitch(@"静音", @"videoMuted", self, @selector(setPref:forSpecifier:))];
+        [specs addObject:LNBSwitch(@"静音", @"videoMuted", self, @selector(setPreferenceValue:specifier:))];
 
-        PSSpecifier *volume = LNBSlider(@"音量", @"videoVolume", self, @selector(setPref:forSpecifier:), 0.0, 1.0);
+        PSSpecifier *volume = LNBSlider(@"音量", @"videoVolume", self, @selector(setPreferenceValue:specifier:), 0.0, 1.0);
         [specs addObject:volume];
 
-        [specs addObject:LNBSwitch(@"与其他音频混音", @"mixWithOthers", self, @selector(setPref:forSpecifier:))];
+        [specs addObject:LNBSwitch(@"与其他音频混音", @"mixWithOthers", self, @selector(setPreferenceValue:specifier:))];
 
         // ---- 3. 卡片背景 ----
         [specs addObject:LNBGroup(@"通知卡片背景（单条）",
                                   @"作用于每一条通知。为保证系统稳定性，卡片仅支持静态图片（视频自动取其首帧）。")];
-        [specs addObject:LNBSwitch(@"卡片背景开关", @"cardEnabled", self, @selector(setPref:forSpecifier:))];
+        [specs addObject:LNBSwitch(@"卡片背景开关", @"cardEnabled", self, @selector(setPreferenceValue:specifier:))];
 
         PSSpecifier *pickCard = [PSSpecifier preferenceSpecifierNamed:@"选择卡片图片"
                                                                target:self
@@ -302,8 +329,8 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
         pickCard.action = @selector(pickCardImage);
         [specs addObject:pickCard];
 
-        [specs addObject:LNBSlider(@"卡片透明度", @"cardAlpha", self, @selector(setPref:forSpecifier:), 0.2, 1.0)];
-        [specs addObject:LNBSwitch(@"暗色遮罩（提升可读性）", @"cardBlurOverlay", self, @selector(setPref:forSpecifier:))];
+        [specs addObject:LNBSlider(@"卡片透明度", @"cardAlpha", self, @selector(setPreferenceValue:specifier:), 0.2, 1.0)];
+        [specs addObject:LNBSwitch(@"暗色遮罩（提升可读性）", @"cardBlurOverlay", self, @selector(setPreferenceValue:specifier:))];
 
         // ---- 4. 其它 ----
         [specs addObject:LNBGroup(@"其它", @"所有修改即时生效，无需注销或重启。")];
@@ -329,9 +356,9 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
         [clearBtn setProperty:@(YES) forKey:@"enabled"];
         [specs addObject:clearBtn];
 
-        _cachedSpecifiers = specs;
+        _specifiers = specs;
     }
-    return _cachedSpecifiers;
+    return _specifiers;
 }
 
 #pragma mark 详情文本（右侧灰字）
@@ -354,26 +381,6 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
     if ([LNBFileManager fileExistsNamed:kBGGlobalVideo]) [parts addObject:@"视频"];
     if ([LNBFileManager fileExistsNamed:kBGCardImage])   [parts addObject:@"卡片图"];
     return parts.count ? [parts componentsJoinedByString:@" / "] : @"尚无资源";
-}
-
-#pragma mark 写值
-
-- (void)setPref:(id)value forSpecifier:(PSSpecifier *)specifier {
-    NSString *key = [specifier propertyForKey:@"key"];
-    if (!key) return;
-
-    // 静音时把音量记成 0，避免静音状态下残留音量值让用户困惑
-    id stored = value;
-    if ([key isEqualToString:@"videoMuted"] && [value boolValue]) {
-        // 仅切换静音标志，音量值保留，取消静音后恢复
-        stored = value;
-    }
-
-    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
-    [d setObject:stored forKey:key];
-    [d synchronize];
-
-    [LNBFileManager postReload];
 }
 
 #pragma mark 资源选择
@@ -422,7 +429,7 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
 
         if (ok) {
             [LNBFileManager postReload];
-            [self reloadSpecifiers];
+            [self.table reloadData];
             [self showAlertWithTitle:@"设置成功" message:[NSString stringWithFormat:@"已保存为 %@", targetName]];
         } else {
             [self showAlertWithTitle:@"设置失败" message:error.localizedDescription ?: @"无法写入文件"];
@@ -446,7 +453,7 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
         [LNBFileManager removeFileNamed:kBGGlobalVideo];
         [LNBFileManager removeFileNamed:kBGCardImage];
         [LNBFileManager postReload];
-        [self reloadSpecifiers];
+        [self.table reloadData];
         [self showAlertWithTitle:@"已清除" message:@"所有背景资源已删除。"];
     }]];
     [self presentViewController:alert animated:YES completion:nil];
