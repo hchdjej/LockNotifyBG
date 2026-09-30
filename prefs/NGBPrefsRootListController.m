@@ -9,6 +9,8 @@
 #import <UIKit/UIKit.h>
 #import <MobileCoreServices/MobileCoreServices.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <PhotosUI/PhotosUI.h>
+#import <objc/runtime.h>
 #import <notify.h>
 
 #define kPrefsDomain       @"com.hchdjej.locknotifybg"
@@ -119,7 +121,7 @@
 
 #pragma mark - 主设置控制器
 
-@interface NGBPrefsRootListController : UITableViewController
+@interface NGBPrefsRootListController : UITableViewController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @property (nonatomic, strong) NSMutableDictionary *prefs;
 @end
 
@@ -440,7 +442,7 @@
 - (void)presentImagePickerForName:(NSString *)fileName {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.mediaTypes = @[(NSString *)kUTTypeImage];
+    picker.mediaTypes = @[UTTypeImage.identifier];
     picker.delegate = self;
     picker.modalPresentationStyle = UIModalPresentationFullScreen;
     // 用 tag 传递目标文件名
@@ -451,7 +453,7 @@
 - (void)presentVideoPickerForName:(NSString *)fileName {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.mediaTypes = @[(NSString *)kUTTypeMovie];
+    picker.mediaTypes = @[UTTypeMovie.identifier];
     picker.videoQuality = UIImagePickerControllerQualityTypeHigh;
     picker.delegate = self;
     picker.modalPresentationStyle = UIModalPresentationFullScreen;
