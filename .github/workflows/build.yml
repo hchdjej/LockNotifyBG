@@ -36,7 +36,6 @@ jobs:
           cp -R iPhoneOS16.5.sdk "$HOME/theos/sdks/"
 
       - name: Build
-        id: build
         run: |
           export THEOS=$HOME/theos
           export PATH="$THEOS/bin:$PATH"
@@ -45,26 +44,7 @@ jobs:
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless >> /tmp/build.log 2>&1
           RC=$?
           set -e
-
-          echo "make 退出码: $RC"
-          echo "===== 日志尾部 ====="
           tail -60 /tmp/build.log
-
-          # 汇总诊断，无论成败都写进 summary
-          {
-            echo "## 构建结果"
-            echo "make 退出码: \`$RC\`"
-            echo ""
-            echo "### 产物查找"
-            echo '```'
-            find . -name "*.deb" -not -path "./.git/*" 2>/dev/null || echo "(无)"
-            echo '```'
-            echo "### 关键错误"
-            echo '```'
-            grep -iE "error:|fatal|Error [0-9]" /tmp/build.log 2>/dev/null | head -40 || echo "(无)"
-            echo '```'
-          } >> $GITHUB_STEP_SUMMARY
-
           if [ "$RC" -ne 0 ]; then
             echo "::error::编译失败，退出码 $RC"
             exit 1
@@ -72,12 +52,11 @@ jobs:
 
       - name: Package artifact
         run: |
-          set -e
+          exec > >(tee /tmp/pkg.log) 2>&1
           DEB=$(find . -name "*.deb" -not -path "./.git/*" | head -n1)
           if [ -z "$DEB" ]; then
             echo "::error::未找到 deb 产物"
             find . -maxdepth 3 -type d -not -path "./.git*" | head -40
-            tail -80 /tmp/build.log
             exit 1
           fi
           echo "找到产物: $DEB"
@@ -85,8 +64,8 @@ jobs:
           cp "$DEB" "$GITHUB_WORKSPACE/LockNotifyBG-rootless.deb"
           shasum -a 256 LockNotifyBG-rootless.deb | tee checksum.txt
 
-          # 生成含文件清单的 Release 说明
-          {
+          # 生成含文件清单的 Release 说明（失败不影响产物上传）
+          generate_notes() {
             echo "自动编译产物（iOS 16.5 / iphoneos-arm64 / rootless / Dopamine）"
             echo ""
             echo "## 校验和（SHA256）"
@@ -95,30 +74,38 @@ jobs:
             echo '```'
             echo "## 包内文件清单"
             echo '```'
-            if [ -x "$HOME/theos/bin/dpkg-deb" ]; then
-              "$HOME/theos/bin/dpkg-deb" -c LockNotifyBG-rootless.deb || true
-            else
-              mkdir -p /tmp/deblist && cd /tmp/deblist && rm -f control.tar.* data.tar.*
+            "$HOME/theos/bin/dpkg-deb" -c LockNotifyBG-rootless.deb 2>&1
+            echo '```'
+          }
+          generate_notes > release-notes.md 2>/tmp/notes.err || {
+            echo "dpkg-deb -c 失败，改用 ar 解包: $(cat /tmp/notes.err | tail -3)"
+            {
+              echo "自动编译产物（iOS 16.5 / iphoneos-arm64 / rootless / Dopamine）"
+              echo ""
+              echo "## 校验和（SHA256）"
+              echo '```'
+              cat checksum.txt
+              echo '```'
+              echo "## 包内文件清单"
+              echo '```'
+              mkdir -p /tmp/deblist && cd /tmp/deblist
+              rm -rf control.tar.* data.tar.* 2>/dev/null
               ar x "$GITHUB_WORKSPACE/LockNotifyBG-rootless.deb"
-              for f in data.tar.xz data.tar.gz data.tar.lzma; do
-                if [ -f "$f" ]; then
-                  case "$f" in
-                    *.xz)  xz -dc "$f" | tar -tf - ;;
-                    *.gz)  tar -tzf "$f" ;;
-                    *.lzma) xz --format=lzma -dc "$f" | tar -tf - ;;
-                  esac
-                fi
+              ls -la
+              for f in data.tar.xz data.tar.gz data.tar.lzma data.tar.bz2; do
+                [ -f "$f" ] || continue
+                case "$f" in
+                  *.xz)   xz -dc "$f" | tar -tf - ;;
+                  *.gz)   tar -tzf "$f" ;;
+                  *.lzma) xz --format=lzma -dc "$f" | tar -tf - ;;
+                  *.bz2)  tar -tjf "$f" ;;
+                esac
               done
-            fi
-            echo '```'
-          } > release-notes.md
-          {
-            echo "## 产物信息"
-            echo '```'
-            ls -lh LockNotifyBG-rootless.deb
-            cat checksum.txt
-            echo '```'
-          } >> $GITHUB_STEP_SUMMARY
+              echo '```'
+            } > release-notes.md
+          }
+          echo "---- release-notes.md 预览 ----"
+          head -40 release-notes.md
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
@@ -150,11 +137,17 @@ jobs:
           {
             echo "构建失败 — run ${{ github.run_id }}"
             echo ""
-            echo "### 错误行"
-            grep -iE "error:|fatal|Error [0-9]|No such|not found" /tmp/build.log 2>/dev/null | head -50 || echo "(无)"
+            echo "### pkg.log（产物步骤日志）"
+            echo '```'
+            tail -60 /tmp/pkg.log 2>/dev/null || echo "(无)"
+            echo '```'
+            echo "### build.log 错误行"
+            grep -iE "error:|fatal|Error [0-9]" /tmp/build.log 2>/dev/null | head -40 || echo "(无)"
             echo ""
-            echo "### 日志尾部"
-            tail -80 /tmp/build.log 2>/dev/null || echo "(无日志)"
+            echo "### build.log 尾部"
+            echo '```'
+            tail -60 /tmp/build.log 2>/dev/null || echo "(无)"
+            echo '```'
           } > /tmp/diag.txt
           gh issue create --repo "${{ github.repository }}" \
             --title "build-failure-${{ github.run_id }}" \
