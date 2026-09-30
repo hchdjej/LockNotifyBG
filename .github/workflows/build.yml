@@ -40,13 +40,45 @@ jobs:
           ls "$THEOS/sdks"
 
       - name: Build rootless package
+        id: build
+        continue-on-error: true
         run: |
           export THEOS=$HOME/theos
           export PATH="$THEOS/bin:$PATH"
-          make clean || true
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
-          echo "---- 构建产物 ----"
-          ls -lh packages/
+          set +e
+          make clean > /tmp/build.log 2>&1
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless >> /tmp/build.log 2>&1
+          echo "BUILD_EXIT=$?" >> /tmp/build.log
+          set -e
+          echo "===== 构建日志（尾部 120 行）====="
+          tail -120 /tmp/build.log
+
+      - name: Publish build log to summary
+        if: always()
+        run: |
+          {
+            echo "## 构建日志"
+            echo '```'
+            tail -150 /tmp/build.log 2>/dev/null || echo "无日志"
+            echo '```'
+            echo "### 关键错误行"
+            echo '```'
+            grep -iE "error|fatal|No such|not found|Error [0-9]" /tmp/build.log 2>/dev/null | head -40 || echo "无匹配"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+          cp /tmp/build.log build.log 2>/dev/null || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+
+      - name: Fail if build failed
+        if: steps.build.outcome == 'failure'
+        run: exit 1
 
       - name: Show package info
         run: |
