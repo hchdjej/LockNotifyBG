@@ -84,6 +84,34 @@ jobs:
           ls -lh "$DEB"
           cp "$DEB" "$GITHUB_WORKSPACE/LockNotifyBG-rootless.deb"
           shasum -a 256 LockNotifyBG-rootless.deb | tee checksum.txt
+
+          # 生成含文件清单的 Release 说明
+          {
+            echo "自动编译产物（iOS 16.5 / iphoneos-arm64 / rootless / Dopamine）"
+            echo ""
+            echo "## 校验和（SHA256）"
+            echo '```'
+            cat checksum.txt
+            echo '```'
+            echo "## 包内文件清单"
+            echo '```'
+            if [ -x "$HOME/theos/bin/dpkg-deb" ]; then
+              "$HOME/theos/bin/dpkg-deb" -c LockNotifyBG-rootless.deb || true
+            else
+              mkdir -p /tmp/deblist && cd /tmp/deblist && rm -f control.tar.* data.tar.*
+              ar x "$GITHUB_WORKSPACE/LockNotifyBG-rootless.deb"
+              for f in data.tar.xz data.tar.gz data.tar.lzma; do
+                if [ -f "$f" ]; then
+                  case "$f" in
+                    *.xz)  xz -dc "$f" | tar -tf - ;;
+                    *.gz)  tar -tzf "$f" ;;
+                    *.lzma) xz --format=lzma -dc "$f" | tar -tf - ;;
+                  esac
+                fi
+              done
+            fi
+            echo '```'
+          } > release-notes.md
           {
             echo "## 产物信息"
             echo '```'
@@ -110,7 +138,7 @@ jobs:
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "LockNotifyBG $TAG" \
-            --notes "自动编译产物（iOS 16.5 / iphoneos-arm64 / rootless）" \
+            --notes-file release-notes.md \
             LockNotifyBG-rootless.deb checksum.txt \
             || gh release upload "$TAG" LockNotifyBG-rootless.deb checksum.txt --clobber
 
