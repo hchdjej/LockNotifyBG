@@ -1,0 +1,65 @@
+name: Build LockNotifyBG
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build rootless deb (iOS 16.5)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          brew install ldid xz make coreutils
+          echo "依赖安装完成"
+
+      - name: Setup Theos
+        run: |
+          export THEOS=$HOME/theos
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          echo "Theos 克隆完成"
+          ls "$THEOS" | head
+
+      - name: Install iOS 16.5 SDK
+        run: |
+          export THEOS=$HOME/theos
+          mkdir -p "$THEOS/sdks"
+          cd /tmp
+          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks.git
+          cd sdks
+          git sparse-checkout set --no-cone iPhoneOS16.5.sdk
+          git checkout
+          cp -R iPhoneOS16.5.sdk "$THEOS/sdks/"
+          echo "已安装 SDK:"
+          ls "$THEOS/sdks"
+
+      - name: Build rootless package
+        run: |
+          export THEOS=$HOME/theos
+          export PATH="$THEOS/bin:$PATH"
+          make clean || true
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          echo "---- 构建产物 ----"
+          ls -lh packages/
+
+      - name: Show package info
+        run: |
+          DEB=$(ls packages/*.deb | head -n1)
+          echo "包路径: $DEB"
+          dpkg-deb -I "$DEB"
+          echo "---- 文件清单 ----"
+          dpkg-deb -c "$DEB"
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LockNotifyBG-rootless
+          path: packages/*.deb
+          if-no-files-found: error
+          retention-days: 90
