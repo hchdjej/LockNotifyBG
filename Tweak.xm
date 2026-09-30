@@ -194,9 +194,9 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
         return;
     }
 
-    // 已在播放同一个视频则跳过
+    // 已在播放同一个视频则跳过（但仍需刷新音频配置）
     if (self.player && self.playerLayer) {
-        [self applyAudioConfig:prefs];
+        [self applyAudioConfig:[LNBPrefs sharedInstance]];
         return;
     }
 
@@ -204,7 +204,8 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
     AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
     self.player = [AVPlayer playerWithPlayerItem:item];
 
-    // 音频配置：默认静音，可由设置面板打开
+    // 音频配置取自全局配置单例
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
     [self applyAudioConfig:prefs];
 
     self.player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
@@ -400,7 +401,7 @@ static void LNBReloadConfiguration(void) {
 
 - (void)layoutSubviews {
     %orig;
-    LNBEnsureGlobalBackground(self);
+    LNBEnsureGlobalBackground((UIView *)self);
 }
 
 %end
@@ -409,7 +410,7 @@ static void LNBReloadConfiguration(void) {
 
 - (void)layoutSubviews {
     %orig;
-    LNBEnsureGlobalBackground(self);
+    LNBEnsureGlobalBackground((UIView *)self);
 }
 
 %end
@@ -419,7 +420,7 @@ static void LNBReloadConfiguration(void) {
 
 - (void)layoutSubviews {
     %orig;
-    LNBApplyCardBackground(self);
+    LNBApplyCardBackground((UIView *)self);
 }
 
 %end
@@ -429,7 +430,7 @@ static void LNBReloadConfiguration(void) {
 
 - (void)layoutSubviews {
     %orig;
-    LNBApplyCardBackground(self);
+    LNBApplyCardBackground((UIView *)self);
 }
 
 %end
