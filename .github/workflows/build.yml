@@ -65,33 +65,28 @@ jobs:
           shasum -a 256 LockNotifyBG-rootless.deb | tee checksum.txt
 
           # 生成含文件清单的 Release 说明（失败不影响产物上传）
-          generate_notes() {
-            echo "自动编译产物（iOS 16.5 / iphoneos-arm64 / rootless / Dopamine）"
-            echo ""
-            echo "## 校验和（SHA256）"
-            echo '```'
-            cat checksum.txt
-            echo '```'
-            echo "## 包内文件清单"
-            echo '```'
-            "$HOME/theos/bin/dpkg-deb" -c LockNotifyBG-rootless.deb 2>&1
-            echo '```'
-          }
-          generate_notes > release-notes.md 2>/tmp/notes.err || {
-            echo "dpkg-deb -c 失败，改用 ar 解包: $(cat /tmp/notes.err | tail -3)"
-            {
-              echo "自动编译产物（iOS 16.5 / iphoneos-arm64 / rootless / Dopamine）"
-              echo ""
-              echo "## 校验和（SHA256）"
-              echo '```'
-              cat checksum.txt
-              echo '```'
-              echo "## 包内文件清单"
-              echo '```'
-              mkdir -p /tmp/deblist && cd /tmp/deblist
+          echo "自动编译产物（iOS 16.5 / iphoneos-arm64 / rootless / Dopamine）" > release-notes.md
+          echo "" >> release-notes.md
+          echo "## 校验和（SHA256）" >> release-notes.md
+          echo '```' >> release-notes.md
+          cat checksum.txt >> release-notes.md
+          echo '```' >> release-notes.md
+          echo "## 包内文件清单" >> release-notes.md
+          echo '```' >> release-notes.md
+          LIST_OK=0
+          if command -v dpkg-deb >/dev/null 2>&1; then
+            if dpkg-deb -c LockNotifyBG-rootless.deb; then LIST_OK=1; fi
+          fi
+          if [ "$LIST_OK" != 1 ] && [ -x "$HOME/theos/bin/dpkg-deb" ]; then
+            if "$HOME/theos/bin/dpkg-deb" -c LockNotifyBG-rootless.deb; then LIST_OK=1; fi
+          fi
+          if [ "$LIST_OK" != 1 ]; then
+            echo "(无 dpkg-deb，用 ar 解包列出)" 
+            mkdir -p /tmp/deblist
+            (
+              cd /tmp/deblist
               rm -rf control.tar.* data.tar.* 2>/dev/null
               ar x "$GITHUB_WORKSPACE/LockNotifyBG-rootless.deb"
-              ls -la
               for f in data.tar.xz data.tar.gz data.tar.lzma data.tar.bz2; do
                 [ -f "$f" ] || continue
                 case "$f" in
@@ -101,11 +96,12 @@ jobs:
                   *.bz2)  tar -tjf "$f" ;;
                 esac
               done
-              echo '```'
-            } > release-notes.md
-          }
+            ) && LIST_OK=1
+          fi
+          [ "$LIST_OK" = 1 ] || echo "(清单生成失败，但 deb 本身正常)"
+          echo '```' >> release-notes.md
           echo "---- release-notes.md 预览 ----"
-          head -40 release-notes.md
+          cat release-notes.md
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
