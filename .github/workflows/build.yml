@@ -5,6 +5,10 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   build:
     name: Build rootless deb (iOS 16.5)
@@ -76,13 +80,40 @@ jobs:
           path: build.log
           if-no-files-found: warn
 
+      - name: Report failure to issue (readable via API)
+        if: steps.build.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY=$(tail -c 60000 /tmp/build.log | sed 's/`/'"'"'/g')
+          {
+            echo "构建失败日志（run ${{ github.run_id }}）"
+            echo ""
+            echo '```'
+            echo "$BODY"
+            echo '```'
+          } > /tmp/issue_body.txt
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "build-failure-${{ github.run_id }}" \
+            --body-file /tmp/issue_body.txt || true
+
       - name: Fail if build failed
         if: steps.build.outcome == 'failure'
         run: exit 1
 
       - name: Show package info
         run: |
-          DEB=$(ls packages/*.deb | head -n1)
+          echo "---- packages 目录 ----"
+          ls -lah packages/ 2>&1 || echo "packages 目录不存在"
+          echo "---- 工程根目录 ----"
+          ls -lah . | head -30
+          DEB=$(ls packages/*.deb 2>/dev/null | head -n1)
+          if [ -z "$DEB" ]; then
+            echo "!! 未找到 deb 产物，输出构建日志尾部供诊断"
+            tail -60 /tmp/build.log
+            exit 1
+          fi
           echo "包路径: $DEB"
           dpkg-deb -I "$DEB"
           echo "---- 文件清单 ----"
