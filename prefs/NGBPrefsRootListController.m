@@ -191,26 +191,76 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
 
 #pragma mark - 主设置控制器
 
+// ---------------------------------------------------------------------------
+// 诊断日志：写入 /var/mobile/Library/LockNotifyBG/prefs.log
+// 用于定位设置面板启动阶段的具体崩溃点（该路径全局可写，用 Filza 即可查看）
+// ---------------------------------------------------------------------------
+static void LNBLog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+
+    NSString *dir = @"/var/mobile/Library/LockNotifyBG";
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES
+                                               attributes:nil error:nil];
+    NSString *path = [dir stringByAppendingPathComponent:@"prefs.log"];
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"HH:mm:ss.SSS";
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
+
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } else {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    }
+}
+
 @interface NGBPrefsRootListController : PSListController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @end
 
 @implementation NGBPrefsRootListController
 
+// 类被加载进内存时立刻记录 —— 若连这行都没有，说明二进制根本没被加载
++ (void)load {
+    LNBLog(@"=== [1] 类已加载 (load) ===");
+}
+
+- (instancetype)init {
+    LNBLog(@"[2] init 进入, super=%@", NSStringFromClass([self superclass]));
+    self = [super init];
+    LNBLog(@"[3] init 返回 self=%@", self ? @"OK" : @"nil");
+    return self;
+}
+
 #pragma mark 生命周期
 
 - (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"锁屏通知背景";
-    [LNBFileManager ensureDirectory];
-    [self seedDefaultsIfNeeded];
+    LNBLog(@"[4] viewDidLoad 进入");
+    @try {
+        [super viewDidLoad];
+        LNBLog(@"[5] super viewDidLoad 完成");
+        self.title = @"锁屏通知背景";
+        [LNBFileManager ensureDirectory];
+        LNBLog(@"[6] 目录就绪");
+        [self seedDefaultsIfNeeded];
+        LNBLog(@"[7] 默认值写入完成");
+    } @catch (NSException *e) {
+        LNBLog(@"[!] viewDidLoad 抛异常: %@ — %@", e.name, e.reason);
+        @throw;
+    }
 }
 
 - (void)viewWillAppear:(BOOL)animated {
+    LNBLog(@"[8] viewWillAppear 进入");
     [super viewWillAppear:animated];
-    // 从文件选择器返回后刷新「已设置 / 未设置」状态。
-    // 用 reloadData 而非 reloadSpecifiers：后者会重建 specifier 数组，
-    // 在 view 尚未完全就绪时容易与父类的索引计算冲突。
+    LNBLog(@"[9] super viewWillAppear 完成");
     [self.table reloadData];
+    LNBLog(@"[10] reloadData 完成");
 }
 
 // 首次进入时把默认值写进 prefs domain，避免 tweak 侧读到 nil
@@ -266,11 +316,13 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
 #pragma mark specifiers
 
 - (NSArray *)specifiers {
+    LNBLog(@"[S1] specifiers 被调用, 当前 _specifiers=%@", _specifiers ? @"非空" : @"nil");
     // 必须写入 PSListController 的 _specifiers：
     // 父类靠它生成分组索引、cell 高度等元数据；若为 nil 会去加载同名 plist
     // （本 bundle 没有该文件），随后在取索引时越界崩溃。
     if (_specifiers == nil) {
         NSMutableArray *specs = [NSMutableArray array];
+        LNBLog(@"[S2] 开始构建 specifier 数组");
 
         // ---- 0. 总开关 ----
         [specs addObject:LNBGroup(@"功能开关", @"关闭后所有背景设置立即失效，但资源文件会保留。")];
@@ -357,7 +409,9 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
         [specs addObject:clearBtn];
 
         _specifiers = specs;
+        LNBLog(@"[S3] specifier 构建完成, 共 %lu 项", (unsigned long)specs.count);
     }
+    LNBLog(@"[S4] 返回 _specifiers (%lu 项)", (unsigned long)_specifiers.count);
     return _specifiers;
 }
 
