@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 jobs:
@@ -101,6 +101,18 @@ jobs:
             checksum.txt
           if-no-files-found: error
           retention-days: 90
+
+      - name: Publish to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1.1.0-build.${{ github.run_number }}"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "LockNotifyBG $TAG" \
+            --notes "自动编译产物（iOS 16.5 / iphoneos-arm64 / rootless）" \
+            LockNotifyBG-rootless.deb checksum.txt \
+            || gh release upload "$TAG" LockNotifyBG-rootless.deb checksum.txt --clobber
 
       - name: Report failure
         if: failure()
