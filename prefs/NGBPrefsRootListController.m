@@ -2,8 +2,11 @@
 //  NGBPrefsRootListController.m
 //  LockNotifyBG 偏好设置面板
 //
-//  提供：总开关、全局背景开关、视频开关、透明度、卡片背景开关、选择图片/视频文件
-//  文件选择后拷贝到 /var/mobile/Library/LockNotifyBG/
+//  必须是 PSListController 子类 —— PreferenceLoader 以 specifier 机制驱动
+//  设置界面，任何 UITableViewController 子类都会因缺失 specifiers 而闪退。
+//
+//  提供：总开关、全局背景开关、透明度、视频与音频控制、卡片背景、资源文件选择。
+//  资源文件统一存放在 /var/mobile/Library/LockNotifyBG/
 //
 
 #import <UIKit/UIKit.h>
@@ -13,12 +16,52 @@
 #import <objc/runtime.h>
 #import <notify.h>
 
-#define kPrefsDomain       @"com.hchdjej.locknotifybg"
+// ---------------------------------------------------------------------------
+// Preferences 私有框架的最小声明
+//
+// PSListController / PSSpecifier 定义在私有框架 Preferences 中，其头文件不在
+// 主流 iOS SDK 里（需要额外引入 theos/headers 仓库）。这里自带最小声明，
+// 既避免额外依赖，又保证链接时符号能正确解析到 Preferences.framework。
+// ---------------------------------------------------------------------------
+
+// PSSpecifier 的 cell 类型：直接用字符串，Preferences 框架按名实例化对应 cell 类
+// （不引用 PSControlTableCellType 等外部符号，避免链接期缺失）
+#define kCellSwitch   @"PSSwitchCell"
+#define kCellSlider   @"PSSliderCell"
+#define kCellLink     @"PSLinkCell"
+#define kCellStatic   @"PSStaticTextCell"
+#define kCellButton   @"PSButtonCell"
+
+@interface PSSpecifier : NSObject
+@property (nonatomic, assign) SEL action;
+@property (nonatomic, assign) SEL getter;
+@property (nonatomic, assign) SEL setter;
+@property (nonatomic, strong) id target;
+
++ (instancetype)preferenceSpecifierNamed:(NSString *)name
+                                  target:(id)target
+                                     set:(SEL)setter
+                                     get:(SEL)getter
+                                  detail:(Class)detail
+                                    cell:(NSString *)cell
+                                    edit:(Class)edit;
++ (instancetype)groupSpecifierWithName:(NSString *)name;
+
+- (void)setProperty:(id)value forKey:(NSString *)key;
+- (id)propertyForKey:(NSString *)key;
+@end
+
+@interface PSListController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) NSMutableArray *specifiers;
+- (void)reloadSpecifiers;
+@end
+
+#define kPrefsDomain        @"com.hchdjej.locknotifybg"
 #define kReloadNotification @"com.hchdjej.locknotifybg/reload"
-#define kBGDirectory       @"/var/mobile/Library/LockNotifyBG"
-#define kBGGlobalImage     @"global.jpg"
-#define kBGGlobalVideo     @"global.mp4"
-#define kBGCardImage       @"card.jpg"
+#define kBGDirectory        @"/var/mobile/Library/LockNotifyBG"
+#define kBGGlobalImage      @"global.jpg"
+#define kBGGlobalVideo      @"global.mp4"
+#define kBGCardImage        @"card.jpg"
 
 #pragma mark - 资源管理工具
 
@@ -61,411 +104,299 @@
 }
 
 + (BOOL)copyFileAtURL:(NSURL *)url toName:(NSString *)name error:(NSError **)error {
-    if (![self ensureDirectory]) {
-        if (error) *error = [NSError errorWithDomain:@"LockNotifyBG" code:1 userInfo:@{NSLocalizedDescriptionKey: @"无法创建资源目录"}];
+    if (!url) {
+        if (error) *error = [NSError errorWithDomain:@"LockNotifyBG" code:1
+                                           userInfo:@{NSLocalizedDescriptionKey: @"无效的文件地址"}];
         return NO;
     }
+    [self ensureDirectory];
 
-    // iCloud / 文件 App 的文件需要先申请安全访问权限
-    BOOL needsScope = [url startAccessingSecurityScopedResource];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dest = [self pathForFile:name];
 
-    // 通过 NSFileCoordinator 读取，兼容 iCloud Drive 未下载文件
-    __block BOOL success = NO;
-    __block NSError *innerError = nil;
-    NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
-    [coordinator coordinateReadingItemAtURL:url
-                                    options:NSFileCoordinatorReadingWithoutChanges
-                                      error:&innerError
-                                 byAccessor:^(NSURL *newURL) {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *dest = [self pathForFile:name];
-
-        // 覆盖前先删旧文件
+    // 覆盖前先删除，避免 copyItemAtURL 因目标已存在而失败
+    if ([fm fileExistsAtPath:dest]) {
         [fm removeItemAtPath:dest error:nil];
+    }
 
-        NSError *copyError = nil;
-        success = [fm copyItemAtPath:newURL.path toPath:dest error:&copyError];
-        if (!success) innerError = copyError;
-
-        if (success) {
-            // 修正权限，保证 SpringBoard 可读
-            [fm setAttributes:@{NSFilePosixPermissions: @(0644),
-                                NSFileOwnerAccountName: @"mobile",
-                                NSFileGroupOwnerAccountName: @"mobile"}
-                 ofItemAtPath:dest error:nil];
-        }
-    }];
-
-    if (needsScope) [url stopAccessingSecurityScopedResource];
-
-    if (!success && error) *error = innerError;
-    return success;
+    BOOL ok = [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:dest] error:error];
+    if (ok) {
+        [fm setAttributes:@{NSFilePosixPermissions: @(0644)}
+             ofItemAtPath:dest error:nil];
+    }
+    return ok;
 }
 
 + (BOOL)removeFileNamed:(NSString *)name {
-    return [[NSFileManager defaultManager] removeItemAtPath:[self pathForFile:name] error:nil];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *path = [self pathForFile:name];
+    if (![fm fileExistsAtPath:path]) return YES;
+    return [fm removeItemAtPath:path error:nil];
 }
 
 + (BOOL)fileExistsNamed:(NSString *)name {
-    NSString *path = [self pathForFile:name];
-    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-    return attrs && [attrs fileSize] > 0;
+    return [[NSFileManager defaultManager] fileExistsAtPath:[self pathForFile:name]];
 }
 
 + (void)postReload {
-    // 通知 SpringBoard 里的 tweak 重新读取配置，免重启
     notify_post([kReloadNotification UTF8String]);
 }
 
 @end
 
+#pragma mark - PSSpecifier 便捷构造
+
+static PSSpecifier *LNBGroup(NSString *header, NSString *footer) {
+    PSSpecifier *s = [PSSpecifier groupSpecifierWithName:header];
+    if (footer) [s setProperty:footer forKey:@"footerText"];
+    return s;
+}
+
+static PSSpecifier *LNBSwitch(NSString *label, NSString *key, id target, SEL action) {
+    PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:label
+                                                    target:target
+                                                       set:action
+                                                       get:@selector(readPref:)
+                                                    detail:nil
+                                                      cell:kCellSwitch
+                                                      edit:nil];
+    [s setProperty:key forKey:@"key"];
+    [s setProperty:kPrefsDomain forKey:@"defaults"];
+    [s setProperty:@YES forKey:@"default"];
+    return s;
+}
+
+static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL action,
+                              double min, double max) {
+    PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:label
+                                                    target:target
+                                                       set:action
+                                                       get:@selector(readPref:)
+                                                    detail:nil
+                                                      cell:kCellSlider
+                                                      edit:nil];
+    [s setProperty:key forKey:@"key"];
+    [s setProperty:kPrefsDomain forKey:@"defaults"];
+    [s setProperty:@(min) forKey:@"min"];
+    [s setProperty:@(max) forKey:@"max"];
+    [s setProperty:@YES forKey:@"showValue"];
+    return s;
+}
+
 #pragma mark - 主设置控制器
 
-@interface NGBPrefsRootListController : UITableViewController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
-@property (nonatomic, strong) NSMutableDictionary *prefs;
+@interface NGBPrefsRootListController : PSListController <UIImagePickerControllerDelegate, UINavigationControllerDelegate> {
+    NSArray *_cachedSpecifiers;
+}
 @end
 
 @implementation NGBPrefsRootListController
 
-#pragma mark 数据读写
+#pragma mark 生命周期
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"锁屏通知背景";
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
-                                                                                          target:self
-                                                                                          action:@selector(dismissSelf)];
     [LNBFileManager ensureDirectory];
-    [self loadPrefs];
+    [self seedDefaultsIfNeeded];
 }
 
-- (void)dismissSelf {
-    [self.prefs writeToFile:[self prefsPath] atomically:YES];
-    [LNBFileManager postReload];
-    [self dismissViewControllerAnimated:YES completion:nil];
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // 从文件选择器返回后刷新「已设置 / 未设置」状态
+    [self reloadSpecifiers];
 }
 
-- (NSString *)prefsPath {
-    return [kBGDirectory stringByAppendingPathComponent:@"prefs.plist"];
-}
-
-- (void)loadPrefs {
-    NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:[self prefsPath]];
-    NSDictionary *defaults = @{@"enabled": @YES,
-                               @"globalEnabled": @YES,
-                               @"globalUseVideo": @NO,
-                               @"globalAlpha": @0.85,
-                               @"cardEnabled": @NO,
-                               @"cardAlpha": @0.9,
+// 首次进入时把默认值写进 prefs domain，避免 tweak 侧读到 nil
+- (void)seedDefaultsIfNeeded {
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
+    NSDictionary *defaults = @{@"enabled":         @YES,
+                               @"globalEnabled":   @YES,
+                               @"globalUseVideo":  @NO,
+                               @"globalAlpha":     @0.85,
+                               @"cardEnabled":     @NO,
+                               @"cardAlpha":       @0.9,
                                @"cardBlurOverlay": @YES,
-                               @"videoMuted": @YES,
-                               @"videoVolume": @0.6,
-                               @"mixWithOthers": @YES};
-    self.prefs = [NSMutableDictionary dictionaryWithDictionary:defaults];
-    if (saved) [self.prefs addEntriesFromDictionary:saved];
-
-    // 同步写入 NSUserDefaults，供 tweak 侧读取
-    [self syncToUserDefaults];
-}
-
-- (void)syncToUserDefaults {
-    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
-    for (NSString *key in self.prefs) {
-        [defaults setObject:self.prefs[key] forKey:key];
-    }
-    [defaults synchronize];
-}
-
-#pragma mark 表格结构
-
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return 5;
-}
-
-- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    switch (section) {
-        case 0: return @"功能开关";
-        case 1: return @"全局背景（通知列表整块）";
-        case 2: return @"声音";
-        case 3: return @"通知卡片背景（单条）";
-        case 4: return @"其它";
-        default: return nil;
-    }
-}
-
-- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    switch (section) {
-        case 1: return @"全局背景作用于锁屏通知列表整体区域。视频模式会在系统刷新时重新挂载播放层，可能出现短暂闪烁。";
-        case 2: return @"背景视频默认静音。打开声音后，若同时开着「与其他音频混音」，播放背景视频不会中断你正在听的音乐；关闭混音则背景视频独占音频通道。";
-        case 3: return @"卡片背景作用于每一条通知。为保证系统稳定性，卡片仅支持静态图片（视频自动取其首帧）。";
-        case 4: return @"修改后自动生效，无需注销。";
-        default: return nil;
-    }
-}
-
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    switch (section) {
-        case 0: return 1;
-        case 1: return 5;   // 开关 / 图片 / 视频 / 用视频 / 透明度
-        case 2: return 3;   // 静音开关 / 音量 / 混音
-        case 3: return 4;   // 开关 / 选图 / 透明度 / 遮罩
-        case 4: return 1;   // 清除全部
-        default: return 0;
-    }
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    static NSString *cellID = @"LNBActionCell";
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cellID];
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:cellID];
-    }
-    cell.accessoryView = nil;
-    cell.accessoryType = UITableViewCellAccessoryNone;
-    cell.detailTextLabel.text = nil;
-    cell.textLabel.textColor = [UIColor labelColor];
-
-    UISwitch *toggle = [[UISwitch alloc] init];
-
-    if (indexPath.section == 0) {
-        cell.textLabel.text = @"启用插件";
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        toggle.on = [self.prefs[@"enabled"] boolValue];
-        toggle.tag = 100;
-        [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
-        cell.accessoryView = toggle;
-        return cell;
-    }
-
-    if (indexPath.section == 1) {
-        switch (indexPath.row) {
-            case 0: {
-                cell.textLabel.text = @"全局背景开关";
-                cell.selectionStyle = UITableViewCellSelectionStyleNone;
-                toggle.on = [self.prefs[@"globalEnabled"] boolValue];
-                toggle.tag = 101;
-                [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
-                cell.accessoryView = toggle;
-                return cell;
-            }
-            case 1: {
-                cell.textLabel.text = @"选择背景图片";
-                BOOL exists = [LNBFileManager fileExistsNamed:kBGGlobalImage];
-                cell.detailTextLabel.text = exists ? @"已设置" : @"未设置";
-                cell.detailTextLabel.textColor = exists ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-                return cell;
-            }
-            case 2: {
-                cell.textLabel.text = @"选择背景视频";
-                BOOL exists = [LNBFileManager fileExistsNamed:kBGGlobalVideo];
-                cell.detailTextLabel.text = exists ? @"已设置" : @"未设置";
-                cell.detailTextLabel.textColor = exists ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-                return cell;
-            }
-            case 3: {
-                cell.textLabel.text = @"使用视频作为背景";
-                cell.selectionStyle = UITableViewCellSelectionStyleNone;
-                toggle.on = [self.prefs[@"globalUseVideo"] boolValue];
-                toggle.tag = 102;
-                [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
-                cell.accessoryView = toggle;
-                return cell;
-            }
-            case 4: {
-                cell.textLabel.text = @"背景透明度";
-                cell.selectionStyle = UITableViewCellSelectionStyleNone;
-                UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(0, 0, 160, 34)];
-                slider.minimumValue = 0.2;
-                slider.maximumValue = 1.0;
-                slider.value = [self.prefs[@"globalAlpha"] floatValue];
-                slider.tag = 200;
-                [slider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
-                cell.accessoryView = slider;
-                return cell;
-            }
-            default: break;
+                               @"videoMuted":      @YES,
+                               @"videoVolume":     @0.6,
+                               @"mixWithOthers":   @YES};
+    for (NSString *key in defaults) {
+        if ([d objectForKey:key] == nil) {
+            [d setObject:defaults[key] forKey:key];
         }
     }
-
-    if (indexPath.section == 2) {
-        switch (indexPath.row) {
-            case 0: {
-                cell.textLabel.text = @"静音";
-                cell.selectionStyle = UITableViewCellSelectionStyleNone;
-                toggle.on = [self.prefs[@"videoMuted"] boolValue];
-                toggle.tag = 105;
-                [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
-                cell.accessoryView = toggle;
-                return cell;
-            }
-            case 1: {
-                cell.textLabel.text = @"音量";
-                cell.selectionStyle = UITableViewCellSelectionStyleNone;
-                BOOL muted = [self.prefs[@"videoMuted"] boolValue];
-
-                UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(0, 0, 160, 34)];
-                slider.minimumValue = 0.0;
-                slider.maximumValue = 1.0;
-                slider.value = [self.prefs[@"videoVolume"] floatValue];
-                slider.tag = 202;
-                slider.enabled = !muted;
-                slider.alpha = muted ? 0.4 : 1.0;
-                [slider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
-                cell.accessoryView = slider;
-                return cell;
-            }
-            case 2: {
-                cell.textLabel.text = @"与其他音频混音";
-                cell.selectionStyle = UITableViewCellSelectionStyleNone;
-                toggle.on = [self.prefs[@"mixWithOthers"] boolValue];
-                toggle.tag = 106;
-                [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
-                cell.accessoryView = toggle;
-                return cell;
-            }
-            default: break;
-        }
-    }
-
-    if (indexPath.section == 3) {
-        switch (indexPath.row) {
-            case 0: {
-                cell.textLabel.text = @"卡片背景开关";
-                cell.selectionStyle = UITableViewCellSelectionStyleNone;
-                toggle.on = [self.prefs[@"cardEnabled"] boolValue];
-                toggle.tag = 103;
-                [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
-                cell.accessoryView = toggle;
-                return cell;
-            }
-            case 1: {
-                cell.textLabel.text = @"选择卡片图片";
-                BOOL exists = [LNBFileManager fileExistsNamed:kBGCardImage];
-                cell.detailTextLabel.text = exists ? @"已设置" : @"未设置";
-                cell.detailTextLabel.textColor = exists ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-                return cell;
-            }
-            case 2: {
-                cell.textLabel.text = @"卡片透明度";
-                cell.selectionStyle = UITableViewCellSelectionStyleNone;
-                UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(0, 0, 160, 34)];
-                slider.minimumValue = 0.2;
-                slider.maximumValue = 1.0;
-                slider.value = [self.prefs[@"cardAlpha"] floatValue];
-                slider.tag = 201;
-                [slider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
-                cell.accessoryView = slider;
-                return cell;
-            }
-            case 3: {
-                cell.textLabel.text = @"暗色遮罩（提升可读性）";
-                cell.selectionStyle = UITableViewCellSelectionStyleNone;
-                toggle.on = [self.prefs[@"cardBlurOverlay"] boolValue];
-                toggle.tag = 104;
-                [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
-                cell.accessoryView = toggle;
-                return cell;
-            }
-            default: break;
-        }
-    }
-
-    if (indexPath.section == 4) {
-        cell.textLabel.text = @"清除所有背景资源";
-        cell.textLabel.textColor = [UIColor systemRedColor];
-        cell.accessoryType = UITableViewCellAccessoryNone;
-        return cell;
-    }
-
-    return cell;
+    [d synchronize];
 }
 
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+#pragma mark 取值（供 PSSpecifier 的 get 使用）
 
-    if (indexPath.section == 1 && indexPath.row == 1) {
-        [self presentImagePickerForName:kBGGlobalImage];
-    } else if (indexPath.section == 1 && indexPath.row == 2) {
-        [self presentVideoPickerForName:kBGGlobalVideo];
-    } else if (indexPath.section == 3 && indexPath.row == 1) {
-        [self presentImagePickerForName:kBGCardImage];
-    } else if (indexPath.section == 4 && indexPath.row == 0) {
-        [self confirmClearAll];
-    }
+- (id)readPref:(PSSpecifier *)specifier {
+    NSString *key = [specifier propertyForKey:@"key"];
+    if (!key) return @NO;
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
+    id v = [d objectForKey:key];
+    if (v == nil) v = [specifier propertyForKey:@"default"];
+    return v ?: @NO;
 }
 
-#pragma mark 控件回调
+#pragma mark specifiers
 
-- (void)toggleChanged:(UISwitch *)sender {
-    switch (sender.tag) {
-        case 100: self.prefs[@"enabled"]         = @(sender.isOn); break;
-        case 101: self.prefs[@"globalEnabled"]   = @(sender.isOn); break;
-        case 102: self.prefs[@"globalUseVideo"]  = @(sender.isOn); break;
-        case 103: self.prefs[@"cardEnabled"]     = @(sender.isOn); break;
-        case 104: self.prefs[@"cardBlurOverlay"] = @(sender.isOn); break;
-        case 105: self.prefs[@"videoMuted"]      = @(sender.isOn); break;
-        case 106: self.prefs[@"mixWithOthers"]   = @(sender.isOn); break;
-        default: break;
-    }
-    [self persistAndReload];
+- (NSArray *)specifiers {
+    if (_cachedSpecifiers == nil) {
+        NSMutableArray *specs = [NSMutableArray array];
 
-    // 静音开关会改变音量滑块的可用态，需要刷新该分区
-    if (sender.tag == 105) {
-        NSIndexSet *soundSection = [NSIndexSet indexSetWithIndex:2];
-        [UIView performWithoutAnimation:^{
-            [self.tableView reloadSections:soundSection withRowAnimation:UITableViewRowAnimationNone];
-        }];
+        // ---- 0. 总开关 ----
+        [specs addObject:LNBGroup(@"功能开关", @"关闭后所有背景设置立即失效，但资源文件会保留。")];
+        [specs addObject:LNBSwitch(@"启用插件", @"enabled", self, @selector(setPref:forSpecifier:))];
+
+        // ---- 1. 全局背景 ----
+        [specs addObject:LNBGroup(@"全局背景（通知列表整块）",
+                                  @"作用于锁屏通知列表整体区域。视频模式会在系统刷新时重新挂载播放层，可能出现短暂闪烁。")];
+        [specs addObject:LNBSwitch(@"全局背景开关", @"globalEnabled", self, @selector(setPref:forSpecifier:))];
+
+        PSSpecifier *pickImage = [PSSpecifier preferenceSpecifierNamed:@"选择背景图片"
+                                                                target:self
+                                                                   set:nil
+                                                                   get:@selector(readGlobalImageDetail:)
+                                                                detail:nil
+                                                                  cell:kCellLink
+                                                                  edit:nil];
+        pickImage->action = @selector(pickGlobalImage);
+        [specs addObject:pickImage];
+
+        PSSpecifier *pickVideo = [PSSpecifier preferenceSpecifierNamed:@"选择背景视频"
+                                                                target:self
+                                                                   set:nil
+                                                                   get:@selector(readGlobalVideoDetail:)
+                                                                detail:nil
+                                                                  cell:kCellLink
+                                                                  edit:nil];
+        pickVideo->action = @selector(pickGlobalVideo);
+        [specs addObject:pickVideo];
+
+        [specs addObject:LNBSwitch(@"使用视频作为背景", @"globalUseVideo", self, @selector(setPref:forSpecifier:))];
+        [specs addObject:LNBSlider(@"背景透明度", @"globalAlpha", self, @selector(setPref:forSpecifier:), 0.2, 1.0)];
+
+        // ---- 2. 声音 ----
+        [specs addObject:LNBGroup(@"声音",
+                                  @"背景视频默认静音。打开声音后，若同时开启「与其他音频混音」，播放背景视频不会中断你正在听的音乐；关闭混音则背景视频独占音频通道。")];
+        [specs addObject:LNBSwitch(@"静音", @"videoMuted", self, @selector(setPref:forSpecifier:))];
+
+        PSSpecifier *volume = LNBSlider(@"音量", @"videoVolume", self, @selector(setPref:forSpecifier:), 0.0, 1.0);
+        [specs addObject:volume];
+
+        [specs addObject:LNBSwitch(@"与其他音频混音", @"mixWithOthers", self, @selector(setPref:forSpecifier:))];
+
+        // ---- 3. 卡片背景 ----
+        [specs addObject:LNBGroup(@"通知卡片背景（单条）",
+                                  @"作用于每一条通知。为保证系统稳定性，卡片仅支持静态图片（视频自动取其首帧）。")];
+        [specs addObject:LNBSwitch(@"卡片背景开关", @"cardEnabled", self, @selector(setPref:forSpecifier:))];
+
+        PSSpecifier *pickCard = [PSSpecifier preferenceSpecifierNamed:@"选择卡片图片"
+                                                               target:self
+                                                                  set:nil
+                                                                  get:@selector(readCardImageDetail:)
+                                                               detail:nil
+                                                                 cell:kCellLink
+                                                                 edit:nil];
+        pickCard->action = @selector(pickCardImage);
+        [specs addObject:pickCard];
+
+        [specs addObject:LNBSlider(@"卡片透明度", @"cardAlpha", self, @selector(setPref:forSpecifier:), 0.2, 1.0)];
+        [specs addObject:LNBSwitch(@"暗色遮罩（提升可读性）", @"cardBlurOverlay", self, @selector(setPref:forSpecifier:))];
+
+        // ---- 4. 其它 ----
+        [specs addObject:LNBGroup(@"其它", @"所有修改即时生效，无需注销或重启。")];
+
+        PSSpecifier *status = [PSSpecifier preferenceSpecifierNamed:@"资源状态"
+                                                             target:self
+                                                                set:nil
+                                                                get:@selector(readStatusDetail:)
+                                                             detail:nil
+                                                               cell:kCellStatic
+                                                               edit:nil];
+        [status setProperty:@NO forKey:@"enabled"];
+        [specs addObject:status];
+
+        PSSpecifier *clearBtn = [PSSpecifier preferenceSpecifierNamed:@"清除所有背景资源"
+                                                              target:self
+                                                                 set:nil
+                                                                 get:nil
+                                                              detail:nil
+                                                                cell:kCellButton
+                                                                edit:nil];
+        clearBtn->action = @selector(confirmClearAll);
+        [clearBtn setProperty:@(YES) forKey:@"enabled"];
+        [specs addObject:clearBtn];
+
+        _cachedSpecifiers = specs;
     }
+    return _cachedSpecifiers;
 }
 
-- (void)sliderChanged:(UISlider *)sender {
-    switch (sender.tag) {
-        case 200: self.prefs[@"globalAlpha"] = @(sender.value); break;
-        case 201: self.prefs[@"cardAlpha"]   = @(sender.value); break;
-        case 202: self.prefs[@"videoVolume"] = @(sender.value); break;
-        default: break;
-    }
-    [self persistAndReload];
+#pragma mark 详情文本（右侧灰字）
+
+- (id)readGlobalImageDetail:(PSSpecifier *)specifier {
+    return [LNBFileManager fileExistsNamed:kBGGlobalImage] ? @"已设置" : @"未设置";
 }
 
-- (void)persistAndReload {
-    [self.prefs writeToFile:[self prefsPath] atomically:YES];
-    [self syncToUserDefaults];
+- (id)readGlobalVideoDetail:(PSSpecifier *)specifier {
+    return [LNBFileManager fileExistsNamed:kBGGlobalVideo] ? @"已设置" : @"未设置";
+}
+
+- (id)readCardImageDetail:(PSSpecifier *)specifier {
+    return [LNBFileManager fileExistsNamed:kBGCardImage] ? @"已设置" : @"未设置";
+}
+
+- (id)readStatusDetail:(PSSpecifier *)specifier {
+    NSMutableArray *parts = [NSMutableArray array];
+    if ([LNBFileManager fileExistsNamed:kBGGlobalImage]) [parts addObject:@"全局图"];
+    if ([LNBFileManager fileExistsNamed:kBGGlobalVideo]) [parts addObject:@"视频"];
+    if ([LNBFileManager fileExistsNamed:kBGCardImage])   [parts addObject:@"卡片图"];
+    return parts.count ? [parts componentsJoinedByString:@" / "] : @"尚无资源";
+}
+
+#pragma mark 写值
+
+- (void)setPref:(id)value forSpecifier:(PSSpecifier *)specifier {
+    NSString *key = [specifier propertyForKey:@"key"];
+    if (!key) return;
+
+    // 静音时把音量记成 0，避免静音状态下残留音量值让用户困惑
+    id stored = value;
+    if ([key isEqualToString:@"videoMuted"] && [value boolValue]) {
+        // 仅切换静音标志，音量值保留，取消静音后恢复
+        stored = value;
+    }
+
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
+    [d setObject:stored forKey:key];
+    [d synchronize];
+
     [LNBFileManager postReload];
 }
 
-#pragma mark 文件选择
+#pragma mark 资源选择
 
-- (void)presentImagePickerForName:(NSString *)fileName {
+- (void)pickGlobalImage { [self presentPickerForName:kBGGlobalImage isVideo:NO]; }
+- (void)pickGlobalVideo { [self presentPickerForName:kBGGlobalVideo isVideo:YES]; }
+- (void)pickCardImage   { [self presentPickerForName:kBGCardImage   isVideo:NO]; }
+
+- (void)presentPickerForName:(NSString *)fileName isVideo:(BOOL)isVideo {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.mediaTypes = @[UTTypeImage.identifier];
+    picker.mediaTypes = isVideo ? @[UTTypeMovie.identifier] : @[UTTypeImage.identifier];
+    if (isVideo) picker.videoQuality = UIImagePickerControllerQualityTypeHigh;
     picker.delegate = self;
     picker.modalPresentationStyle = UIModalPresentationFullScreen;
-    // 用 tag 传递目标文件名
-    objc_setAssociatedObject(picker, @selector(presentImagePickerForName:), fileName, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    objc_setAssociatedObject(picker, @selector(presentPickerForName:isVideo:),
+                             fileName, OBJC_ASSOCIATION_COPY_NONATOMIC);
     [self presentViewController:picker animated:YES completion:nil];
 }
 
-- (void)presentVideoPickerForName:(NSString *)fileName {
-    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.mediaTypes = @[UTTypeMovie.identifier];
-    picker.videoQuality = UIImagePickerControllerQualityTypeHigh;
-    picker.delegate = self;
-    picker.modalPresentationStyle = UIModalPresentationFullScreen;
-    objc_setAssociatedObject(picker, @selector(presentVideoPickerForName:), fileName, OBJC_ASSOCIATION_COPY_NONATOMIC);
-    [self presentViewController:picker animated:YES completion:nil];
-}
-
-- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
-    NSString *targetName = objc_getAssociatedObject(picker, @selector(presentImagePickerForName:));
-    if (!targetName) {
-        targetName = objc_getAssociatedObject(picker, @selector(presentVideoPickerForName:));
-    }
+- (void)imagePickerController:(UIImagePickerController *)picker
+        didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
+    NSString *targetName = objc_getAssociatedObject(picker, @selector(presentPickerForName:isVideo:));
 
     [picker dismissViewControllerAnimated:YES completion:^{
         if (!targetName) return;
@@ -475,16 +406,14 @@
 
         if ([targetName isEqualToString:kBGGlobalVideo]) {
             NSURL *videoURL = info[UIImagePickerControllerMediaURL];
-            if (videoURL) {
-                ok = [LNBFileManager copyFileAtURL:videoURL toName:targetName error:&error];
-            }
+            if (videoURL) ok = [LNBFileManager copyFileAtURL:videoURL toName:targetName error:&error];
         } else {
             NSURL *imageURL = info[UIImagePickerControllerImageURL];
             UIImage *image = info[UIImagePickerControllerOriginalImage];
             if (imageURL) {
                 ok = [LNBFileManager copyFileAtURL:imageURL toName:targetName error:&error];
             } else if (image) {
-                // 无 URL 时（如某些相册资源）手动写 JPEG
+                // 部分相册资源拿不到 URL，直接编码写盘
                 NSData *jpeg = UIImageJPEGRepresentation(image, 0.92);
                 NSString *dest = [LNBFileManager pathForFile:targetName];
                 ok = [jpeg writeToFile:dest atomically:YES];
@@ -492,9 +421,8 @@
         }
 
         if (ok) {
-            [self.prefs writeToFile:[self prefsPath] atomically:YES];
             [LNBFileManager postReload];
-            [self.tableView reloadData];
+            [self reloadSpecifiers];
             [self showAlertWithTitle:@"设置成功" message:[NSString stringWithFormat:@"已保存为 %@", targetName]];
         } else {
             [self showAlertWithTitle:@"设置失败" message:error.localizedDescription ?: @"无法写入文件"];
@@ -518,7 +446,7 @@
         [LNBFileManager removeFileNamed:kBGGlobalVideo];
         [LNBFileManager removeFileNamed:kBGCardImage];
         [LNBFileManager postReload];
-        [self.tableView reloadData];
+        [self reloadSpecifiers];
         [self showAlertWithTitle:@"已清除" message:@"所有背景资源已删除。"];
     }]];
     [self presentViewController:alert animated:YES completion:nil];
