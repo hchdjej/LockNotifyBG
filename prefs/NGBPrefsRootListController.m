@@ -261,7 +261,7 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
                                                                 detail:nil
                                                                   cell:kCellLink
                                                                   edit:nil];
-        pickImage->action = @selector(pickGlobalImage);
+        pickImage.action = @selector(pickGlobalImage);
         [specs addObject:pickImage];
 
         PSSpecifier *pickVideo = [PSSpecifier preferenceSpecifierNamed:@"选择背景视频"
@@ -271,7 +271,7 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
                                                                 detail:nil
                                                                   cell:kCellLink
                                                                   edit:nil];
-        pickVideo->action = @selector(pickGlobalVideo);
+        pickVideo.action = @selector(pickGlobalVideo);
         [specs addObject:pickVideo];
 
         [specs addObject:LNBSwitch(@"使用视频作为背景", @"globalUseVideo", self, @selector(setPref:forSpecifier:))];
@@ -299,7 +299,7 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
                                                                detail:nil
                                                                  cell:kCellLink
                                                                  edit:nil];
-        pickCard->action = @selector(pickCardImage);
+        pickCard.action = @selector(pickCardImage);
         [specs addObject:pickCard];
 
         [specs addObject:LNBSlider(@"卡片透明度", @"cardAlpha", self, @selector(setPref:forSpecifier:), 0.2, 1.0)];
@@ -325,7 +325,7 @@ static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL act
                                                               detail:nil
                                                                 cell:kCellButton
                                                                 edit:nil];
-        clearBtn->action = @selector(confirmClearAll);
+        clearBtn.action = @selector(confirmClearAll);
         [clearBtn setProperty:@(YES) forKey:@"enabled"];
         [specs addObject:clearBtn];
 
