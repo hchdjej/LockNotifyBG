@@ -411,7 +411,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
     PSSpecifier *spec = [self specifierAtIndexPath:indexPath];
     if (spec) {
         NSString *k = [spec propertyForKey:@"lnbAction"];
-        LNBLog(@"[D] 点击行 %@ — lnbAction=%@", NSStringFromNSIndexPath(indexPath), k);
+        LNBLog(@"[D] 点击行 %@ — lnbAction=%@", [indexPath description], k);
         if ([k isEqualToString:@"pickGlobalImage"]) { [self lnbPickGlobalImage:spec]; return; }
         if ([k isEqualToString:@"pickGlobalVideo"]) { [self lnbPickGlobalVideo:spec]; return; }
         if ([k isEqualToString:@"pickCardImage"])   { [self lnbPickCardImage:spec];   return; }
