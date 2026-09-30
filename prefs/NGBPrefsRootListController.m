@@ -2,11 +2,15 @@
 //  NGBPrefsRootListController.m
 //  LockNotifyBG 偏好设置面板
 //
-//  必须是 PSListController 子类 —— PreferenceLoader 以 specifier 机制驱动
-//  设置界面，任何 UITableViewController 子类都会因缺失 specifiers 而闪退。
+//  PSListController 子类。声明部分逐行对照 theos/headers/Preferences 官方头文件：
+//  PSSpecifier.h / PSListController.h / PSViewController.h / PSTableCell.h
 //
-//  提供：总开关、全局背景开关、透明度、视频与音频控制、卡片背景、资源文件选择。
-//  资源文件统一存放在 /var/mobile/Library/LockNotifyBG/
+//  关键教训（由设备端日志定位）：
+//   1. PSSpecifier 的 action 是 @public ivar，没有 setAction: 方法 —— 用 .action
+//      会编译成 setAction: 消息导致 unrecognized selector 闪退；正确写法是 ->action。
+//      按钮行则优先用 buttonAction 属性（iOS 9+）。
+//   2. preferenceSpecifierNamed: 的 cell: 参数是 PSCellType 枚举，不是字符串。
+//   3. PSListController 依赖 _specifiers ivar 生成分组索引，getter 必须写入它。
 //
 
 #import <UIKit/UIKit.h>
@@ -16,50 +20,58 @@
 #import <objc/runtime.h>
 #import <notify.h>
 
-// ---------------------------------------------------------------------------
-// Preferences 私有框架的最小声明
-//
-// PSListController / PSSpecifier 定义在私有框架 Preferences 中，其头文件不在
-// 主流 iOS SDK 里（需要额外引入 theos/headers 仓库）。这里自带最小声明，
-// 既避免额外依赖，又保证链接时符号能正确解析到 Preferences.framework。
-// ---------------------------------------------------------------------------
+#pragma mark - Preferences 私有框架最小声明（照抄 theos/headers）
 
-// PSSpecifier 的 cell 类型：直接用字符串，Preferences 框架按名实例化对应 cell 类
-// （不引用 PSControlTableCellType 等外部符号，避免链接期缺失）
-#define kCellSwitch   @"PSSwitchCell"
-#define kCellSlider   @"PSSliderCell"
-#define kCellLink     @"PSLinkCell"
-#define kCellStatic   @"PSStaticTextCell"
-#define kCellButton   @"PSButtonCell"
+typedef NS_ENUM(NSInteger, PSCellType) {
+	PSGroupCell,
+	PSLinkCell,
+	PSLinkListCell,
+	PSListItemCell,
+	PSTitleValueCell,
+	PSSliderCell,
+	PSSwitchCell,
+	PSStaticTextCell,
+	PSEditTextCell,
+	PSSegmentCell,
+	PSGiantIconCell,
+	PSGiantCell,
+	PSSecureEditTextCell,
+	PSButtonCell,
+	PSEditTextViewCell,
+	PSSpinnerCell
+};
 
-@interface PSSpecifier : NSObject
-@property (nonatomic, assign) SEL action;
-@property (nonatomic, assign) SEL getter;
-@property (nonatomic, assign) SEL setter;
-@property (nonatomic, strong) id target;
-
-+ (instancetype)preferenceSpecifierNamed:(NSString *)name
-                                  target:(id)target
-                                     set:(SEL)setter
-                                     get:(SEL)getter
-                                  detail:(Class)detail
-                                    cell:(NSString *)cell
-                                    edit:(Class)edit;
+@interface PSSpecifier : NSObject {
+@public
+	SEL action;
+}
++ (instancetype)preferenceSpecifierNamed:(NSString *)identifier target:(id)target set:(SEL)set get:(SEL)get detail:(Class)detail cell:(PSCellType)cellType edit:(Class)edit;
 + (instancetype)groupSpecifierWithName:(NSString *)name;
 
-- (void)setProperty:(id)value forKey:(NSString *)key;
+@property (nonatomic, retain) id target;
+@property (nonatomic, retain) NSString *name;
+@property (nonatomic) PSCellType cellType;
+@property (nonatomic) SEL buttonAction;
+@property (nonatomic, retain) NSMutableDictionary *properties;
+
 - (id)propertyForKey:(NSString *)key;
+- (void)setProperty:(id)property forKey:(NSString *)key;
+- (id)performGetter;
+- (void)performSetterWithValue:(id)value;
 @end
 
-@interface PSListController : UIViewController <UITableViewDataSource, UITableViewDelegate> {
-    // PSListController 内部直接访问 _specifiers 来生成分组索引与 cell 元数据，
-    // 因此必须把 specifier 数组写进这个 ivar，而不是自己的缓存变量。
-    NSMutableArray *_specifiers;
+@interface PSViewController : UIViewController
+- (id)readPreferenceValue:(PSSpecifier *)specifier;
+- (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier;
+@end
+
+@interface PSListController : PSViewController <UITableViewDelegate, UITableViewDataSource> {
+	NSMutableArray *_specifiers;
 }
-@property (nonatomic, strong) NSMutableArray *specifiers;
-@property (nonatomic, strong) UITableView *table;
+@property (nonatomic, retain) UITableView *table;
+@property (nonatomic, retain) NSMutableArray *specifiers;
+- (PSSpecifier *)specifierAtIndexPath:(NSIndexPath *)indexPath;
 - (void)reloadSpecifiers;
-- (NSArray *)loadSpecifiersFromPlistName:(NSString *)name target:(id)target;
 @end
 
 #define kPrefsDomain        @"com.hchdjej.locknotifybg"
@@ -91,17 +103,10 @@
             withIntermediateDirectories:YES
                              attributes:@{NSFilePosixPermissions: @(0755)}
                                   error:&error];
-    if (!ok) {
-        NSLog(@"[LockNotifyBG] 创建目录失败: %@", error);
-        return NO;
-    }
+    if (!ok) return NO;
 
-    // 目录创建后单独修正属主与权限（创建时 attributes 对属主项不完全生效）
-    [fm setAttributes:@{NSFilePosixPermissions: @(0755),
-                        NSFileOwnerAccountName: @"mobile",
-                        NSFileGroupOwnerAccountName: @"mobile"}
+    [fm setAttributes:@{NSFilePosixPermissions: @(0755)}
          ofItemAtPath:kBGDirectory error:nil];
-
     return YES;
 }
 
@@ -120,16 +125,10 @@
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dest = [self pathForFile:name];
 
-    // 覆盖前先删除，避免 copyItemAtURL 因目标已存在而失败
-    if ([fm fileExistsAtPath:dest]) {
-        [fm removeItemAtPath:dest error:nil];
-    }
+    if ([fm fileExistsAtPath:dest]) [fm removeItemAtPath:dest error:nil];
 
     BOOL ok = [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:dest] error:error];
-    if (ok) {
-        [fm setAttributes:@{NSFilePosixPermissions: @(0644)}
-             ofItemAtPath:dest error:nil];
-    }
+    if (ok) [fm setAttributes:@{NSFilePosixPermissions: @(0644)} ofItemAtPath:dest error:nil];
     return ok;
 }
 
@@ -150,51 +149,8 @@
 
 @end
 
-#pragma mark - PSSpecifier 便捷构造
+#pragma mark - 诊断日志
 
-static PSSpecifier *LNBGroup(NSString *header, NSString *footer) {
-    PSSpecifier *s = [PSSpecifier groupSpecifierWithName:header];
-    if (footer) [s setProperty:footer forKey:@"footerText"];
-    return s;
-}
-
-static PSSpecifier *LNBSwitch(NSString *label, NSString *key, id target, SEL action) {
-    PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:label
-                                                    target:target
-                                                       set:action
-                                                       get:@selector(readPreferenceValue:)
-                                                    detail:nil
-                                                      cell:kCellSwitch
-                                                      edit:nil];
-    [s setProperty:key forKey:@"key"];
-    [s setProperty:kPrefsDomain forKey:@"defaults"];
-    [s setProperty:@YES forKey:@"default"];
-    return s;
-}
-
-static PSSpecifier *LNBSlider(NSString *label, NSString *key, id target, SEL action,
-                              double min, double max) {
-    PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:label
-                                                    target:target
-                                                       set:action
-                                                       get:@selector(readPreferenceValue:)
-                                                    detail:nil
-                                                      cell:kCellSlider
-                                                      edit:nil];
-    [s setProperty:key forKey:@"key"];
-    [s setProperty:kPrefsDomain forKey:@"defaults"];
-    [s setProperty:@(min) forKey:@"min"];
-    [s setProperty:@(max) forKey:@"max"];
-    [s setProperty:@YES forKey:@"showValue"];
-    return s;
-}
-
-#pragma mark - 主设置控制器
-
-// ---------------------------------------------------------------------------
-// 诊断日志：写入 /var/mobile/Library/LockNotifyBG/prefs.log
-// 用于定位设置面板启动阶段的具体崩溃点（该路径全局可写，用 Filza 即可查看）
-// ---------------------------------------------------------------------------
 static void LNBLog(NSString *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -203,8 +159,7 @@ static void LNBLog(NSString *fmt, ...) {
 
     NSString *dir = @"/var/mobile/Library/LockNotifyBG";
     [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                              withIntermediateDirectories:YES
-                                               attributes:nil error:nil];
+                              withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *path = [dir stringByAppendingPathComponent:@"prefs.log"];
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
     df.dateFormat = @"HH:mm:ss.SSS";
@@ -220,24 +175,78 @@ static void LNBLog(NSString *fmt, ...) {
     }
 }
 
+#pragma mark - specifier 构造辅助
+
+static PSSpecifier *LNBGroup(NSString *header, NSString *footer) {
+    PSSpecifier *s = [PSSpecifier groupSpecifierWithName:header];
+    if (footer) [s setProperty:footer forKey:@"footerText"];
+    return s;
+}
+
+// 开关行：set/get 传 nil，值读写走 PSViewController 的
+// readPreferenceValue: / setPreferenceValue:specifier: 钩子
+static PSSpecifier *LNBSwitch(NSString *label, NSString *key) {
+    PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:label
+                                                    target:nil
+                                                       set:nil
+                                                       get:nil
+                                                    detail:nil
+                                                      cell:PSSwitchCell
+                                                      edit:nil];
+    [s setProperty:key forKey:@"key"];
+    [s setProperty:kPrefsDomain forKey:@"defaults"];
+    [s setProperty:@YES forKey:@"default"];
+    return s;
+}
+
+static PSSpecifier *LNBSlider(NSString *label, NSString *key, double min, double max) {
+    PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:label
+                                                    target:nil
+                                                       set:nil
+                                                       get:nil
+                                                    detail:nil
+                                                      cell:PSSliderCell
+                                                      edit:nil];
+    [s setProperty:key forKey:@"key"];
+    [s setProperty:kPrefsDomain forKey:@"defaults"];
+    [s setProperty:@(min) forKey:@"min"];
+    [s setProperty:@(max) forKey:@"max"];
+    [s setProperty:@YES forKey:@"showValue"];
+    return s;
+}
+
+// 按钮行：buttonAction 属性 + ->action ivar 双保险，再用 lnbAction 兜底
+static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *actionKey) {
+    PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:label
+                                                    target:target
+                                                       set:nil
+                                                       get:nil
+                                                    detail:nil
+                                                      cell:PSButtonCell
+                                                      edit:nil];
+    s.buttonAction = sel;
+    s->action = sel;
+    [s setProperty:actionKey forKey:@"lnbAction"];
+    return s;
+}
+
+#pragma mark - 主设置控制器
+
 @interface NGBPrefsRootListController : PSListController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @end
 
 @implementation NGBPrefsRootListController
 
-// 类被加载进内存时立刻记录 —— 若连这行都没有，说明二进制根本没被加载
 + (void)load {
-    LNBLog(@"=== [1] 类已加载 (load) ===");
+    LNBLog(@"=== [1] 类已加载（load）===");
 }
 
 - (instancetype)init {
-    LNBLog(@"[2] init 进入, super=%@", NSStringFromClass([self superclass]));
+    LNBLog(@"[2] init 进入，super=%@", NSStringFromClass([self superclass]));
     self = [super init];
     LNBLog(@"[3] init 返回 self=%@", self ? @"OK" : @"nil");
     return self;
 }
-
-#pragma mark 生命周期
 
 - (void)viewDidLoad {
     LNBLog(@"[4] viewDidLoad 进入");
@@ -258,12 +267,10 @@ static void LNBLog(NSString *fmt, ...) {
 - (void)viewWillAppear:(BOOL)animated {
     LNBLog(@"[8] viewWillAppear 进入");
     [super viewWillAppear:animated];
-    LNBLog(@"[9] super viewWillAppear 完成");
     [self.table reloadData];
     LNBLog(@"[10] reloadData 完成");
 }
 
-// 首次进入时把默认值写进 prefs domain，避免 tweak 侧读到 nil
 - (void)seedDefaultsIfNeeded {
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
     NSDictionary *defaults = @{@"enabled":         @YES,
@@ -277,16 +284,13 @@ static void LNBLog(NSString *fmt, ...) {
                                @"videoVolume":     @0.6,
                                @"mixWithOthers":   @YES};
     for (NSString *key in defaults) {
-        if ([d objectForKey:key] == nil) {
-            [d setObject:defaults[key] forKey:key];
-        }
+        if ([d objectForKey:key] == nil) [d setObject:defaults[key] forKey:key];
     }
     [d synchronize];
 }
 
-#pragma mark 偏好读写（PSListController 原生扩展点）
+#pragma mark 值读写（PSViewController 标准钩子）
 
-// 框架读取开关/滑块当前值时会调用这里
 - (id)readPreferenceValue:(PSSpecifier *)specifier {
     NSString *key = [specifier propertyForKey:@"key"];
     if (!key) return @NO;
@@ -296,7 +300,6 @@ static void LNBLog(NSString *fmt, ...) {
     return v ?: @NO;
 }
 
-// 用户改动开关/滑块时框架调用这里
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
     NSString *key = [specifier propertyForKey:@"key"];
     if (!key) return;
@@ -307,7 +310,6 @@ static void LNBLog(NSString *fmt, ...) {
 
     [LNBFileManager postReload];
 
-    // 让依赖该值的行（如音量滑块）立即刷新
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.table reloadData];
     });
@@ -316,120 +318,63 @@ static void LNBLog(NSString *fmt, ...) {
 #pragma mark specifiers
 
 - (NSArray *)specifiers {
-    LNBLog(@"[S1] specifiers 被调用, 当前 _specifiers=%@", _specifiers ? @"非空" : @"nil");
-    // 必须写入 PSListController 的 _specifiers：
-    // 父类靠它生成分组索引、cell 高度等元数据；若为 nil 会去加载同名 plist
-    // （本 bundle 没有该文件），随后在取索引时越界崩溃。
+    LNBLog(@"[S1] specifiers 被调用，当前 _specifiers=%@", _specifiers ? @"非空" : @"nil");
     if (_specifiers == nil) {
         NSMutableArray *specs = [NSMutableArray array];
-        LNBLog(@"[S2] 开始构建 specifier 数组");
 
         // ---- 0. 总开关 ----
         [specs addObject:LNBGroup(@"功能开关", @"关闭后所有背景设置立即失效，但资源文件会保留。")];
-        [specs addObject:LNBSwitch(@"启用插件", @"enabled", self, @selector(setPreferenceValue:specifier:))];
+        [specs addObject:LNBSwitch(@"启用插件", @"enabled")];
 
         // ---- 1. 全局背景 ----
         [specs addObject:LNBGroup(@"全局背景（通知列表整块）",
                                   @"作用于锁屏通知列表整体区域。视频模式会在系统刷新时重新挂载播放层，可能出现短暂闪烁。")];
-        [specs addObject:LNBSwitch(@"全局背景开关", @"globalEnabled", self, @selector(setPreferenceValue:specifier:))];
-
-        PSSpecifier *pickImage = [PSSpecifier preferenceSpecifierNamed:@"选择背景图片"
-                                                                target:self
-                                                                   set:nil
-                                                                   get:@selector(readGlobalImageDetail:)
-                                                                detail:nil
-                                                                  cell:kCellLink
-                                                                  edit:nil];
-        pickImage.action = @selector(pickGlobalImage);
-        [specs addObject:pickImage];
-
-        PSSpecifier *pickVideo = [PSSpecifier preferenceSpecifierNamed:@"选择背景视频"
-                                                                target:self
-                                                                   set:nil
-                                                                   get:@selector(readGlobalVideoDetail:)
-                                                                detail:nil
-                                                                  cell:kCellLink
-                                                                  edit:nil];
-        pickVideo.action = @selector(pickGlobalVideo);
-        [specs addObject:pickVideo];
-
-        [specs addObject:LNBSwitch(@"使用视频作为背景", @"globalUseVideo", self, @selector(setPreferenceValue:specifier:))];
-        [specs addObject:LNBSlider(@"背景透明度", @"globalAlpha", self, @selector(setPreferenceValue:specifier:), 0.2, 1.0)];
+        [specs addObject:LNBSwitch(@"全局背景开关", @"globalEnabled")];
+        [specs addObject:LNBButton(self, @"选择背景图片", @selector(lnbPickGlobalImage:), @"pickGlobalImage")];
+        [specs addObject:LNBButton(self, @"选择背景视频", @selector(lnbPickGlobalVideo:), @"pickGlobalVideo")];
+        [specs addObject:LNBSwitch(@"使用视频作为背景", @"globalUseVideo")];
+        [specs addObject:LNBSlider(@"背景透明度", @"globalAlpha", 0.2, 1.0)];
 
         // ---- 2. 声音 ----
         [specs addObject:LNBGroup(@"声音",
-                                  @"背景视频默认静音。打开声音后，若同时开启「与其他音频混音」，播放背景视频不会中断你正在听的音乐；关闭混音则背景视频独占音频通道。")];
-        [specs addObject:LNBSwitch(@"静音", @"videoMuted", self, @selector(setPreferenceValue:specifier:))];
-
-        PSSpecifier *volume = LNBSlider(@"音量", @"videoVolume", self, @selector(setPreferenceValue:specifier:), 0.0, 1.0);
-        [specs addObject:volume];
-
-        [specs addObject:LNBSwitch(@"与其他音频混音", @"mixWithOthers", self, @selector(setPreferenceValue:specifier:))];
+                                  @"背景视频默认静音。打开声音后，若同时开启「与其他音频混音」，播放背景视频不会中断你正在听的音乐。")];
+        [specs addObject:LNBSwitch(@"静音", @"videoMuted")];
+        [specs addObject:LNBSlider(@"音量", @"videoVolume", 0.0, 1.0)];
+        [specs addObject:LNBSwitch(@"与其他音频混音", @"mixWithOthers")];
 
         // ---- 3. 卡片背景 ----
         [specs addObject:LNBGroup(@"通知卡片背景（单条）",
-                                  @"作用于每一条通知。为保证系统稳定性，卡片仅支持静态图片（视频自动取其首帧）。")];
-        [specs addObject:LNBSwitch(@"卡片背景开关", @"cardEnabled", self, @selector(setPreferenceValue:specifier:))];
-
-        PSSpecifier *pickCard = [PSSpecifier preferenceSpecifierNamed:@"选择卡片图片"
-                                                               target:self
-                                                                  set:nil
-                                                                  get:@selector(readCardImageDetail:)
-                                                               detail:nil
-                                                                 cell:kCellLink
-                                                                 edit:nil];
-        pickCard.action = @selector(pickCardImage);
-        [specs addObject:pickCard];
-
-        [specs addObject:LNBSlider(@"卡片透明度", @"cardAlpha", self, @selector(setPreferenceValue:specifier:), 0.2, 1.0)];
-        [specs addObject:LNBSwitch(@"暗色遮罩（提升可读性）", @"cardBlurOverlay", self, @selector(setPreferenceValue:specifier:))];
+                                  @"作用于每一条通知。卡片仅支持静态图片。")];
+        [specs addObject:LNBSwitch(@"卡片背景开关", @"cardEnabled")];
+        [specs addObject:LNBButton(self, @"选择卡片图片", @selector(lnbPickCardImage:), @"pickCardImage")];
+        [specs addObject:LNBSlider(@"卡片透明度", @"cardAlpha", 0.2, 1.0)];
+        [specs addObject:LNBSwitch(@"暗色遮罩（提升可读性）", @"cardBlurOverlay")];
 
         // ---- 4. 其它 ----
-        [specs addObject:LNBGroup(@"其它", @"所有修改即时生效，无需注销或重启。")];
+        [specs addObject:LNBGroup(@"其它", @"所有修改即时生效，无需注销。")];
 
         PSSpecifier *status = [PSSpecifier preferenceSpecifierNamed:@"资源状态"
-                                                             target:self
+                                                             target:nil
                                                                 set:nil
-                                                                get:@selector(readStatusDetail:)
+                                                                get:@selector(lnbStatusDetail:)
                                                              detail:nil
-                                                               cell:kCellStatic
+                                                               cell:PSStaticTextCell
                                                                edit:nil];
         [status setProperty:@NO forKey:@"enabled"];
         [specs addObject:status];
 
-        PSSpecifier *clearBtn = [PSSpecifier preferenceSpecifierNamed:@"清除所有背景资源"
-                                                              target:self
-                                                                 set:nil
-                                                                 get:nil
-                                                              detail:nil
-                                                                cell:kCellButton
-                                                                edit:nil];
-        clearBtn.action = @selector(confirmClearAll);
-        [clearBtn setProperty:@(YES) forKey:@"enabled"];
-        [specs addObject:clearBtn];
+        [specs addObject:LNBButton(self, @"清除所有背景资源", @selector(lnbConfirmClearAll:), @"clearAll")];
 
         _specifiers = specs;
-        LNBLog(@"[S3] specifier 构建完成, 共 %lu 项", (unsigned long)specs.count);
+        LNBLog(@"[S3] 构建完成，共 %lu 项", (unsigned long)specs.count);
     }
-    LNBLog(@"[S4] 返回 _specifiers (%lu 项)", (unsigned long)_specifiers.count);
+    LNBLog(@"[S4] 返回 %lu 项", (unsigned long)_specifiers.count);
     return _specifiers;
 }
 
-#pragma mark 详情文本（右侧灰字）
+#pragma mark 详情与状态文本
 
-- (id)readGlobalImageDetail:(PSSpecifier *)specifier {
-    return [LNBFileManager fileExistsNamed:kBGGlobalImage] ? @"已设置" : @"未设置";
-}
-
-- (id)readGlobalVideoDetail:(PSSpecifier *)specifier {
-    return [LNBFileManager fileExistsNamed:kBGGlobalVideo] ? @"已设置" : @"未设置";
-}
-
-- (id)readCardImageDetail:(PSSpecifier *)specifier {
-    return [LNBFileManager fileExistsNamed:kBGCardImage] ? @"已设置" : @"未设置";
-}
-
-- (id)readStatusDetail:(PSSpecifier *)specifier {
+- (id)lnbStatusDetail:(PSSpecifier *)specifier {
     NSMutableArray *parts = [NSMutableArray array];
     if ([LNBFileManager fileExistsNamed:kBGGlobalImage]) [parts addObject:@"全局图"];
     if ([LNBFileManager fileExistsNamed:kBGGlobalVideo]) [parts addObject:@"视频"];
@@ -437,11 +382,45 @@ static void LNBLog(NSString *fmt, ...) {
     return parts.count ? [parts componentsJoinedByString:@" / "] : @"尚无资源";
 }
 
-#pragma mark 资源选择
+#pragma mark 点击处理（buttonAction 主路径 + didSelect 兜底）
 
-- (void)pickGlobalImage { [self presentPickerForName:kBGGlobalImage isVideo:NO]; }
-- (void)pickGlobalVideo { [self presentPickerForName:kBGGlobalVideo isVideo:YES]; }
-- (void)pickCardImage   { [self presentPickerForName:kBGCardImage   isVideo:NO]; }
+- (void)lnbPickGlobalImage:(PSSpecifier *)spec { [self presentPickerForName:kBGGlobalImage isVideo:NO]; }
+- (void)lnbPickGlobalVideo:(PSSpecifier *)spec { [self presentPickerForName:kBGGlobalVideo isVideo:YES]; }
+- (void)lnbPickCardImage:(PSSpecifier *)spec   { [self presentPickerForName:kBGCardImage   isVideo:NO]; }
+
+- (void)lnbConfirmClearAll:(PSSpecifier *)spec {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"确认清除"
+                                                                  message:@"将删除已设置的所有背景图片和视频。"
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [LNBFileManager removeFileNamed:kBGGlobalImage];
+        [LNBFileManager removeFileNamed:kBGGlobalVideo];
+        [LNBFileManager removeFileNamed:kBGCardImage];
+        [LNBFileManager postReload];
+        [self.table reloadData];
+        [self lnbShowAlert:@"已清除" message:@"所有背景资源已删除。"];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+// 兜底：若框架未触发 buttonAction，在 didSelectRowAtIndexPath 里按 lnbAction 分发
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+
+    PSSpecifier *spec = [self specifierAtIndexPath:indexPath];
+    if (spec) {
+        NSString *k = [spec propertyForKey:@"lnbAction"];
+        LNBLog(@"[D] 点击行 %@ — lnbAction=%@", NSStringFromNSIndexPath(indexPath), k);
+        if ([k isEqualToString:@"pickGlobalImage"]) { [self lnbPickGlobalImage:spec]; return; }
+        if ([k isEqualToString:@"pickGlobalVideo"]) { [self lnbPickGlobalVideo:spec]; return; }
+        if ([k isEqualToString:@"pickCardImage"])   { [self lnbPickCardImage:spec];   return; }
+        if ([k isEqualToString:@"clearAll"])        { [self lnbConfirmClearAll:spec]; return; }
+    }
+    [super tableView:tableView didSelectRowAtIndexPath:indexPath];
+}
+
+#pragma mark 资源选择
 
 - (void)presentPickerForName:(NSString *)fileName isVideo:(BOOL)isVideo {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
@@ -474,19 +453,17 @@ static void LNBLog(NSString *fmt, ...) {
             if (imageURL) {
                 ok = [LNBFileManager copyFileAtURL:imageURL toName:targetName error:&error];
             } else if (image) {
-                // 部分相册资源拿不到 URL，直接编码写盘
                 NSData *jpeg = UIImageJPEGRepresentation(image, 0.92);
-                NSString *dest = [LNBFileManager pathForFile:targetName];
-                ok = [jpeg writeToFile:dest atomically:YES];
+                ok = [jpeg writeToFile:[LNBFileManager pathForFile:targetName] atomically:YES];
             }
         }
 
         if (ok) {
             [LNBFileManager postReload];
             [self.table reloadData];
-            [self showAlertWithTitle:@"设置成功" message:[NSString stringWithFormat:@"已保存为 %@", targetName]];
+            [self lnbShowAlert:@"设置成功" message:[NSString stringWithFormat:@"已保存为 %@", targetName]];
         } else {
-            [self showAlertWithTitle:@"设置失败" message:error.localizedDescription ?: @"无法写入文件"];
+            [self lnbShowAlert:@"设置失败" message:error.localizedDescription ?: @"无法写入文件"];
         }
     }];
 }
@@ -495,27 +472,9 @@ static void LNBLog(NSString *fmt, ...) {
     [picker dismissViewControllerAnimated:YES completion:nil];
 }
 
-#pragma mark 清除资源
-
-- (void)confirmClearAll {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"确认清除"
-                                                                  message:@"将删除已设置的所有背景图片和视频。"
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [LNBFileManager removeFileNamed:kBGGlobalImage];
-        [LNBFileManager removeFileNamed:kBGGlobalVideo];
-        [LNBFileManager removeFileNamed:kBGCardImage];
-        [LNBFileManager postReload];
-        [self.table reloadData];
-        [self showAlertWithTitle:@"已清除" message:@"所有背景资源已删除。"];
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
-}
-
 #pragma mark 提示
 
-- (void)showAlertWithTitle:(NSString *)title message:(NSString *)message {
+- (void)lnbShowAlert:(NSString *)title message:(NSString *)message {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
                                                                       message:message
