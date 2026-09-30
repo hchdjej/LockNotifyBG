@@ -1,3 +1,0 @@
-size=28968
-parts=2
-chunk_bytes=20000

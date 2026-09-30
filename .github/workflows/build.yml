@@ -3,8 +3,6 @@ name: Build LockNotifyBG
 on:
   push:
     branches: [ main, master ]
-    paths-ignore:
-      - '_artifacts/**'
   workflow_dispatch:
 
 permissions:
@@ -29,13 +27,29 @@ jobs:
 
       - name: Install iOS 16.5 SDK
         run: |
+          set -eu
           mkdir -p "$HOME/theos/sdks"
           cd /tmp
-          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks.git
-          cd sdks
-          git sparse-checkout set --no-cone iPhoneOS16.5.sdk
-          git checkout
+          # theos/sdks 偶发网络失败，重试最多 4 次
+          ok=0
+          for i in 1 2 3 4; do
+            rm -rf sdks
+            if git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks.git sdks \
+               && cd sdks \
+               && git sparse-checkout set --no-cone iPhoneOS16.5.sdk \
+               && git checkout; then
+              ok=1
+              break
+            fi
+            echo "SDK 拉取第 $i 次失败，重试…"
+            cd /tmp
+            sleep 5
+          done
+          [ "$ok" = 1 ] || { echo "::error::iOS 16.5 SDK 拉取失败（已重试 4 次）"; exit 1; }
+          cd /tmp/sdks
+          test -d iPhoneOS16.5.sdk || { echo "::error::SDK 目录不存在"; ls -la; exit 1; }
           cp -R iPhoneOS16.5.sdk "$HOME/theos/sdks/"
+          ls "$HOME/theos/sdks/"
 
       - name: Build
         run: |
@@ -127,8 +141,9 @@ jobs:
             LockNotifyBG-rootless.deb checksum.txt \
             || gh release upload "$TAG" LockNotifyBG-rootless.deb checksum.txt --clobber
 
-      # 把 deb 以 base64 分片提交进仓库，供无法访问 Release/Artifact
-      # （Azure 存储域名被墙）的环境经由 api.github.com 取回。
+      # 把 deb 以 base64 分片推到独立的 artifacts 分支。
+      # 不放 main，避免与人工提交在同一分支上竞态互相覆盖；
+      # 取回方通过 api.github.com/repos/<owner>/<repo>/contents/_artifacts?ref=artifacts 读取。
       # 该步骤失败不影响构建结论。
       - name: Commit deb as base64 chunks
         continue-on-error: true
@@ -146,14 +161,18 @@ jobs:
           shasum -a 256 LockNotifyBG-rootless.deb | awk '{print $1}' > _artifacts/sha256.txt
           SIZE=$(stat -f%z LockNotifyBG-rootless.deb)
           PARTS=$(ls _artifacts/deb.part.*.b64 | wc -l | tr -d ' ')
-          printf 'size=%s\nparts=%s\nchunk_bytes=20000\n' "$SIZE" "$PARTS" > _artifacts/manifest.txt
+          printf 'size=%s\nparts=%s\nchunk_bytes=20000\nrun=%s\n' \
+            "$SIZE" "$PARTS" "${{ github.run_id }}" > _artifacts/manifest.txt
           cat _artifacts/manifest.txt
-          ls -la _artifacts/
+
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 用孤儿分支承载产物，历史不累积
+          git checkout --orphan artifacts-tmp
+          git rm -rf --cached . >/dev/null 2>&1 || true
           git add -f _artifacts
-          git commit -m "chore(ci): 提交 deb base64 分片 (run ${{ github.run_id }})" || exit 0
-          git push origin HEAD:main
+          git commit -m "artifacts: run ${{ github.run_id }}" >/dev/null
+          git push origin HEAD:artifacts --force
 
       - name: Report failure
         if: failure()
