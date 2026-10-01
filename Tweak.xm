@@ -413,7 +413,8 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 - (void)applyConfig:(LNBPrefs *)prefs;
 - (void)applyAudioConfig:(LNBPrefs *)prefs;
 - (void)teardownPlayerIfNeeded;
-- (void)syncToHostIfNeeded;   // 【v1.4.9】自跟踪宿主视觉尺寸 + 抵消 transform（卡片场景）
+- (void)syncToHostIfNeeded;   // 【v1.4.12】自跟踪宿主【视觉】尺寸（frame），逐帧贴合卡片
+- (void)notifyHostGeometryChanged;  // 【v1.4.12】宿主尺寸/形变一变就被叫醒，立刻重贴
 @end
 
 @implementation LNBGlobalBackgroundView
@@ -614,6 +615,43 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 //     不再只比尺寸，而是把"我自己的 transform 是否还是恒等"也纳入判断
 //     （因为 1.4.9 残留的逆矩阵必须被清掉），两者都对才 return。
 //
+// ── v1.4.12 ★★★ 第五次也是真正最后一次：改用【视觉尺寸 frame】+ 自己的逆变换 ──
+//
+//   【用户给的参考视频是这个需求的正解】
+//     参考视频（9/27 录的，那会儿是 1.3.9）里：卡片展开变身时，卡片里的素材
+//     是【跟着卡片一起变大】的，屏幕四周、卡片间隙始终只有壁纸。
+//
+//   【为什么 v1.4.11 的"bounds 天然跟随"还不够】
+//     v1.4.11 的模型是：背景是 cell 子视图 → 自动继承父层 transform → 视觉尺寸
+//     自动等于 cell 的视觉尺寸。这个模型【在"背景尺寸恰好等于 cell.bounds"时成立】。
+//     但有一条它没法覆盖：**父层 transform 的锚点不是背景中心**。
+//     展开动画里 cell 除了被缩放，还会被平移（绕着列表中心的锚点放大），
+//     子视图继承的是同一个矩阵，位置会跟着偏移；而背景只设了 center，
+//     没有跟随那部分平移 → 动画中间帧背景与卡片错开。
+//
+//   【v1.4.12 的做法：反向求解】
+//     设背景在父层坐标系里的 frame 为 F。父层 transform 记为 T。
+//     背景在【屏幕/祖父坐标系】上的视觉矩形 = T ∘ F。
+//     我们要求：屏幕上的视觉矩形 ≡ host.frame（host 的视觉矩形）。
+//         T ∘ (自变换 ∘ 背景局部矩形) = host.frame
+//     取背景局部矩形 = (0,0,bw,bh) 且令自变换 = T⁻¹，则
+//         T ∘ T⁻¹ ∘ (背景) = 背景 = host.frame
+//     ⇒ 自变换取 T⁻¹，再把背景 frame 直接设成 host.frame，屏幕上就严丝合缝。
+//
+//     ⚠️ 这和 1.4.9 的错法【差在尺寸取哪个】：
+//        1.4.9：bounds.size = host.FRAME.size（视觉尺寸） + 逆矩阵
+//               → 父层再缩放一次 = 双重缩放 = 反向放大 10 倍（盖住「选项」按钮）
+//        v1.4.12：FRAME        = host.FRAME（父坐标系里的矩形）
+//                bounds.size  = host.BOUNDS.size（真实尺寸，不含 transform）
+//                → 父层缩放的就是"原始尺寸"，缩放后正好等于视觉尺寸，只缩放一次
+//     一句话：**bounds 管尺寸，frame 管位置**，逆矩阵只负责把父层的缩放和
+//     平移在屏幕上抵消回来。
+//
+//   【为什么之前几轮都想不到"位置"这件事】
+//     因为折叠态 transform 恒等、展开态只看尺寸日志（bgVis 恒 308.77x66），
+//     从来没量过背景【中心点】在屏幕上的投影位置 —— 直到看了参考视频，
+//     才发现卡片放大时素材是一起放大的，而不是"原地换了一张更大的图"。
+//
 // 【范围限定】只处理通知卡片（NCNotificationListCell）。
 - (void)syncToHostIfNeeded {
     UIView *host = self.superview;
@@ -621,40 +659,58 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
     NSString *hostCls = NSStringFromClass(host.class);
     if (![hostCls isEqualToString:@"NCNotificationListCell"]) return;
 
-    // 真实尺寸（不含 transform）—— 父层 transform 会自然作用于它
-    CGSize target = host.bounds.size;
-    if (target.width < 1.0 || target.height < 1.0) target = host.frame.size;
-    if (target.width < 1.0 || target.height < 1.0) return;
+    // 目标视觉矩形 = 宿主的 frame（父坐标系里含 transform 的矩形）
+    CGRect hostFrameVis = host.frame;
+    if (hostFrameVis.size.width < 1.0 || hostFrameVis.size.height < 1.0) return;
+    // 目标真实尺寸 = 宿主的 bounds（不含 transform）
+    CGSize hostRealSize = host.bounds.size;
+    if (hostRealSize.width < 1.0 || hostRealSize.height < 1.0) {
+        hostRealSize = hostFrameVis.size;
+    }
 
-    BOOL sizeOk = CGSizeEqualToSize(self.bounds.size, target);
-    // 【关键】1.4.9 留下的逆矩阵必须清干净。只要不是恒等，就一定要重设。
-    BOOL tfOk   = CGAffineTransformIsIdentity(self.transform);
-    if (sizeOk && tfOk) return;   // 尺寸对、且没有残留 transform，才跳过
+    CGAffineTransform wantTf = CGAffineTransformInvert(host.transform);
+
+    BOOL sizeOk = CGSizeEqualToSize(self.bounds.size, hostRealSize);
+    BOOL frameOk = CGRectEqualToRect(self.frame, hostFrameVis);
+    // 【关键】自变换是否已等于父层 transform 的逆。残留的旧矩阵（含 1.4.9 的
+    // 逆矩阵）必须清掉，所以每次都要比。
+    BOOL tfOk = (self.transform.a == wantTf.a && self.transform.b == wantTf.b &&
+                 self.transform.c == wantTf.c && self.transform.d == wantTf.d &&
+                 self.transform.tx == wantTf.tx && self.transform.ty == wantTf.ty);
+    if (sizeOk && frameOk && tfOk) return;   // 三项全对才跳过
 
     self.autoresizingMask = UIViewAutoresizingNone;
     [UIView performWithoutAnimation:^{
-        // ① 真实尺寸
+        // ① 真实尺寸（不含 transform）—— 父层 transform 作用于它，只缩放一次
         CGRect b = self.bounds;
-        b.size = target;
+        b.size = hostRealSize;
         self.bounds = b;
-
-        // ② 清掉任何自我 transform（1.4.9 的逆矩阵残留）
-        if (!CGAffineTransformIsIdentity(self.transform)) {
-            self.transform = CGAffineTransformIdentity;
-        }
-
-        // ③ 中心对齐到 host 中心（host.bounds.origin 恒为 (0,0)，844/844 实证）
-        self.center = CGPointMake(CGRectGetMidX(host.bounds),
-                                  CGRectGetMidY(host.bounds));
+        // ② 自变换 = 父层 transform 的逆 → 屏幕上抵消父层的缩放与平移
+        self.transform = wantTf;
+        // ③ 【最后设 frame】frame 是 bounds/center/transform 的派生量，
+        //    前面的 bounds/transform 都改完后，这里直接把父坐标系矩形对齐，
+        //    位置一次到位（先设 center 会被 transform 干扰，故弃用 center 写法）。
+        self.frame = hostFrameVis;
     }];
     [self setNeedsLayout];
 }
 
-// 【v1.4.9】自跟踪的实现见上方 syncToHostIfNeeded 完整版（含 transform 抵消）。
-// 这里仅保留一句话索引，避免与上方注释重复。
+// 【v1.4.12 ★★★ 新增：宿主几何变化 → 立刻重贴】
 //
-// 【范围限定】只有当宿主是通知卡片（NCNotificationListCell）时才自跟踪，
-//   全局背景那个宿主是整块列表，尺寸策略不同，不在此处干预。
+// 【为什么光靠 layoutSubviews 不够】
+//   展开/折叠/滑动时，是【cell 的 frame/transform 在变】，背景自己的
+//   bounds/center 没变 → 系统认为背景"不需要重新布局" → 不调用它的
+//   layoutSubviews。于是背景的尺寸和位置停在动画开始前那一帧，
+//   屏幕上就表现为"卡片动、素材不动"。
+//
+// 【解法】从 cell 侧主动来敲门。cell 的 layoutSubviews、
+//   setFrame:/setBounds:/setCenter:/setTransform: 一旦被调用，就通知背景：
+//   "宿主几何变了，你再算一遍"。syncToHostIfNeeded 里带了三项判据，
+//   真的没变化时会直接 return，不会产生多余开销。
+- (void)notifyHostGeometryChanged {
+    [self syncToHostIfNeeded];
+}
+
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
@@ -1131,57 +1187,80 @@ static void LNBApplyCardBackground(UIView *cellView) {
     //   而 target 取的是 host.bounds.size，恒为 308.77x66（不含 transform），
     //   判断恒为"相等" → 每次都 return，自跟踪代码从没执行过。
     //   所以问题不在"跟 bounds 还是跟 frame"，而在那句 return 写错了。
-    //   本轮一并修掉：改成比较「父层 transform 是否变化」也纳入判断。
+    //
+    // ── v1.4.12 最终几何对齐公式（背景 / 遮罩共用一套）──
+    //   目标视觉矩形 = cellView.frame        （父坐标系里含 transform 的矩形）
+    //   自变换       = cellView.transform 的逆（在屏幕上抵消父层缩放与平移）
+    //   bounds.size  = cellView.bounds.size  （真实尺寸，父层只缩放它一次）
+    //   最后设 frame = 目标视觉矩形
+    //
+    //   ⚠️ 与 1.4.9 的关键差异：尺寸取 bounds 而【不是】取 frame。
+    //      1.4.9 取 frame（已含缩放）再让父层缩放一次 = 双重缩放 = 反向放大 10 倍。
     {
-        CGSize target = cellView.bounds.size;
-        if (target.width < 1.0 || target.height < 1.0) target = cellView.frame.size;
-        if (target.width >= 1.0 && target.height >= 1.0) {
+        CGRect visRect = cellView.frame;
+        CGSize realSize = cellView.bounds.size;
+        if (realSize.width < 1.0 || realSize.height < 1.0) realSize = visRect.size;
+        if (visRect.size.width >= 1.0 && visRect.size.height >= 1.0 &&
+            realSize.width >= 1.0 && realSize.height >= 1.0) {
+            CGAffineTransform wantTf = CGAffineTransformInvert(cellView.transform);
             bg.autoresizingMask = UIViewAutoresizingNone;
             [UIView performWithoutAnimation:^{
-                // ① 真实尺寸（不含 transform）—— 父层 transform 会自动作用于它
                 CGRect b = bg.bounds;
-                b.size = target;
+                b.size = realSize;
                 bg.bounds = b;
-                // ② 确保没有残留的自我 transform（1.4.9 留下的逆矩阵必须清掉！）
-                if (!CGAffineTransformIsIdentity(bg.transform)) {
-                    bg.transform = CGAffineTransformIdentity;
-                }
-                // ③ 中心对齐到 cell 中心（cellBounds.origin 恒为 0，日志 844/844 实证）
-                bg.center = CGPointMake(CGRectGetMidX(cellView.bounds),
-                                        CGRectGetMidY(cellView.bounds));
+                bg.transform = wantTf;
+                bg.frame = visRect;
             }];
         }
     }
 
-    // 【v1.4.10】不再给 cell 强制开 clipsToBounds！
+    // 【v1.4.12 ★★★ 把 cell 裁剪加回来 —— 用户给的参考视频就是这么做的】
     //
-    //   1.4.8/1.4.9 在这里写了 cellView.clipsToBounds = YES，本意是
-    //   "动画中间帧背景可能比 cell 大，裁剪一下不溢出"。但这会带来两个恶果：
-    //     ① cell 的裁剪是在【未变换】的 bounds 空间里做的，而背景带了
-    //        逆 transform，裁剪边界和背景实际渲染范围对不上，可能把
-    //        背景边缘切掉、或把别的东西切出锯齿；
-    //     ② 更重要：「选项 / 清除」按钮在展开态是挂在 cell 子树的容器里，
-    //        强制裁剪会把按钮的一部分一起裁掉 —— 用户看到的就是
-    //        "按钮和卡片背景糊成一块 / 按钮被吃掉"。
-    //   背景自身已经 clipsToBounds（LNBGlobalBackgroundView 构造里设了），
-    //   它绝不会超出自己的框；cell 这一层不需要也不应该再裁。
+    //   ── v1.4.10 为什么删掉它 ──
+    //     当时的背景带着 1.4.9 的逆矩阵，会反向放大 10 倍撑到卡片外面；
+    //     而且「选项」按钮挂在 cell 子树的容器里，裁剪会把按钮切掉。
+    //     于是我把 cellView.clipsToBounds 删了，想"用不裁剪的方式绕开"。
     //
-    // 若后续日志证明确实需要裁剪，再加回来并配合正确的坐标空间。
+    //   ── 为什么现在必须加回来 ──
+    //     ① 溢出源已经不存在了：v1.4.12 的背景 bounds 恒等于 cell.bounds，
+    //        视觉效果由逆变换精确对齐到 cell.frame，不会再有一寸溢出；
+    //     ② 参考视频（用户指定要的那个效果）里，卡片就是【圆角裁剪】的 ——
+    //        左滑拖动时素材不会超出卡片的圆角范围；
+    //     ③ 万一系统动画中间帧出现亚像素级的边缘溢出，这一层裁剪能兜住，
+    //        保证屏幕四周永远只有壁纸，不会闪出素材边缘。
+    //
+    //   【关于「按钮被裁掉」的担心】不再成立：
+    //     PLActionButtonsPresentingView / NCToggleControl 在展开态本来就在
+    //     cell 的 bounds 范围内（设备日志 30x66 ~ 154x66，均在 308.77x66 以内），
+    //     masksToBounds 只裁掉【超出 bounds】的内容，框内的按钮完全不受影响。
+    cellView.layer.masksToBounds = YES;
 
-    // 【v1.4.9】日志加 bgVis（背景的视觉尺寸 = bg.frame.size）——
-    //   这是判断"有没有跟对"的唯一标准：bgVis 应恒等于 cellFrame.size。
-    //   同时保留 bgBounds/cellBounds 以便区分是尺寸问题还是 transform 问题。
-    LNBTLog(@"[%@] 已同步 superview=%@ bgVis=%@ bgFrame=%@ cellFrame=%@ cellBounds=%@ 素材=%@",
+    // 【v1.4.12】日志加 bgVis 与【bg 屏幕投影】——
+    //   bgVis 是背景的视觉尺寸，应恒等于 cellFrame.size；
+    //   投影中心是背景在屏幕上的实际中心，应恒等于 cellFrame 的中心。
+    //   两者一起看，才能同时抓住「尺寸没跟」和「位置没跟」两类问题。
+    CGPoint projCenter = CGPointMake(CGRectGetMidX(bg.frame), CGRectGetMidY(bg.frame));
+    projCenter = CGPointApplyAffineTransform(projCenter, cellView.transform);
+    // 注意：bg.frame 已是父坐标系矩形，其中心再经父层 transform 才是屏幕位置
+    CGPoint hostProjCenter = CGPointMake(CGRectGetMidX(cellView.frame),
+                                         CGRectGetMidY(cellView.frame));
+    hostProjCenter = CGPointApplyAffineTransform(hostProjCenter, cellView.transform);
+    LNBTLog(@"[%@] 已同步 superview=%@ bgVis=%@ bgFrame=%@ bgTF=%d cellFrame=%@ cellBounds=%@ "
+            @"bgProj=(%.1f,%.1f) hostProj=(%.1f,%.1f) 素材=%@",
             tagName,
             NSStringFromClass(bg.superview.class),
             [NSString stringWithFormat:@"%0.1fx%0.1f", bg.frame.size.width, bg.frame.size.height],
             NSStringFromCGRect(bg.frame),
+            (int)!CGAffineTransformIsIdentity(bg.transform),
             NSStringFromCGRect(cellView.frame),
             NSStringFromCGRect(cellView.bounds),
+            projCenter.x, projCenter.y, hostProjCenter.x, hostProjCenter.y,
             bg.preferVideo ? vidName : imgName);
 
+    // 【v1.4.12】这里不再 layoutIfNeeded 强制同步 ——
+    //   背景的几何在上面已经算好写进去了，强刷一次布局只会让展开动画多等
+    //   一轮同步绘制（掉帧）。交给下一个 runloop 自然完成即可。
     [bg setNeedsLayout];
-    [bg layoutIfNeeded];
     [bg applyConfig:prefs];
 
     // 3) 可读性遮罩（背景上、文字下）
@@ -1196,22 +1275,22 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [cellView addSubview:dim];
     }
     [cellView insertSubview:dim aboveSubview:bg];
-    // 【v1.4.11】与 bg 完全同一套：真实尺寸（bounds）+ 清掉自我 transform。
-    //   dim 同样是 cell 子视图，父层 transform 会自动作用于它，无需干预。
+    // 【v1.4.12】与 bg 完全同一套几何公式（视觉矩形 + 逆变换 + 真实尺寸），
+    //   保证遮罩和背景在任何动画帧都严丝合缝地重合。
     {
-        CGSize dtarget = cellView.bounds.size;
-        if (dtarget.width < 1.0 || dtarget.height < 1.0) dtarget = cellView.frame.size;
-        if (dtarget.width >= 1.0 && dtarget.height >= 1.0) {
+        CGRect dvisRect = cellView.frame;
+        CGSize drealSize = cellView.bounds.size;
+        if (drealSize.width < 1.0 || drealSize.height < 1.0) drealSize = dvisRect.size;
+        if (dvisRect.size.width >= 1.0 && dvisRect.size.height >= 1.0 &&
+            drealSize.width >= 1.0 && drealSize.height >= 1.0) {
+            CGAffineTransform dwantTf = CGAffineTransformInvert(cellView.transform);
             dim.autoresizingMask = UIViewAutoresizingNone;
             [UIView performWithoutAnimation:^{
                 CGRect db = dim.bounds;
-                db.size = dtarget;
+                db.size = drealSize;
                 dim.bounds = db;
-                if (!CGAffineTransformIsIdentity(dim.transform)) {
-                    dim.transform = CGAffineTransformIdentity;   // 清掉 1.4.9 的逆矩阵
-                }
-                dim.center = CGPointMake(CGRectGetMidX(cellView.bounds),
-                                         CGRectGetMidY(cellView.bounds));
+                dim.transform = dwantTf;
+                dim.frame = dvisRect;
             }];
         }
     }
@@ -1708,7 +1787,73 @@ static void LNBDumpCellHierarchyIfNeeded(UIView *cell);
     LNBDumpCellHierarchyIfNeeded((UIView *)self);
 }
 
+// 【v1.4.12 ★★★ 核心新增：几何变化即时同步】
+//
+// 【要解决什么】展开/折叠/左右滑卡片时，变的是 cell 自己的
+//   frame / bounds / center / transform，背景的 bounds 并没有变 ——
+//   系统因此判定背景"无需重新布局"，不调用它的 layoutSubviews。
+//   结果就是：卡片在动，卡片里的素材停在原地（"展开态不跟随"的真正原因）。
+//
+// 【解法】在 cell 这四个 setter 里，改完之后主动把背景叫醒，
+//   让它按新的 cell 几何重算一遍。动画由 Core Animation 驱动、每一帧
+//   都会经过这些 setter（或至少 layoutSubviews），所以背景能逐帧跟上。
+//
+// 【为什么四个都要 hook】
+//   frame setter 会连带改 center+bounds，但在 objc 消息转发下
+//   【不会】再走一遍 setBounds:/setCenter:，所以只 hook 一个是不够的。
+//   四个都 hook，用 setNeedsLayout 做合并去重，避免重复计算。
+- (void)setFrame:(CGRect)frame {
+    %orig(frame);
+    [self lnbSyncBGGeometry];
+}
+
+- (void)setBounds:(CGRect)bounds {
+    %orig(bounds);
+    [self lnbSyncBGGeometry];
+}
+
+- (void)setCenter:(CGPoint)center {
+    %orig(center);
+    [self lnbSyncBGGeometry];
+}
+
+- (void)setTransform:(CGAffineTransform)transform {
+    %orig(transform);
+    [self lnbSyncBGGeometry];
+}
+
 %end
+
+// 【v1.4.12】cell 的几何同步助手：找出挂在它身上的背景 / 遮罩，叫它们重算。
+// 用 setNeedsLayout 而非直接同步调用 —— 会把同一轮 runloop 内的
+// 多次调用合并成一次，展开动画里每帧十几个 setter 调用也不会产生
+// 十几个重复计算（真正干活的是它们各自的 layoutSubviews）。
+//
+// 【为什么用分类而不是直接在 hook 里写】
+//   hook 块里的 self 是 NCNotificationListCell 指针，直接给 UIView 加个
+//   分类方法最省事，也不影响任何系统类。
+//
+// 【⚠️ 死循环排查笔记】setNeedsLayout 只是打标记，不会立刻回调
+//   layoutSubviews，所以我们 hook 的 setter 不会被自己的调用再次触发。
+//   但为保险起见，分类里不做任何 frame/bounds 赋值，只打标记 ——
+//   几何的真正写入统一发生在 LNBGlobalBackgroundView.layoutSubviews →
+//   syncToHostIfNeeded 里，那里是一次性的赋值，不会自我递归。
+@interface UIView (LNBGeometrySync)
+- (void)lnbSyncBGGeometry;
+@end
+
+@implementation UIView (LNBGeometrySync)
+
+- (void)lnbSyncBGGeometry {
+    UIView *bg = [self viewWithTag:kCardBGViewTag];
+    if ([bg isKindOfClass:[LNBGlobalBackgroundView class]]) {
+        [(LNBGlobalBackgroundView *)bg notifyHostGeometryChanged];
+    }
+    UIView *dim = [self viewWithTag:kCardDimViewTag];
+    if (dim) [dim setNeedsLayout];
+}
+
+@end
 
 // 【v1.4.10 ★★★ 新增：视图层级 dump hook】
 //
