@@ -260,6 +260,9 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 - (void)lnbPickSupp2Image:(PSSpecifier *)spec;
 - (void)lnbConfirmClearAll:(PSSpecifier *)spec;
 - (void)lnbClearDiagBorders:(PSSpecifier *)spec;
+- (void)lnbViewLog:(PSSpecifier *)spec;
+- (void)lnbCopyLog:(PSSpecifier *)spec;
+- (void)lnbClearLog:(PSSpecifier *)spec;
 @end
 
 @implementation NGBPrefsRootListController
@@ -433,6 +436,9 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
                                   @"开启后会给锁屏通知的各层视图描上彩色边框，用于确认背景图挂在哪一层、被谁挡住。\n红=通知卡片容器　绿=我们的背景视图　紫=遮罩层　黄=被隐藏的系统白底　蓝=文字内容层　橙=整块背景宿主\n排查完请务必关闭，否则会一直显示彩色边框。")];
         [specs addObject:LNBSwitch(self, @"诊断模式（彩色边框）", @"diagMode")];
         [specs addObject:LNBButton(self, @"清除诊断彩框", @selector(lnbClearDiagBorders:), @"clearDiag")];
+        [specs addObject:LNBButton(self, @"查看运行日志", @selector(lnbViewLog:), @"viewLog")];
+        [specs addObject:LNBButton(self, @"复制日志到剪贴板", @selector(lnbCopyLog:), @"copyLog")];
+        [specs addObject:LNBButton(self, @"清空日志", @selector(lnbClearLog:), @"clearLog")];
 
         // ---- 5. 其它 ----
         [specs addObject:LNBGroup(@"其它", @"所有修改即时生效，无需注销。")];
@@ -529,6 +535,65 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
     [self lnbShowAlert:@"已清除" message:@"诊断模式已关闭，彩色边框会在锁屏通知下一次刷新时消失。"];
 }
 
+#pragma mark 运行日志（v1.3.9）
+
+// tweak 侧把日志写在 /var/mobile/Library/LockNotifyBG/tweak.log
+static NSString *LNBLogFilePath(void) {
+    return @"/var/mobile/Library/LockNotifyBG/tweak.log";
+}
+
+- (void)lnbViewLog:(PSSpecifier *)spec {
+    NSString *path = LNBLogFilePath();
+    NSString *content = [NSString stringWithContentsOfFile:path
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:NULL];
+    if (!content.length) {
+        [self lnbShowAlert:@"暂无日志"
+                    message:@"还没写入日志。请先开「诊断模式」，然后回锁屏让通知出现，再回来查看。"];
+        return;
+    }
+
+    // 日志可能很长，只展示最后 60 行，避免弹窗卡死
+    NSArray *lines = [content componentsSeparatedByString:@"\n"];
+    NSInteger keep = 60;
+    NSInteger from = MAX(0, (NSInteger)lines.count - keep);
+    NSArray *tail = [lines subarrayWithRange:NSMakeRange(from, lines.count - from)];
+    NSString *shown = [tail componentsJoinedByString:@"\n"];
+
+    // 优先展示按钮相关行，方便一眼定位
+    NSMutableArray *btnLines = [NSMutableArray array];
+    for (NSString *l in lines) {
+        if ([l containsString:@"按钮"] || [l containsString:@"探针"]) [btnLines addObject:l];
+    }
+    NSString *btnPart = btnLines.count
+        ? [NSString stringWithFormat:@"【按钮相关 %lu 条】\n%@\n\n", (unsigned long)btnLines.count,
+           [[btnLines subarrayWithRange:NSMakeRange(MAX(0,(NSInteger)btnLines.count-25),
+                                                    MIN(25, btnLines.count))] componentsJoinedByString:@"\n"]]
+        : @"【按钮相关】暂无 —— 说明扫描没走到按钮所在层\n\n";
+
+    [self lnbShowAlert:@"运行日志（尾部）"
+                message:[NSString stringWithFormat:@"%@————————\n%@", btnPart, shown]];
+}
+
+- (void)lnbCopyLog:(PSSpecifier *)spec {
+    NSString *content = [NSString stringWithContentsOfFile:LNBLogFilePath()
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:NULL];
+    if (!content.length) {
+        [self lnbShowAlert:@"暂无日志" message:@"还没有内容可复制。"];
+        return;
+    }
+    [UIPasteboard generalPasteboard].string = content;
+    [self lnbShowAlert:@"已复制"
+                message:[NSString stringWithFormat:@"日志已复制到剪贴板（%lu 字符），可直接粘贴发送。",
+                         (unsigned long)content.length]];
+}
+
+- (void)lnbClearLog:(PSSpecifier *)spec {
+    [[NSFileManager defaultManager] removeItemAtPath:LNBLogFilePath() error:NULL];
+    [self lnbShowAlert:@"已清空" message:@"日志已删除，下次触发会重新写入。"];
+}
+
 // 兜底：若框架未触发 buttonAction，在 didSelectRowAtIndexPath 里按 lnbAction 分发
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
@@ -545,6 +610,9 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         if ([k isEqualToString:@"pickSuppVideo"])   { [self lnbPickSuppVideo:spec];   return; }
         if ([k isEqualToString:@"pickSupp2Image"])  { [self lnbPickSupp2Image:spec];  return; }
         if ([k isEqualToString:@"clearDiag"])       { [self lnbClearDiagBorders:spec]; return; }
+        if ([k isEqualToString:@"viewLog"])         { [self lnbViewLog:spec];         return; }
+        if ([k isEqualToString:@"copyLog"])         { [self lnbCopyLog:spec];         return; }
+        if ([k isEqualToString:@"clearLog"])        { [self lnbClearLog:spec];        return; }
         if ([k isEqualToString:@"clearAll"])        { [self lnbConfirmClearAll:spec]; return; }
     }
     [super tableView:tableView didSelectRowAtIndexPath:indexPath];

@@ -1022,28 +1022,94 @@ static void LNBApplyCardBackground(UIView *cellView) {
 
 #pragma mark - 按钮（选项 / 清除）独立铺图 【v1.3.8】
 
+// 取一个视图上所有可见文字（UIButton 的 title、UILabel、私有按钮的字符串属性），
+// 用于判定它到底是「选项」还是「清除」。iOS 通知按钮未必是 UIButton，
+// 所以这里不依赖类型，而是把子视图里的文字都收集起来做包含判断。
+static NSString *LNBGatherText(UIView *v) {
+    NSMutableString *acc = [NSMutableString string];
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:v];
+    NSInteger guard = 0;
+    while (stack.count > 0 && guard++ < 200) {
+        UIView *cur = [stack lastObject];
+        [stack removeLastObject];
+
+        if ([cur isKindOfClass:[UILabel class]]) {
+            NSString *t = ((UILabel *)cur).text;
+            if (t.length) [acc appendFormat:@" %@", t];
+        }
+        if ([cur isKindOfClass:[UIButton class]]) {
+            NSString *t = [((UIButton *)cur) titleForState:UIControlStateNormal];
+            if (t.length) [acc appendFormat:@" %@", t];
+        }
+        // 私有类常见：直接响应 title / text
+        for (NSString *sel in @[@"title", @"text", @"stringValue"]) {
+            SEL s = NSSelectorFromString(sel);
+            if ([cur respondsToSelector:s]) {
+                @try {
+                    id val = [cur performSelector:s];
+                    if ([val isKindOfClass:[NSString class]] && [val length]) {
+                        [acc appendFormat:@" %@", val];
+                    }
+                } @catch (__unused NSException *e) {}
+            }
+        }
+        for (UIView *sub in cur.subviews) [stack addObject:sub];
+    }
+    return acc;
+}
+
 // 判断一个视图是否是「聚焦通知时右侧的选项 / 清除按钮」候选。
-// 1.3.6 的教训是不要赌类名，所以这里用多重特征交叉确认：
-//   1) 是 UIButton（或类名含 Button 的私有按钮类）
-//   2) 尺寸是小方块量级（25 ~ 160pt，卡片和整块列表远超上限）
-//   3) 祖先链里确实有 NCNotification*（活在通知系统里）
-// 三条都满足才算候选；真正铺图还要过总开关（suppModuleEnabled，默认关）。
+//
+// 【v1.3.9 放宽】1.3.8 要求 isKindOfClass:UIButton —— 设备上没生效，
+// 说明通知按钮多半不是 UIButton（私有类或自定义视图）。现在改为：
+//   1) 尺寸是小方块量级（25 ~ 220pt，卡片/列表远超上限）
+//   2) 祖先链里确实有 NCNotification*（活在通知系统里）
+//   3) 自己的子树里有文字，或类名含 Button
+// 不再要求任何具体类型。另外，只要祖先链命中，无论最终认不认，
+// 诊断模式下都会记一条日志（见 LNBLogButtonCandidates），便于定位。
 static BOOL LNBIsCandidateActionButton(UIView *v) {
     if (!v) return NO;
-    NSString *cls = NSStringFromClass(v.class);
-    if (![v isKindOfClass:[UIButton class]] && ![cls containsString:@"Button"]) return NO;
 
     CGSize sz = v.bounds.size;
-    if (sz.width < 25.0 || sz.height < 25.0 || sz.width > 160.0 || sz.height > 160.0) return NO;
+    if (sz.width < 25.0 || sz.height < 25.0 || sz.width > 220.0 || sz.height > 220.0) return NO;
 
+    BOOL insideNotification = NO;
     for (UIView *p = v.superview; p; p = p.superview) {
-        if ([NSStringFromClass(p.class) containsString:@"NCNotification"]) return YES;
+        if ([NSStringFromClass(p.class) containsString:@"NCNotification"]) {
+            insideNotification = YES;
+            break;
+        }
     }
-    return NO;
+    if (!insideNotification) return NO;
+
+    NSString *cls = NSStringFromClass(v.class);
+    if ([cls containsString:@"Button"]) return YES;
+
+    NSString *txt = LNBGatherText(v);
+    return txt.length > 0;
+}
+
+// 【v1.3.9 探针】诊断模式下，把一个视图的按钮画像记一条日志。
+// 无论最后认不认，只要在通知区域内、尺寸像按钮，都记下来 ——
+// 这样即使识别规则没命中，也能从日志里看出"它到底长什么样"。
+static void LNBLogButtonCandidate(UIView *v, BOOL accepted) {
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    if (!prefs.enabled || !prefs.diagMode) return;
+
+    CGSize sz = v.bounds.size;
+    if (sz.width < 15.0 || sz.height < 15.0 || sz.width > 260.0 || sz.height > 260.0) return;
+
+    NSString *cls = NSStringFromClass(v.class);
+    NSString *txt = LNBGatherText(v);
+    BOOL isBtn = [v isKindOfClass:[UIButton class]];
+
+    LNBTLog(@"[按钮探针] %@ cls=%@ isUIButton=%d size=%0.0fx%0.0f text=\"%@\"",
+            accepted ? @"✅已认" : @"❌未认", cls, (int)isBtn,
+            sz.width, sz.height, txt);
 }
 
 // 给【单个按钮】铺自己的圆角图 —— 每个模块各自跟自己的框走。
-// 归属判定：优先看按钮文字（"选项"/"清除"），拿不到文字时沿用已挂图；
+// 归属判定：优先看文字（"选项"/"清除"），拿不到文字时沿用已挂图；
 // 素材回退：清除 -> supp2.jpg，选项 -> supp.jpg，缺图再退 supp -> card。
 static void LNBApplyButtonBackground(UIView *view) {
     if (!view) return;
@@ -1055,17 +1121,16 @@ static void LNBApplyButtonBackground(UIView *view) {
     for (UIView *sub in view.subviews) {
         if (sub.tag == kSuppBtn1Tag || sub.tag == kSuppBtn2Tag) [sub removeFromSuperview];
     }
-    if (!wantOn) return;   // 总开关默认关闭：识别再准也不越权（1.3.6 教训）
+    if (!wantOn) return;
 
-    UIButton *btn = (UIButton *)view;
-    NSString *label = btn.titleLabel.text ?: @"";
+    // 归属：文字里找「清除 / 选项」关键字
+    NSString *label = LNBGatherText(view);
+    NSString *lower = label.lowercaseString;
 
-    NSInteger tag = kSuppBtn1Tag;   // 默认按「选项」处理
-    if ([label containsString:@"清除"] ||
-        [label.lowercaseString containsString:@"clear"]) {
+    NSInteger tag = kSuppBtn1Tag;
+    if ([label containsString:@"清除"] || [lower containsString:@"clear"]) {
         tag = kSuppBtn2Tag;
-    } else if ([label containsString:@"选项"] ||
-               [label.lowercaseString containsString:@"option"]) {
+    } else if ([label containsString:@"选项"] || [lower containsString:@"option"]) {
         tag = kSuppBtn1Tag;
     }
 
@@ -1075,8 +1140,9 @@ static void LNBApplyButtonBackground(UIView *view) {
     if (!LNBFileExists(LNBPathForResource(imgName))) imgName = kBGCardImage;
     if (!LNBFileExists(LNBPathForResource(imgName))) return;
 
-    // 铺图：插到最底层（index 0），系统的 titleLabel / imageView 天然浮在上面
-    UIImageView *iv = [[UIImageView alloc] initWithFrame:btn.bounds];
+    // 铺图：插到最底层（index 0），系统自己的 label / imageView 天然浮在上面。
+    // 【v1.3.9】不再假设它是 UIButton —— 用 view 本身即可（放宽后可能是任意视图）。
+    UIImageView *iv = [[UIImageView alloc] initWithFrame:view.bounds];
     iv.tag = tag;
     iv.contentMode = UIViewContentModeScaleAspectFill;
     iv.clipsToBounds = YES;
@@ -1086,18 +1152,17 @@ static void LNBApplyButtonBackground(UIView *view) {
 
     UIImage *img = [UIImage imageWithContentsOfFile:LNBPathForResource(imgName)];
     iv.image = img;
-    [btn insertSubview:iv atIndex:0];
+    [view insertSubview:iv atIndex:0];
 
-    // 圆角与按钮本体一致（截图里那两块是明显的圆角方块）
-    iv.layer.cornerRadius = btn.layer.cornerRadius > 0 ? btn.layer.cornerRadius : (btn.bounds.size.height * 0.5);
+    // 圆角：优先沿用按钮本体已有的圆角，否则按高度取半（截图里是明显的圆角块）
+    CGFloat cr = view.layer.cornerRadius;
+    iv.layer.cornerRadius = cr > 0.5 ? cr : (view.bounds.size.height * 0.5);
     iv.layer.masksToBounds = YES;
 
-    if (prefs.diagMode) {
-        LNBDiagMarkView(iv, [UIColor greenColor], 2.0);
-        LNBTLog(@"[按钮] 已铺图 btn=%@ label=%@ tag=0x%lX 尺寸=%0.0fx%0.0f 素材=%@",
-                NSStringFromClass(btn.class), label, (unsigned long)tag,
-                btn.bounds.size.width, btn.bounds.size.height, imgName);
-    }
+    LNBLogButtonCandidate(view, YES);
+    LNBTLog(@"[按钮] ✅ 已铺图 cls=%@ text=\"%@\" tag=0x%lX size=%0.0fx%0.0f 素材=%@",
+            NSStringFromClass(view.class), label, (unsigned long)tag,
+            view.bounds.size.width, view.bounds.size.height, imgName);
 }
 
 // 【v1.3.1 核心修复】在通知列表子树里扫描每一条通知并应用卡片背景。
@@ -1138,6 +1203,10 @@ static void LNBScanAndApplyCards(UIView *root) {
                 LNBApplyButtonBackground(v);
                 continue;   // 按钮内部只有 label/image，无需继续下探
             }
+
+            // ②b【v1.3.9 探针】没被认成按钮、但尺寸像按钮的视图也记一条，
+            // 这样即使识别规则没命中，日志里也能看出它长什么样、叫什么类名。
+            LNBLogButtonCandidate(v, NO);
 
             // ③ 旧版模块级补充视图：仍走卡片同款逻辑（默认关闭，不误伤）
             if (LNBIsSupplementaryModule(v)) {
