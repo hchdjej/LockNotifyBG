@@ -204,8 +204,14 @@ static void LNBDiagClearTree(UIView *root) {
 @property (nonatomic, assign) BOOL cardBlurOverlay; // 卡片上是否叠一层半透明色保证文字可读
 
 // ---- v1.3.6 附属按钮模块（删除 / 选项）----
-// 逻辑与卡片完全一致，字段独立，便于单独开关与调参。
-@property (nonatomic, assign) BOOL suppEnabled;      // 按钮模块背景总开关
+// 【v1.3.7 重要调整】
+// 1. 开关改名 suppEnabled -> suppModuleEnabled：1.3.6 曾默认开启且按键模块的
+//    「类名猜测」误伤了通知列表里其他补充模块（分隔线 / 时间条），把卡片区域
+//    搞乱。改名可以绕开旧 plist 里残留的 YES，保证升级后默认彻底关闭。
+// 2. 默认值改为 NO：在拿到「删除 / 选项」模块的真实类名之前（诊断探针
+//    LNBLogVisibleModules 输出），按钮模块不再参与任何挂载 —— 默认视觉
+//    与 1.3.3 完全一致。
+@property (nonatomic, assign) BOOL suppModuleEnabled; // 按钮模块背景总开关（默认关）
 @property (nonatomic, assign) BOOL suppUseVideo;     // 按钮背景用视频（supp.mp4）
 @property (nonatomic, assign) CGFloat suppAlpha;     // 按钮背景不透明度
 @property (nonatomic, assign) BOOL suppBlurOverlay;  // 按钮背景暗色遮罩
@@ -256,9 +262,12 @@ static void LNBDiagClearTree(UIView *root) {
     self.cardAlpha        = saved[@"cardAlpha"]        ? [saved[@"cardAlpha"] doubleValue]      : 0.9;
     self.cardBlurOverlay  = saved[@"cardBlurOverlay"]  ? [saved[@"cardBlurOverlay"] boolValue]  : YES;
 
-    // v1.3.6 附属按钮模块：默认开启，参数与卡片一致（0.9 / 遮罩开），
-    // 这样默认体验就是「按钮和卡片同款背景」，用户不必额外配置。
-    self.suppEnabled      = saved[@"suppEnabled"]      ? [saved[@"suppEnabled"] boolValue]      : YES;
+    // v1.3.7 附属按钮模块：默认【关闭】。
+    // 1.3.6 默认开启时，"类名含 Supplementary 就认"的规则误伤了通知列表里
+    // 的其他补充模块（每条通知下面的分隔线 / 时间条），给它们挂背景+藏白底，
+    // 造成红框与背景错乱。真实类名确认前（见诊断探针），按钮模块默认不参与。
+    // 开关 key 已改名 suppModuleEnabled，旧 plist 的 suppEnabled 不会再被读取。
+    self.suppModuleEnabled = saved[@"suppModuleEnabled"] ? [saved[@"suppModuleEnabled"] boolValue] : NO;
     self.suppUseVideo     = saved[@"suppUseVideo"]     ? [saved[@"suppUseVideo"] boolValue]     : NO;
     self.suppAlpha        = saved[@"suppAlpha"]        ? [saved[@"suppAlpha"] doubleValue]      : 0.9;
     self.suppBlurOverlay  = saved[@"suppBlurOverlay"]  ? [saved[@"suppBlurOverlay"] boolValue]  : YES;
@@ -695,6 +704,88 @@ static void LNBSetCardMaterialsHidden(UIView *root, BOOL hidden) {
 
 #pragma mark - 附属按钮模块识别（删除 / 选项）
 
+// ---- 【v1.3.7】诊断探针：把通知列表里所有候选模块的真实类名打出来 ----
+//
+// 1.3.6 的教训：没有真实类名就靠"类名含 Supplementary"猜，误伤了通知列表里
+// 其他补充模块（分隔线 / 时间条），把卡片区域搞乱。这个探针在诊断模式下每
+// 8 秒把窗口里所有有尺寸的 NCNotification* / *Supplementary* 视图按面积从
+// 大到小打一遍（类名 / frame / 父链），用日志而非猜测定类名。
+//
+// 用法：设置里开「诊断模式」→ 锁屏出现通知 → 20 秒后回来把日志发开发者。
+
+static NSTimer *sLNBProbeTimer = nil;
+
+// 收集并打印当前所有候选模块
+static void LNBLogVisibleModules(void) {
+    if (![NSThread isMainThread]) return;
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    if (!prefs.enabled || !prefs.diagMode) return;
+
+    UIWindow *window = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (w.isKeyWindow) { window = w; break; }
+            }
+        }
+        if (window) break;
+    }
+    if (!window) return;
+
+    NSMutableArray<NSString *> *hits = [NSMutableArray array];
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:window];
+    while (stack.count > 0) {
+        UIView *v = [stack lastObject];
+        [stack removeLastObject];
+
+        NSString *cls = NSStringFromClass(v.class);
+        CGSize sz = v.bounds.size;
+        BOOL interesting = ([cls containsString:@"NCNotification"] ||
+                            [cls containsString:@"Supplementary"]);
+        if (interesting && sz.width > 2.0 && sz.height > 2.0) {
+            // 父链（最多 3 级，够定位了）
+            NSMutableString *chain = [NSMutableString string];
+            UIView *p = v.superview;
+            for (int i = 0; p && i < 3; i++) {
+                [chain appendFormat:@"%@ / ", NSStringFromClass(p.class)];
+                p = p.superview;
+            }
+            [hits addObject:[NSString stringWithFormat:
+                @"%0.0f\t%@ {%0.0f,%0.0f,%0.0f x %0.0f}\tin[%@…]",
+                sz.width * sz.height, cls,
+                v.frame.origin.x, v.frame.origin.y, sz.width, sz.height,
+                chain]];
+        }
+        for (UIView *sub in v.subviews) [stack addObject:sub];
+    }
+
+    // 面积降序（行首是面积数字，doubleValue 正好可比较）
+    [hits sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        double da = [a doubleValue], db = [b doubleValue];
+        return da > db ? NSOrderedAscending : (da < db ? NSOrderedDescending : NSOrderedSame);
+    }];
+
+    LNBTLog(@"[探针] ===== 开始：当前候选模块 %lu 个 =====", (unsigned long)hits.count);
+    for (NSString *line in hits) LNBTLog(@"[探针] %@", line);
+    LNBTLog(@"[探针] ===== 结束 =====");
+}
+
+// 诊断开关变化 / reload 时启停探针（诊断开 = 每 8 秒 dump 一次）
+static void LNBProbeUpdate(void) {
+    BOOL wantOn = [LNBPrefs sharedInstance].diagMode;
+    if (wantOn && !sLNBProbeTimer) {
+        sLNBProbeTimer = [NSTimer timerWithTimeInterval:8.0
+                                                 repeats:YES
+                                                   block:^(NSTimer *t) { LNBLogVisibleModules(); }];
+        [[NSRunLoop mainRunLoop] addTimer:sLNBProbeTimer forMode:NSRunLoopCommonModes];
+        LNBTLog(@"[探针] 已启动：诊断模式下每 8 秒打印候选模块");
+    } else if (!wantOn && sLNBProbeTimer) {
+        [sLNBProbeTimer invalidate];
+        sLNBProbeTimer = nil;
+        LNBTLog(@"[探针] 已停止");
+    }
+}
+
 // 【v1.3.6】判断一个视图是不是「删除 / 选项」按钮模块。
 //
 // 【背景】1.3.4 我用日志里一个 401x160 的 NCNotificationListSupplementaryHostingView
@@ -761,7 +852,7 @@ static void LNBApplyCardBackground(UIView *cellView) {
     BOOL useVideo     = isSupp ? prefs0.suppUseVideo   : prefs0.cardUseVideo;
     BOOL overlayOn    = isSupp ? prefs0.suppBlurOverlay : prefs0.cardBlurOverlay;
     CGFloat alphaVal  = isSupp ? prefs0.suppAlpha      : prefs0.cardAlpha;
-    BOOL moduleOn     = prefs0.enabled && (isSupp ? prefs0.suppEnabled : prefs0.cardEnabled);
+    BOOL moduleOn     = prefs0.enabled && (isSupp ? prefs0.suppModuleEnabled : prefs0.cardEnabled);
     NSInteger bgTag   = isSupp ? kSuppBGViewTag  : kCardBGViewTag;
     NSInteger dimTag  = isSupp ? kSuppDimViewTag : kCardDimViewTag;
 
@@ -966,6 +1057,8 @@ static void LNBReloadConfiguration(void) {
     [[LNBPrefs sharedInstance] reload];
     // 【v1.3.3】素材可能刚被选/删，文件存在性缓存必须失效
     LNBInvalidateFileCache();
+    // 【v1.3.7】诊断开关变化时启停候选模块探针
+    LNBProbeUpdate();
     // 让所有已存在的背景视图立即刷新
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *window = nil;

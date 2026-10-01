@@ -302,7 +302,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
                                @"cardUseVideo":    @NO,
                                @"cardAlpha":       @0.9,
                                @"cardBlurOverlay": @YES,
-                               @"suppEnabled":     @YES,
+                               @"suppModuleEnabled": @NO,
                                @"suppUseVideo":    @NO,
                                @"suppAlpha":       @0.9,
                                @"suppBlurOverlay": @YES,
@@ -398,11 +398,11 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         [specs addObject:LNBSwitch(self, @"暗色遮罩（提升文字可读性）", @"cardBlurOverlay")];
 
         // ---- 2. 附属按钮模块背景（删除 / 选项）----
-        // 用户要求：这两个模块的背景逻辑与通知卡片完全一致，
-        // 所以这里的设置项也和卡片分组一一对应。
+        // 【v1.3.7】默认关闭：1.3.6 的类名猜测误伤了通知列表里其他补充模块，
+        // 导致卡片区域红框与背景错乱。真实类名经诊断日志确认前，本组保持关闭。
         [specs addObject:LNBGroup(@"附属按钮背景（删除 / 选项）",
-                                  @"锁屏通知底部的「删除」「选项」按钮模块，背景逻辑与通知卡片完全一致。\n默认开启并自动沿用卡片素材；也可以在这里单独选图/视频。")];
-        [specs addObject:LNBSwitch(self, @"按钮背景开关", @"suppEnabled")];
+                                  @"【默认关闭】1.3.6 误伤了通知间其他模块，已回调。\n开启前请先开诊断模式并把日志发给开发者，确认「删除 / 选项」模块的真实类名后再开启。背景逻辑与通知卡片完全一致。")];
+        [specs addObject:LNBSwitch(self, @"按钮背景开关", @"suppModuleEnabled")];
         [specs addObject:LNBButton(self, @"选择按钮图片", @selector(lnbPickSuppImage:), @"pickSuppImage")];
         [specs addObject:LNBButton(self, @"选择按钮视频", @selector(lnbPickSuppVideo:), @"pickSuppVideo")];
         [specs addObject:LNBSwitch(self, @"使用视频作为按钮背景", @"suppUseVideo")];
