@@ -35,6 +35,10 @@ static NSString *const kBGCardVideo      = @"card.mp4";
 // 逻辑与卡片完全一致，只是换一套文件名，便于用户给按钮配不同的图/视频。
 static NSString *const kBGSuppImage      = @"supp.jpg";
 static NSString *const kBGSuppVideo      = @"supp.mp4";
+// v1.3.8：聚焦通知时右侧「选项 / 清除」按钮的独立圆角图。
+// 参考同类插件效果：每个按钮各自铺一张图，文字浮在上面。
+//   选项按钮 -> supp.jpg   清除按钮 -> supp2.jpg（缺省时回退 supp.jpg）
+static NSString *const kBGSupp2Image     = @"supp2.jpg";
 static NSString *const kPrefsDomain      = @"com.hchdjej.locknotifybg";
 static NSString *const kReloadNotification = @"com.hchdjej.locknotifybg/reload";
 
@@ -49,6 +53,9 @@ static const NSInteger kCardDimViewTag = 0x1F0B8;
 // 附属按钮模块用独立 tag，避免和卡片的背景视图互相干扰
 static const NSInteger kSuppBGViewTag  = 0x1F0B9;
 static const NSInteger kSuppDimViewTag = 0x1F0BA;
+// v1.3.8：按钮铺图 tag（选项=1 / 清除=2），独立于模块级 tag
+static const NSInteger kSuppBtn1Tag = 0x1F0BB;
+static const NSInteger kSuppBtn2Tag = 0x1F0BC;
 
 #pragma mark - 诊断日志（tweak 侧）
 
@@ -262,12 +269,13 @@ static void LNBDiagClearTree(UIView *root) {
     self.cardAlpha        = saved[@"cardAlpha"]        ? [saved[@"cardAlpha"] doubleValue]      : 0.9;
     self.cardBlurOverlay  = saved[@"cardBlurOverlay"]  ? [saved[@"cardBlurOverlay"] boolValue]  : YES;
 
-    // v1.3.7 附属按钮模块：默认【关闭】。
-    // 1.3.6 默认开启时，"类名含 Supplementary 就认"的规则误伤了通知列表里
-    // 的其他补充模块（每条通知下面的分隔线 / 时间条），给它们挂背景+藏白底，
-    // 造成红框与背景错乱。真实类名确认前（见诊断探针），按钮模块默认不参与。
-    // 开关 key 已改名 suppModuleEnabled，旧 plist 的 suppEnabled 不会再被读取。
-    self.suppModuleEnabled = saved[@"suppModuleEnabled"] ? [saved[@"suppModuleEnabled"] boolValue] : NO;
+    // v1.3.8 选项 / 清除按钮：默认【开启】。
+    // 1.3.6 之所以翻车，是因为用「类名含 Supplementary 就认」去猜，误伤了
+    // 通知列表里其他补充模块。本版换了识别方式：尺寸门限（25~160pt 小方块）
+    // + UIButton 类型 + 祖先链含 NCNotification，三重交叉，且【不再铺整块背景、
+    // 不藏任何白底】—— 只在按钮自己身上叠一张图，误伤面几乎为零，故恢复默认开。
+    // 开关 key 沿用 suppModuleEnabled（已改名，旧 plist 的 suppEnabled 不再读取）。
+    self.suppModuleEnabled = saved[@"suppModuleEnabled"] ? [saved[@"suppModuleEnabled"] boolValue] : YES;
     self.suppUseVideo     = saved[@"suppUseVideo"]     ? [saved[@"suppUseVideo"] boolValue]     : NO;
     self.suppAlpha        = saved[@"suppAlpha"]        ? [saved[@"suppAlpha"] doubleValue]      : 0.9;
     self.suppBlurOverlay  = saved[@"suppBlurOverlay"]  ? [saved[@"suppBlurOverlay"] boolValue]  : YES;
@@ -1012,6 +1020,86 @@ static void LNBApplyCardBackground(UIView *cellView) {
     }
 }
 
+#pragma mark - 按钮（选项 / 清除）独立铺图 【v1.3.8】
+
+// 判断一个视图是否是「聚焦通知时右侧的选项 / 清除按钮」候选。
+// 1.3.6 的教训是不要赌类名，所以这里用多重特征交叉确认：
+//   1) 是 UIButton（或类名含 Button 的私有按钮类）
+//   2) 尺寸是小方块量级（25 ~ 160pt，卡片和整块列表远超上限）
+//   3) 祖先链里确实有 NCNotification*（活在通知系统里）
+// 三条都满足才算候选；真正铺图还要过总开关（suppModuleEnabled，默认关）。
+static BOOL LNBIsCandidateActionButton(UIView *v) {
+    if (!v) return NO;
+    NSString *cls = NSStringFromClass(v.class);
+    if (![v isKindOfClass:[UIButton class]] && ![cls containsString:@"Button"]) return NO;
+
+    CGSize sz = v.bounds.size;
+    if (sz.width < 25.0 || sz.height < 25.0 || sz.width > 160.0 || sz.height > 160.0) return NO;
+
+    for (UIView *p = v.superview; p; p = p.superview) {
+        if ([NSStringFromClass(p.class) containsString:@"NCNotification"]) return YES;
+    }
+    return NO;
+}
+
+// 给【单个按钮】铺自己的圆角图 —— 每个模块各自跟自己的框走。
+// 归属判定：优先看按钮文字（"选项"/"清除"），拿不到文字时沿用已挂图；
+// 素材回退：清除 -> supp2.jpg，选项 -> supp.jpg，缺图再退 supp -> card。
+static void LNBApplyButtonBackground(UIView *view) {
+    if (!view) return;
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+
+    BOOL wantOn = prefs.enabled && prefs.suppModuleEnabled;
+
+    // 清掉本按钮上已铺的图（统一走这里，避免残留）
+    for (UIView *sub in view.subviews) {
+        if (sub.tag == kSuppBtn1Tag || sub.tag == kSuppBtn2Tag) [sub removeFromSuperview];
+    }
+    if (!wantOn) return;   // 总开关默认关闭：识别再准也不越权（1.3.6 教训）
+
+    UIButton *btn = (UIButton *)view;
+    NSString *label = btn.titleLabel.text ?: @"";
+
+    NSInteger tag = kSuppBtn1Tag;   // 默认按「选项」处理
+    if ([label containsString:@"清除"] ||
+        [label.lowercaseString containsString:@"clear"]) {
+        tag = kSuppBtn2Tag;
+    } else if ([label containsString:@"选项"] ||
+               [label.lowercaseString containsString:@"option"]) {
+        tag = kSuppBtn1Tag;
+    }
+
+    // 素材回退链
+    NSString *imgName = (tag == kSuppBtn2Tag) ? kBGSupp2Image : kBGSuppImage;
+    if (!LNBFileExists(LNBPathForResource(imgName))) imgName = kBGSuppImage;
+    if (!LNBFileExists(LNBPathForResource(imgName))) imgName = kBGCardImage;
+    if (!LNBFileExists(LNBPathForResource(imgName))) return;
+
+    // 铺图：插到最底层（index 0），系统的 titleLabel / imageView 天然浮在上面
+    UIImageView *iv = [[UIImageView alloc] initWithFrame:btn.bounds];
+    iv.tag = tag;
+    iv.contentMode = UIViewContentModeScaleAspectFill;
+    iv.clipsToBounds = YES;
+    iv.userInteractionEnabled = NO;
+    iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    iv.alpha = prefs.suppAlpha;
+
+    UIImage *img = [UIImage imageWithContentsOfFile:LNBPathForResource(imgName)];
+    iv.image = img;
+    [btn insertSubview:iv atIndex:0];
+
+    // 圆角与按钮本体一致（截图里那两块是明显的圆角方块）
+    iv.layer.cornerRadius = btn.layer.cornerRadius > 0 ? btn.layer.cornerRadius : (btn.bounds.size.height * 0.5);
+    iv.layer.masksToBounds = YES;
+
+    if (prefs.diagMode) {
+        LNBDiagMarkView(iv, [UIColor greenColor], 2.0);
+        LNBTLog(@"[按钮] 已铺图 btn=%@ label=%@ tag=0x%lX 尺寸=%0.0fx%0.0f 素材=%@",
+                NSStringFromClass(btn.class), label, (unsigned long)tag,
+                btn.bounds.size.width, btn.bounds.size.height, imgName);
+    }
+}
+
 // 【v1.3.1 核心修复】在通知列表子树里扫描每一条通知并应用卡片背景。
 //
 // 【为什么只认 NCNotificationListCell】v1.3.0 用「类名含 LookView」扫描，
@@ -1035,16 +1123,26 @@ static void LNBScanAndApplyCards(UIView *root) {
         [stack removeLastObject];
         if (v != root) {
             NSString *cls = NSStringFromClass(v.class);
+
+            // ① 通知卡片：铺卡片自己的背景（模块跟着自己的框走）
             if ([cls isEqualToString:@"NCNotificationListCell"]) {
                 LNBApplyCardBackground(v);
-                continue;   // 卡片内部不再展开，避免命中 0x0 的 ShortLookView
+                // 【v1.3.8 不再 continue】聚焦时「选项 / 清除」按钮就在卡片子树里，
+                // 之前 continue 会整棵跳过，按钮永远找不到。这里改为继续向下展开，
+                // 但下面会用 LNBIsCandidateActionButton 严格尺寸门限把 0x0 的
+                // ShortLookView 等噪声挡掉。
             }
+
+            // ② 选项 / 清除按钮：各自铺自己的圆角图（独立于卡片背景）
+            if (LNBIsCandidateActionButton(v)) {
+                LNBApplyButtonBackground(v);
+                continue;   // 按钮内部只有 label/image，无需继续下探
+            }
+
+            // ③ 旧版模块级补充视图：仍走卡片同款逻辑（默认关闭，不误伤）
             if (LNBIsSupplementaryModule(v)) {
-                // 「删除 / 选项」按钮模块：走【和卡片完全相同】的注入逻辑，
-                // 只是把素材换成 supp.* 那一套、tag 换成独立的一套，
-                // 这样两个模块的视觉行为和卡片 100% 一致。
-                LNBApplyCardBackground(v);   // 内部按 isSupp 自动切换参数
-                continue;                    // 同样不再向下展开
+                LNBApplyCardBackground(v);
+                continue;
             }
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
@@ -1087,8 +1185,10 @@ static void LNBReloadConfiguration(void) {
             NSString *cls = NSStringFromClass(view.class);
             if ([cls isEqualToString:@"NCNotificationListCell"]) {
                 LNBApplyCardBackground(view);
+            } else if (LNBIsCandidateActionButton(view)) {
+                // v1.3.8：改完设置让「选项 / 清除」按钮的图立即刷新
+                LNBApplyButtonBackground(view);
             } else if (LNBIsSupplementaryModule(view)) {
-                // v1.3.6：按钮模块改完设置也要即时生效
                 LNBApplyCardBackground(view);
             }
 
