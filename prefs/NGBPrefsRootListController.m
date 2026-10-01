@@ -256,7 +256,6 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 - (void)lnbPickCardImage:(PSSpecifier *)spec;
 - (void)lnbPickCardVideo:(PSSpecifier *)spec;
 - (void)lnbPickSuppImage:(PSSpecifier *)spec;
-- (void)lnbPickSuppVideo:(PSSpecifier *)spec;
 - (void)lnbPickSupp2Image:(PSSpecifier *)spec;
 - (void)lnbConfirmClearAll:(PSSpecifier *)spec;
 - (void)lnbClearDiagBorders:(PSSpecifier *)spec;
@@ -309,11 +308,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
                                @"cardAlpha":       @0.9,
                                @"cardBlurOverlay": @YES,
                                @"suppModuleEnabled": @YES,
-                               @"suppUseVideo":    @NO,
                                @"suppAlpha":       @0.9,
-                               @"suppBlurOverlay": @YES,
-                               @"suppVideoSound":  @NO,
-                               @"suppForceMode":   @NO,
                                @"globalEnabled":   @NO,
                                @"globalUseVideo":  @NO,
                                @"globalAlpha":     @0.85,
@@ -404,8 +399,9 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         [specs addObject:LNBSwitch(self, @"暗色遮罩（提升文字可读性）", @"cardBlurOverlay")];
 
         // ---- 2. 选项 / 清除按钮（各自独立背景）----
-        // 【v1.3.8】改为「每个按钮铺自己的图」，识别用尺寸门限 + 文字判定，
-        // 不再赌类名（1.3.6 的误伤已彻底移除）。
+        // 【v1.4.1】只认 NCToggleControl（设备日志实证），每个按钮铺自己的圆角图。
+        // 已彻底移除 1.3.6 那套「模块级」猜测逻辑 —— 它正是"背景块跟卡片对不齐"
+        // 的元凶。按钮背景逻辑现在与卡片背景完全同构：贴图 + 不透明度。
         [specs addObject:LNBGroup(@"选项 / 清除按钮背景",
                                   @"聚焦一条通知时，右侧「选项」「清除」两个按钮各自铺一张圆角图，"
                                   @"和通知卡片一样——每个模块跟着自己的框走。\n"
@@ -482,7 +478,6 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
     if ([LNBFileManager fileExistsNamed:kBGCardVideo])   [parts addObject:@"卡片视频"];
     if ([LNBFileManager fileExistsNamed:kBGSuppImage])   [parts addObject:@"选项图"];
     if ([LNBFileManager fileExistsNamed:kBGSupp2Image])  [parts addObject:@"清除图"];
-    if ([LNBFileManager fileExistsNamed:kBGSuppVideo])   [parts addObject:@"按钮视频"];
     return parts.count ? [parts componentsJoinedByString:@" / "] : @"尚无资源";
 }
 
@@ -499,7 +494,6 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 - (void)lnbPickCardImage:(PSSpecifier *)spec   { [self presentPickerForName:kBGCardImage   isVideo:NO]; }
 - (void)lnbPickCardVideo:(PSSpecifier *)spec   { [self presentPickerForName:kBGCardVideo   isVideo:YES]; }
 - (void)lnbPickSuppImage:(PSSpecifier *)spec   { [self presentPickerForName:kBGSuppImage   isVideo:NO]; }
-- (void)lnbPickSuppVideo:(PSSpecifier *)spec   { [self presentPickerForName:kBGSuppVideo   isVideo:YES]; }
 - (void)lnbPickSupp2Image:(PSSpecifier *)spec  { [self presentPickerForName:kBGSupp2Image  isVideo:NO]; }
 
 - (void)lnbConfirmClearAll:(PSSpecifier *)spec {
@@ -514,7 +508,6 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         [LNBFileManager removeFileNamed:kBGCardVideo];
         [LNBFileManager removeFileNamed:kBGSuppImage];
         [LNBFileManager removeFileNamed:kBGSupp2Image];
-        [LNBFileManager removeFileNamed:kBGSuppVideo];
         [LNBFileManager postReload];
         [self.table reloadData];
         [self lnbShowAlert:@"已清除" message:@"所有背景资源已删除。"];
@@ -607,7 +600,6 @@ static NSString *LNBLogFilePath(void) {
         if ([k isEqualToString:@"pickCardImage"])   { [self lnbPickCardImage:spec];   return; }
         if ([k isEqualToString:@"pickCardVideo"])   { [self lnbPickCardVideo:spec];   return; }
         if ([k isEqualToString:@"pickSuppImage"])   { [self lnbPickSuppImage:spec];   return; }
-        if ([k isEqualToString:@"pickSuppVideo"])   { [self lnbPickSuppVideo:spec];   return; }
         if ([k isEqualToString:@"pickSupp2Image"])  { [self lnbPickSupp2Image:spec];  return; }
         if ([k isEqualToString:@"clearDiag"])       { [self lnbClearDiagBorders:spec]; return; }
         if ([k isEqualToString:@"viewLog"])         { [self lnbViewLog:spec];         return; }
@@ -642,9 +634,9 @@ static NSString *LNBLogFilePath(void) {
         NSError *error = nil;
         BOOL ok = NO;
 
+        // 【v1.4.1】按钮只支持图片（supp.mp4 入口已移除），这里只剩两处视频目标。
         BOOL isVideoPick = [targetName isEqualToString:kBGGlobalVideo]
-                        || [targetName isEqualToString:kBGCardVideo]
-                        || [targetName isEqualToString:kBGSuppVideo];
+                        || [targetName isEqualToString:kBGCardVideo];
         if (isVideoPick) {
             NSURL *videoURL = info[UIImagePickerControllerMediaURL];
             if (videoURL) ok = [LNBFileManager copyFileAtURL:videoURL toName:targetName error:&error];
