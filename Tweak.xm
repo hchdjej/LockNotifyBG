@@ -88,21 +88,50 @@ static void LNBTLog(NSString *fmt, ...) {
     }
 }
 
-// 递归 dump 视图树：类名 / frame / hidden / alpha / backgroundColor
+// 递归 dump 视图树：类名 / frame / bounds / center / transform / hidden / alpha / bg / tag
+//
+// 【v1.4.10 增强】原来的 dump 只有 frame / hidden / alpha / bg，排查
+// 「卡片背景和选项按钮糊成一块」这种层级问题远远不够 —— 至少还差：
+//   bounds    view 自身坐标系的尺寸（判断尺寸对不对的依据）
+//   center    view 在父坐标系里的中心（判断有没有被推到别处）
+//   transform 有没有被缩放/位移（展开动画的关键）
+//   序号      同级子视图的先后顺序 = 层级 z 序（判断谁盖谁）
+// 全部补上，做到"看日志即可还原现场"。
+//
+// 【坐标系提示】打印时把 center 和 frame 都列出来，若两者对不上（例如
+// center 落在父视图中心但 frame 在很远处），就说明有 transform 在捣鬼。
 static void LNBLogViewTree(UIView *v, NSInteger depth, NSMutableString *out) {
-    if (!v || depth > 9) return;
+    if (!v || depth > 12) return;
     NSMutableString *indent = [NSMutableString string];
     for (NSInteger i = 0; i < depth; i++) [indent appendString:@"  "];
+
+    // transform：标出缩放/位移，恒等则简写 identity
+    CGAffineTransform t = v.transform;
+    NSString *tf = @"identity";
+    if (!CGAffineTransformIsIdentity(t)) {
+        tf = [NSString stringWithFormat:@"[a=%.3f b=%.3f c=%.3f d=%.3f tx=%.1f ty=%.1f]",
+              t.a, t.b, t.c, t.d, t.tx, t.ty];
+    }
 
     NSString *bg = @"nil";
     if (v.backgroundColor) {
         CGFloat r, g, b, a;
-        [v.backgroundColor getRed:&r green:&g blue:&b alpha:&a];
-        bg = [NSString stringWithFormat:@"(%0.2f,%0.2f,%0.2f,%.2f)", r, g, b, a];
+        if ([v.backgroundColor getRed:&r green:&g blue:&b alpha:&a]) {
+            bg = [NSString stringWithFormat:@"(%0.2f,%0.2f,%0.2f,%.2f)", r, g, b, a];
+        } else {
+            bg = @"(non-rgb)";
+        }
     }
-    [out appendFormat:@"%@%@ frame=%@ hidden=%d alpha=%.2f tag=%ld bg=%@\n",
+
+    [out appendFormat:
+        @"%@%@ frame=%@ bounds=%@ center=(%.1f,%.1f) tf=%@ z=%ld/%ld "
+        @"hidden=%d alpha=%.2f clip=%d tag=%ld bg=%@\n",
         indent, NSStringFromClass(v.class),
-        NSStringFromCGRect(v.frame), (int)v.hidden, (double)v.alpha, (long)v.tag, bg];
+        NSStringFromCGRect(v.frame), NSStringFromCGRect(v.bounds),
+        v.center.x, v.center.y, tf,
+        (long)(v.superview ? [v.superview.subviews indexOfObject:v] : 0),
+        (long)(v.superview ? v.superview.subviews.count : 0),
+        (int)v.hidden, (double)v.alpha, (int)v.clipsToBounds, (long)v.tag, bg];
 
     for (UIView *sub in v.subviews) LNBLogViewTree(sub, depth + 1, out);
 }
@@ -116,6 +145,19 @@ static void LNBLogCardTreeOnce(UIView *cellView, NSString *reason) {
     NSMutableString *out = [NSMutableString stringWithFormat:@"--- 卡片视图树 (%@) 根=%@ ---\n",
                             reason, NSStringFromClass(cellView.class)];
     LNBLogViewTree(cellView, 0, out);
+    LNBTLog(@"%@", out);
+}
+
+// 【v1.4.10 ★★★ 新增：按需 dump（不限一次）】
+// 「主卡片和选项糊成一块」这类问题需要在【展开动作发生时】看层级，
+// 而 LNBLogCardTreeOnce 每个 cell 只 dump 第一次（挂背景时），
+// 那时按钮还没出现。这里提供一个不限次数、可指定触发原因的 dump，
+// 由 LNBApplyCardBackground / LNBApplyButtonBackground 的关键分支调用。
+static void LNBLogTreeNow(UIView *root, NSString *reason) {
+    if (!root) return;
+    NSMutableString *out = [NSMutableString stringWithFormat:
+        @"--- 视图树快照 (%@) 根=%@ ---\n", reason, NSStringFromClass(root.class)];
+    LNBLogViewTree(root, 0, out);
     LNBTLog(@"%@", out);
 }
 
@@ -1085,9 +1127,20 @@ static void LNBApplyCardBackground(UIView *cellView) {
         }];
     }
 
-    // 给 cell 本体开裁剪：动画中间帧上 bg 可能比 cell 大或小，
-    // 裁剪保证无论哪种情况都不会溢出卡片轮廓之外。
-    cellView.clipsToBounds = YES;
+    // 【v1.4.10】不再给 cell 强制开 clipsToBounds！
+    //
+    //   1.4.8/1.4.9 在这里写了 cellView.clipsToBounds = YES，本意是
+    //   "动画中间帧背景可能比 cell 大，裁剪一下不溢出"。但这会带来两个恶果：
+    //     ① cell 的裁剪是在【未变换】的 bounds 空间里做的，而背景带了
+    //        逆 transform，裁剪边界和背景实际渲染范围对不上，可能把
+    //        背景边缘切掉、或把别的东西切出锯齿；
+    //     ② 更重要：「选项 / 清除」按钮在展开态是挂在 cell 子树的容器里，
+    //        强制裁剪会把按钮的一部分一起裁掉 —— 用户看到的就是
+    //        "按钮和卡片背景糊成一块 / 按钮被吃掉"。
+    //   背景自身已经 clipsToBounds（LNBGlobalBackgroundView 构造里设了），
+    //   它绝不会超出自己的框；cell 这一层不需要也不应该再裁。
+    //
+    // 若后续日志证明确实需要裁剪，再加回来并配合正确的坐标空间。
 
     // 【v1.4.9】日志加 bgVis（背景的视觉尺寸 = bg.frame.size）——
     //   这是判断"有没有跟对"的唯一标准：bgVis 应恒等于 cellFrame.size。
@@ -1176,19 +1229,15 @@ static void LNBApplyCardBackground(UIView *cellView) {
 - (void)layoutSubviews {
     UIView *host = self.superview;
     if (host) {
-        // 【v1.4.9】与卡片同一套正解：视觉尺寸（frame.size）+ 抵消父层 transform。
-        CGSize target = host.frame.size;
-        if (target.width < 1.0 || target.height < 1.0) target = host.bounds.size;
-        CGAffineTransform inv = CGAffineTransformInvert(host.transform);
-
+        // 【v1.4.10】回退 1.4.9 的 transform 抵消 —— 按钮图只在按钮自身
+        // 坐标系里贴合即可，按钮不会被缩放，不需要也不应该动 transform。
+        CGSize target = host.bounds.size;
         if (target.width >= 1.0 && target.height >= 1.0 &&
-            (!CGSizeEqualToSize(self.bounds.size, target) ||
-             !CGAffineTransformEqualToTransform(self.transform, inv))) {
+            !CGSizeEqualToSize(self.bounds.size, target)) {
             self.autoresizingMask = UIViewAutoresizingNone;
             CGRect b = self.bounds;
             b.size = target;
             self.bounds = b;
-            self.transform = inv;
             self.center = CGPointMake(CGRectGetMidX(host.bounds),
                                       CGRectGetMidY(host.bounds));
         }
@@ -1404,9 +1453,22 @@ static void LNBApplyButtonBackground(UIView *view) {
 
     // 铺图：插到最底层（index 0），系统自己的 label / imageView 天然浮在上面。
     // 【v1.3.9】不再假设它是 UIButton —— 用 view 本身即可（放宽后可能是任意视图）。
-    // 【v1.4.9 ★★★】与卡片同一套正解：frame.size（视觉尺寸）+ 抵消父层 transform。
-    //   1.4.8 用的 bounds.size 在折叠态碰巧对，但按钮一旦被缩放就脱节。
-    //   同时用 LNBFollowImageView 自跟踪子类，在自身 layoutSubviews 里同步。
+    //
+    // 【v1.4.10 ★★★ 回退 1.4.9 的错误】按钮图【不做】任何 transform 抵消。
+    //
+    //   1.4.9 为了"和卡片统一"，给按钮图也加了
+    //       iv.transform = CGAffineTransformInvert(view.transform);
+    //   这是错的，而且破坏性很强：
+    //     ① 按钮（PLPlatterActionButton / NCToggleControl）在正常状态下
+    //        transform 是恒等 → 逆矩阵也是恒等 → 加了等于没加；
+    //     ② 但一旦 view 有任何 transform，逆矩阵会把图片推到
+    //        【远离按钮】的位置，视觉上就是"按钮背景和卡片背景糊成一块"；
+    //     ③ 而且下面用的是 iv.center（父坐标系），和逆 transform 混在一起，
+    //        坐标系不一致，必定错位。
+    //
+    //   正解：按钮图老老实实跟在按钮自身坐标系里 ——
+    //   尺寸取 view.bounds.size（按钮自身坐标系的真实尺寸），
+    //   居中在 view.bounds 中心。按钮不会被缩放，这就够了。
     LNBFollowImageView *iv = [[LNBFollowImageView alloc] initWithFrame:view.bounds];
     iv.contentMode = UIViewContentModeScaleAspectFill;
     iv.clipsToBounds = YES;
@@ -1414,12 +1476,14 @@ static void LNBApplyButtonBackground(UIView *view) {
     iv.autoresizingMask = UIViewAutoresizingNone;
     iv.tag = tag;
     {
-        CGSize ts = view.frame.size;
-        if (ts.width < 1.0 || ts.height < 1.0) ts = view.bounds.size;
+        // 尺寸：用按钮 bounds（自身坐标系的真实尺寸）。
+        // 不用 frame —— frame 是父坐标系的，跨坐标系取值会错。
+        CGSize ts = view.bounds.size;
+        if (ts.width < 1.0 || ts.height < 1.0) ts = view.frame.size;
         CGRect ib = iv.bounds;
         ib.size = ts;
         iv.bounds = ib;
-        iv.transform = CGAffineTransformInvert(view.transform);
+        // 居中在按钮自身坐标系中心
         iv.center = CGPointMake(CGRectGetMidX(view.bounds),
                                 CGRectGetMidY(view.bounds));
     }
@@ -1448,6 +1512,30 @@ static void LNBApplyButtonBackground(UIView *view) {
     LNBTLog(@"[按钮] ✅ 已铺图 cls=%@ text=\"%@\" tag=0x%lX size=%0.0fx%0.0f 素材=%@",
             NSStringFromClass(view.class), label, (unsigned long)tag,
             view.bounds.size.width, view.bounds.size.height, imgName);
+
+    // 【v1.4.10】诊断模式下，每次给按钮铺完图都 dump 一次按钮所在的那棵
+    // 通知子树 —— 这是抓「主卡片背景和选项按钮糊成一块」的现场。
+    // 只 dump 按钮的"通知体系祖先"这一层，避免整棵树太大刷爆日志。
+    if (prefs.diagMode) {
+        UIView *root = view;
+        for (UIView *p = view.superview; p; p = p.superview) {
+            NSString *c = NSStringFromClass(p.class);
+            if ([c containsString:@"NCNotification"] || [c containsString:@"Platter"]) {
+                root = p;
+            } else {
+                break;
+            }
+        }
+        NSMutableString *out = [NSMutableString stringWithFormat:
+            @"\n===== 按钮铺图后 层级快照 (%@) 按钮=%@ 祖先根=%@ =====\n",
+            label.length ? label : @"(无文字)", NSStringFromClass(view.class),
+            NSStringFromClass(root.class)];
+        [out appendFormat:@"按钮自身: frame=%@ bounds=%@ center=(%.1f,%.1f)\n",
+            NSStringFromCGRect(view.frame), NSStringFromCGRect(view.bounds),
+            view.center.x, view.center.y];
+        LNBLogViewTree(root, 0, out);
+        LNBTLog(@"%@", out);
+    }
 }
 
 // 【v1.3.1 核心修复】在通知列表子树里扫描每一条通知并应用卡片背景。
@@ -1547,6 +1635,10 @@ static void LNBReloadConfiguration(void) {
 
 #pragma mark - Hook 入口
 
+// 【v1.4.10】层级 dump 函数定义在下方（紧跟 NCNotificationListCell hook 之后），
+// 但 hook 块里要先调用它 → 这里做前向声明，避免"未声明即使用"编译错误。
+static void LNBDumpCellHierarchyIfNeeded(UIView *cell);
+
 %hook NCNotificationListSectionView
 
 - (void)layoutSubviews {
@@ -1576,9 +1668,85 @@ static void LNBReloadConfiguration(void) {
 - (void)layoutSubviews {
     %orig;
     LNBApplyCardBackground((UIView *)self);
+    // 【v1.4.10】层级快照 hook：展开/折叠状态切换时 dump 一次完整视图树，
+    // 用来定位「主卡片背景和选项按钮糊成一块」到底是谁盖谁、在哪个坐标系。
+    LNBDumpCellHierarchyIfNeeded((UIView *)self);
 }
 
 %end
+
+// 【v1.4.10 ★★★ 新增：视图层级 dump hook】
+//
+// 【要解决什么】用户反馈「主卡片和选项被删到一块了」—— 典型的层级/坐标系问题：
+//   ① 卡片背景（我们的子视图，atIndex:0）盖住了按钮？
+//   ② 按钮背景的 transform 把它推到了卡片位置？
+//   ③ 两者的 superview 其实是同一个，互相重叠？
+//   光看尺寸日志看不出来，必须看【完整视图树】：每层的类名、frame、bounds、
+//   center、transform、z 序（同级先后）、hidden、alpha、clip。
+//
+// 【什么时候 dump】每张 cell 都 dump 会刷爆日志（列表里几十条）。
+//   只在"状态发生变化"时 dump：进入展开 或 从展开退出，各 dump 一次。
+//   判定"展开"：cell.transform 非恒等（被缩放）→ 就是展开/折叠动画中。
+//   状态没变就不重复输出。
+static void LNBDumpCellHierarchyIfNeeded(UIView *cell) {
+    if (!cell) return;
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    if (!prefs.diagMode) return;   // 只在诊断模式开着时刷，避免拖累正常使用
+
+    static const void *kLNBLastExpandState = &kLNBLastExpandState;   // per-cell
+
+    BOOL nowExpanded = !CGAffineTransformIsIdentity(cell.transform);
+    NSNumber *last = objc_getAssociatedObject(cell, kLNBLastExpandState);
+    if (last && last.boolValue == nowExpanded) return;   // 状态没变，跳过
+
+    objc_setAssociatedObject(cell, kLNBLastExpandState, @(nowExpanded),
+                             OBJC_ASSOCIATION_RETAIN);
+
+    NSString *state = nowExpanded ? @"进入展开/缩放态" : @"退出展开→稳定态";
+    // 从 cell 往上找到"最高的通知相关祖先"再 dump，这样能同时看到
+    // 卡片、按钮、以及它们共同的外层容器 —— 只 dump cell 内部会漏掉
+    // 「按钮其实挂在 cell 外面」这种情况。
+    UIView *root = cell;
+    for (UIView *p = cell.superview; p; p = p.superview) {
+        NSString *c = NSStringFromClass(p.class);
+        if ([c containsString:@"NCNotification"] || [c containsString:@"Platter"]) {
+            root = p;
+        } else {
+            break;
+        }
+    }
+    NSMutableString *out = [NSMutableString stringWithFormat:
+        @"\n===== 层级快照 (%@) cell=%@ root=%@ =====\n",
+        state, NSStringFromClass(cell.class), NSStringFromClass(root.class)];
+    // 额外标注"我们挂的背景"和"按钮图"各自的绝对位置，直击问题
+    [out appendString:@"[我方视图定位]\n"];
+    UIView *myBG = [cell viewWithTag:kCardBGViewTag];
+    if (myBG) {
+        [out appendFormat:@"  卡片背景 tag=0x%lX frame=%@ bounds=%@ center=(%.1f,%.1f) tf=%d z=%ld\n",
+            (long)kCardBGViewTag, NSStringFromCGRect(myBG.frame),
+            NSStringFromCGRect(myBG.bounds), myBG.center.x, myBG.center.y,
+            (int)!CGAffineTransformIsIdentity(myBG.transform),
+            (long)[cell.subviews indexOfObject:myBG]];
+    } else {
+        [out appendString:@"  卡片背景: 未挂载\n"];
+    }
+    UIView *myDim = [cell viewWithTag:kCardDimViewTag];
+    if (myDim) {
+        [out appendFormat:@"  卡片遮罩 tag=0x%lX frame=%@ z=%ld\n",
+            (long)kCardDimViewTag, NSStringFromCGRect(myDim.frame),
+            (long)[cell.subviews indexOfObject:myDim]];
+    }
+    for (UIView *b1 in cell.subviews) {
+        if (b1.tag == kSuppBtn1Tag || b1.tag == kSuppBtn2Tag) {
+            [out appendFormat:@"  按钮图 tag=0x%lX 挂在【cell 直系】frame=%@ z=%ld\n",
+                (long)b1.tag, NSStringFromCGRect(b1.frame),
+                (long)[cell.subviews indexOfObject:b1]];
+        }
+    }
+    [out appendString:@"[完整层级]\n"];
+    LNBLogViewTree(root, 0, out);
+    LNBTLog(@"%@", out);
+}
 
 // 【v1.4.1 已移除】NCNotificationListSupplementaryHostingView 的 hook。
 // 它当年是为了给"附属按钮模块"铺背景才挂的，而这个"模块"本身就是 1.3.6 起

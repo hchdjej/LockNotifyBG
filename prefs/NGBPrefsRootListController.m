@@ -429,8 +429,12 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 
         // ---- 4. 诊断 ----
         [specs addObject:LNBGroup(@"诊断（排查用）",
-                                  @"开启后会给锁屏通知的各层视图描上彩色边框，用于确认背景图挂在哪一层、被谁挡住。\n红=通知卡片容器　绿=我们的背景视图　紫=遮罩层　黄=被隐藏的系统白底　蓝=文字内容层　橙=整块背景宿主\n排查完请务必关闭，否则会一直显示彩色边框。")];
-        [specs addObject:LNBSwitch(self, @"诊断模式（彩色边框）", @"diagMode")];
+                                  @"开启后会给锁屏通知的各层视图描上彩色边框，用于确认背景图挂在哪一层、被谁挡住。\n"
+                                  @"红=通知卡片容器　绿=我们的背景视图　紫=遮罩层　黄=被隐藏的系统白底　蓝=文字内容层　橙=整块背景宿主\n"
+                                  @"同时会把【完整视图层级】写进日志：每个视图的 类名 / frame / bounds / center / transform / z序 / hidden / alpha。\n"
+                                  @"触发时机：① 卡片进入或退出展开（缩放）态　② 每次给「选项/清除」按钮铺图后。\n"
+                                  @"排查坐标系、遮挡、错位问题全靠它。排查完请务必关闭，否则会一直显示彩色边框并持续写日志。")];
+        [specs addObject:LNBSwitch(self, @"诊断模式（彩色边框 + 层级快照）", @"diagMode")];
         [specs addObject:LNBButton(self, @"清除诊断彩框", @selector(lnbClearDiagBorders:), @"clearDiag")];
         [specs addObject:LNBButton(self, @"查看运行日志", @selector(lnbViewLog:), @"viewLog")];
         [specs addObject:LNBButton(self, @"复制日志到剪贴板", @selector(lnbCopyLog:), @"copyLog")];
