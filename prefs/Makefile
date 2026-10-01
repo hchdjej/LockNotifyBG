@@ -9,7 +9,7 @@ BUNDLE_NAME = LockNotifyBGPrefs
 LockNotifyBGPrefs_FILES = NGBPrefsRootListController.m
 LockNotifyBGPrefs_INSTALL_PATH = /Library/PreferenceBundles
 LockNotifyBGPrefs_FRAMEWORKS = UIKit AVFoundation MobileCoreServices UniformTypeIdentifiers
-LockNotifyBGPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+LockNotifyBGPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-arc-performSelector-leaks
 LockNotifyBGPrefs_PRIVATE_FRAMEWORKS = Preferences
 
 include $(THEOS_MAKE_PATH)/bundle.mk

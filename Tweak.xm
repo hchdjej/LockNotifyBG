@@ -1041,20 +1041,19 @@ static NSString *LNBGatherText(UIView *v) {
             NSString *t = [((UIButton *)cur) titleForState:UIControlStateNormal];
             if (t.length) [acc appendFormat:@" %@", t];
         }
-        // 私有类常见：直接响应 title / text
-        for (NSString *sel in @[@"title", @"text", @"stringValue"]) {
-            SEL s = NSSelectorFromString(sel);
-            if ([cur respondsToSelector:s]) {
-                @try {
-                    id val = [cur performSelector:s];
-                    if ([val isKindOfClass:[NSString class]] && [val length]) {
-                        [acc appendFormat:@" %@", val];
-                    }
-                } @catch (NSException *e) {
-                    // 【v1.3.9 注意】这里不能写 __unused —— 该宏在 @catch 位置
-                    // 会被 clang 当成类型名，报 unknown type name '__unused'。
-                    (void)e;
+        // 私有类常见：直接响应 title / text / stringValue。
+        // 【v1.3.9 修正】不能用 [cur performSelector:s] —— ARC 下会触发
+        // -Warc-performSelector-leaks，Theos 把它当错误处理，直接编译失败。
+        // 改用 KVC valueForKey:（本质同样是动态取值，但不产生 ARC 泄漏警告），
+        // 找不到 key 时 KVC 会抛 NSUndefinedKeyException，用 @try 兜住即可。
+        for (NSString *key in @[@"title", @"text", @"stringValue"]) {
+            @try {
+                id val = [cur valueForKey:key];
+                if ([val isKindOfClass:[NSString class]] && [val length]) {
+                    [acc appendFormat:@" %@", val];
                 }
+            } @catch (NSException *e) {
+                (void)e;
             }
         }
         for (UIView *sub in cur.subviews) [stack addObject:sub];
