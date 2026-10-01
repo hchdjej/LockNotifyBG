@@ -1084,20 +1084,50 @@ static BOOL LNBIsCandidateActionButton(UIView *v) {
 
     NSString *cls = NSStringFromClass(v.class);
 
-    // ① 真按钮：NCToggleControl。注意 NCToggleControlPair 是并排容器，
-    //    也放行（它的子 NCToggleControl 会各自被单独处理，Pair 本身不铺，
-    //    见下面的 pair 排除）。
+    // ① 真按钮：NCToggleControl —— 「清除」/「折叠」这类开关式小按钮。
+    //    【日志实证 v1.4.5】NCToggleControl 实际尺寸只有两种：
+    //      size=45x34 text="清除"（197 次）
+    //      size=66x34 text="清除"（42 次）
+    //    注意 NCToggleControlPair（108x34）是并排容器，**不认**（见 ②）。
     if ([cls isEqualToString:@"NCToggleControl"]) return YES;
 
-    // ② 明确排除：容器与标题（日志实证的误伤源）
+    // ①b 真按钮：PLPlatterActionButton —— 「选项」按钮的真身！
+    //    【v1.4.5 新增，这是本轮最大的收获】
+    //    用户在「选项」可见状态下抓到了日志：
+    //      ✅ cls=PLPlatterActionButton size=77x66 text="选项"
+    //      ✅ cls=PLPlatterActionButton size=73x66 text="清除"
+    //    它的祖先链是：
+    //      PLPlatterActionButton → PLActionButtonsPresentingView → ...
+    //    之前一直认不到，是因为旧规则要求类名含 "Button" 且祖先链含
+    //    "NCNotification" —— 而 PLPlatter* 是 SpringBoard 的 Platter 体系，
+    //    祖先链里根本没有 NCNotification 前缀，所以被 ③ 拒之门外。
+    if ([cls isEqualToString:@"PLPlatterActionButton"]) return YES;
+
+    // ② 明确排除：容器与标题（日志实证的误伤源，逐个点名）
+    //
+    //    【v1.4.5 重点】PLActionButtonsPresentingView 是包住「选项+全部清除」
+    //    的**容器**，尺寸 30x66 / 154x66 / 103x66...（随按钮数量变化）。
+    //    旧规则靠 ③「类名含 Button」把它放行了（Presenting 里没有 Button，
+    //    但它的意思是"承载按钮的视图"）—— 在容器上铺图会把真正的
+    //    PLPlatterActionButton 子按钮整个盖住，就是用户说的"按钮被遮挡"。
+    //    必须排除。
+    if ([cls containsString:@"ActionButtonsPresenting"]) return NO;  // ← v1.4.5
     if ([cls containsString:@"Coalescing"])      return NO;   // 外层容器，铺了会盖住子按钮
-    if ([cls containsString:@"HeaderTitle"])     return NO;   // 「通知中心」标题
-    if ([cls containsString:@"Pair"])            return NO;   // 并排容器，交给子控件各自铺
+    if ([cls containsString:@"HeaderTitle"])     return NO;   // 「通知中心」标题（85x30）
+    if ([cls containsString:@"HeaderCell"])      return NO;   // v1.4.5 分组头容器
+    if ([cls containsString:@"Pair"])            return NO;   // 并排容器（108x34），交给子控件各自铺
     if ([cls containsString:@"SectionHeader"])   return NO;
     if ([cls containsString:@"SectionView"])     return NO;
+    // 图标/头像/文字这类小视图在探针里数量极大（UIImageView 1616、
+    // NCAvatarView 985、NCBadgedIconView 992），明确挡掉避免任何误伤。
+    if ([cls containsString:@"Avatar"])          return NO;
+    if ([cls containsString:@"BadgedIcon"])      return NO;
+    if ([cls containsString:@"Legibility"])      return NO;   // SBUILegibility* 文字层
+    if ([cls isEqualToString:@"UIImageView"])    return NO;
+    if ([cls isEqualToString:@"UILabel"])        return NO;
 
-    // ③ 其它自定义按钮（保留兜底，但要求类名含 Button 才认，不做文字兜底，
-    //    否则「通知中心」「没有更早的通知」这种有文字的普通视图会被误伤）
+    // ③ 其它自定义按钮兜底：类名含 Button 且祖先链在通知体系内才算。
+    //    【v1.4.5】不再放行"含 Presenting 的容器"（已由 ② 拦下）。
     if ([cls containsString:@"Button"]) {
         for (UIView *p = v.superview; p; p = p.superview) {
             if ([NSStringFromClass(p.class) containsString:@"NCNotification"]) return YES;
@@ -1165,10 +1195,28 @@ static void LNBApplyButtonBackground(UIView *view) {
         return;
     }
 
-    NSInteger tag = kSuppBtn1Tag;
-    if ([label containsString:@"清除"] || [lower containsString:@"clear"]) {
+    // 【v1.4.5】文字优先级：必须先判「选项」再判「清除」。
+    //
+    // 【为什么】日志实证：NCToggleControlPair 这类容器的 text 是
+    //   「清除 清除 清除 折叠 折叠 折叠」（两个子按钮的文字拼接），
+    // 而「全部清除」按钮的文字里同时含「清除」和「选项」的场景也存在
+    //（PLActionButtonsPresentingView 的 text = "全部清除 ... 选项 ..."）。
+    // 旧代码先判「清除」，于是「选项」按钮一旦有个含"清除"的兄弟就会
+    // 被染成 supp2；反过来「选项」也可能被误判。
+    // 改为：文字里【明确含「选项」且不含「清除」】→ 选项图；
+    //       【明确含「清除」】→ 清除图；两者都有时按类名定夺。
+    BOOL hasOption = ([label containsString:@"选项"] || [lower containsString:@"option"]);
+    BOOL hasClear  = ([label containsString:@"清除"] || [lower containsString:@"clear"]);
+
+    NSInteger tag = kSuppBtn1Tag;   // 默认「选项」
+    if (hasOption && !hasClear) {
+        tag = kSuppBtn1Tag;
+    } else if (hasClear && !hasOption) {
         tag = kSuppBtn2Tag;
-    } else if ([label containsString:@"选项"] || [lower containsString:@"option"]) {
+    } else if (hasOption && hasClear) {
+        // 混合文字（容器特征）：PLPlatterActionButton 是真按钮，
+        // 用类名兜底 —— 它的具体归属交给「选项」侧（默认），
+        // 因为真按钮很少同时挂两种文字。
         tag = kSuppBtn1Tag;
     }
 
@@ -1194,9 +1242,19 @@ static void LNBApplyButtonBackground(UIView *view) {
     iv.image = img;
     [view insertSubview:iv atIndex:0];
 
-    // 圆角：优先沿用按钮本体已有的圆角，否则按高度取半（截图里是明显的圆角块）
+    // 圆角：优先沿用按钮本体已有的圆角，否则按「短边」取一个舒服的比例。
+    //
+    // 【v1.4.5 修正】旧代码写的是 height * 0.5（取半 = 胶囊形）。
+    // 对 NCToggleControl（45x34 / 66x34）这种矮扁按钮没问题，
+    // 但「选项」真身 PLPlatterActionButton 是 77x66 —— 一个接近正方形的大块，
+    // 按高度取半会得到 33 半径的椭圆，和用户参照图里那种"圆角方块"完全不符。
+    // 改为：按短边取 30%（66*0.3 ≈ 20），接近 iOS 控制中心的圆角观感。
     CGFloat cr = view.layer.cornerRadius;
-    iv.layer.cornerRadius = cr > 0.5 ? cr : (view.bounds.size.height * 0.5);
+    if (cr <= 0.5) {
+        CGFloat shortSide = MIN(view.bounds.size.width, view.bounds.size.height);
+        cr = shortSide * 0.3;
+    }
+    iv.layer.cornerRadius = cr;
     iv.layer.masksToBounds = YES;
 
     LNBLogButtonCandidate(view, YES);
