@@ -636,7 +636,17 @@ static void LNBEnsureGlobalBackground(UIView *candidateHost) {
     bgView.imageName = kBGGlobalImage;
     bgView.videoName = kBGGlobalVideo;
     bgView.preferVideo = prefs.globalUseVideo;
-    bgView.frame = hostView.bounds;
+    // 【v1.4.6 同款修复】原来写 bgView.frame = hostView.bounds;
+    // frame 属于父坐标系、bounds 属于自身坐标系，两者混用会在
+    // hostView.bounds.origin 非零时把背景推到错误位置并钉死。
+    // 改为设 bounds（继承尺寸）+ center（对齐可视区中心）。
+    {
+        CGRect gb = bgView.bounds;
+        gb.size = hostView.bounds.size;
+        bgView.bounds = gb;
+        bgView.center = CGPointMake(CGRectGetMidX(hostView.bounds),
+                                    CGRectGetMidY(hostView.bounds));
+    }
     [bgView applyConfig:prefs];
 
     // 诊断模式：橙色边框标出「整块列表背景」的宿主范围
@@ -943,45 +953,71 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [bg removeFromSuperview];
         [cellView insertSubview:bg atIndex:0];
     }
-    // 【v1.4.0 修「滑动时背景不跟随」→ v1.4.4 推翻重写】
+
+    // 【v1.4.6 ★ 真凶终于找到了：frame 与 bounds 混用】
     //
-    // 【1.4.0~1.4.3 的思路为什么是错的】
-    //   1.4.0：「每次 layout 都把 bg.frame 强制写成 cellView.bounds」；
-    //   1.4.3：再加 clipsToBounds + bg 内部图层每帧硬对齐。
-    //   在 cell 尺寸【稳定】时这没问题；但用户视频（RPReplay）逐帧实证：
-    //   折叠/展开动画中系统每帧都在改 cell.bounds，于是每帧都把【中间帧
-    //   尺寸】写进了 bg —— 背景图案被反复拉伸压扁（f022 帧小人被水平
-    //   压缩、出现压缩竖线），动画结束又跳回 —— 用户看到的正是
-    //   「素材不跟着滑动定位」。
+    // 视图树 dump 给出了铁证（13:56:35 那条）：
+    //   NCNotificationListCell frame={{46.1, 18.4}, {308.8, 123.2}}
+    //     UIView frame={{0, 0}, {401, 160}}          ← cell 内部更大的一层
     //
-    // 【v1.4.4 正确做法：动画期间冻结，稳定后对齐】
-    //   cell.layer.animationKeys 非空 = 正在跑 CA 动画（折叠/展开/位移）。
-    //   此时【不要碰 bg.frame】：bg 是 cell 的子视图，cell 平移它自然跟着
-    //   平移（图案相对卡片纹丝不动），尺寸变化的中间帧交给 clipsToBounds
-    //   裁剪，图案绝不会被压缩。
-    //   动画结束（animationKeys 为空）后再一次性对齐最终 bounds。
+    //   * cell.frame  = 308.8 x 123.2 → 卡片在屏幕上的真实几何
+    //   * cell.bounds = 309 x 66       → 是【内部坐标系】里的可视尺寸
+    //     日志里 5691 次 cellBounds=309x66 全部来自 bounds，而真实卡片
+    //     是 308x123 —— 两者根本不是一回事。
+    //
+    // 【为什么之前只会"固定在一个位置"】
+    //   旧代码写的是 `bg.frame = cellView.bounds;`
+    //     bg.frame  是【父视图坐标系】的矩形（origin 通常是 0,0）
+    //     cellView.bounds 是【cell 自身坐标系】的矩形（origin 可能是 (0,0)
+    //       但 size 是内部尺寸 66 高）
+    //   把 bounds 直接赋给 frame，等于把"内部坐标系的尺寸"当成了
+    //   "父坐标系的位置 + 尺寸"。当 bounds.origin 非零或内部尺寸与
+    //   frame 尺寸不一致时，背景就被钉死在错误位置，且因为每次都写入
+    //   同一个错误值，它永远不动 —— 正是用户说的
+    //   「一直固定一个位置，不跟着通知模块滑动变换」。
+    //
+    // 【正确做法】
+    //   背景要覆盖 cell 的整个可视区域 → 设 bg.bounds = cellView.bounds
+    //   （继承 cell 的坐标系尺寸），同时把 bg.center 对齐到 cell 的
+    //   bounds 中心。这样无论 bounds.origin 偏移多少，背景都精确覆盖。
+    //   —— 绝不再把 cellView.bounds 赋给 bg.frame。
+    //
+    // 【v1.4.4 的动画冻结策略继续保留】动画期间不写尺寸，避免中间帧
+    //   拉伸图案；动画结束后一次性对齐。
     bg.autoresizingMask = UIViewAutoresizingNone;
     BOOL cellAnimating = (cellView.layer.animationKeys.count > 0);
     if (!cellAnimating) {
-        // 稳定态对齐禁止隐式动画：否则动画结束后 bg 从冻结尺寸过渡到
-        // 最终尺寸时又会自己播一段补间，图案"软着陆"反而多一次跳动。
         [UIView performWithoutAnimation:^{
-            bg.frame = cellView.bounds;
+            // ① bounds 跟 cell 的坐标系尺寸一致
+            CGRect b = bg.bounds;
+            b.size = cellView.bounds.size;
+            bg.bounds = b;
+            // ② 中心点对齐到 cell 可视区中心（cell 坐标系）
+            bg.center = CGPointMake(CGRectGetMidX(cellView.bounds),
+                                    CGRectGetMidY(cellView.bounds));
         }];
     }
+
     // 给 cell 本体开裁剪：动画中间帧上 bg 可能比 cell 大或小，
     // 裁剪保证无论哪种情况都不会溢出卡片轮廓之外。
     cellView.clipsToBounds = YES;
+
+    // 【v1.4.6】日志改为打印 frame/bounds 两组值，便于下次定位：
+    //   cellFrame  = 卡片在屏幕上的真实几何（308x123）
+    //   cellBounds = cell 内部坐标系尺寸（309x66）
+    //   两者不一致正是本版修复的核心。
+    LNBTLog(@"[%@] 背景已挂载 superview=%@ bgFrame=%@ cellFrame=%@ cellBounds=%@ animating=%d 素材=%@",
+            tagName,
+            NSStringFromClass(bg.superview.class),
+            NSStringFromCGRect(bg.frame),
+            NSStringFromCGRect(cellView.frame),
+            NSStringFromCGRect(cellView.bounds),
+            (int)cellAnimating,
+            bg.preferVideo ? vidName : imgName);
+
     [bg setNeedsLayout];
     [bg layoutIfNeeded];
     [bg applyConfig:prefs];
-    LNBTLog(@"[%@] 背景已挂载 superview=%@ 尺寸=%0.0fx%0.0f cellBounds=%0.0fx%0.0f 视频=%d 素材=%@",
-            tagName,
-            NSStringFromClass(bg.superview.class),
-            bg.frame.size.width, bg.frame.size.height,
-            cellView.bounds.size.width, cellView.bounds.size.height,
-            (int)bg.preferVideo,
-            bg.preferVideo ? vidName : imgName);
 
     // 3) 可读性遮罩（背景上、文字下）
     UIView *dim = [cellView viewWithTag:dimTag];
@@ -995,11 +1031,15 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [cellView addSubview:dim];
     }
     [cellView insertSubview:dim aboveSubview:bg];
-    // 【v1.4.4】与 bg 同一套策略：动画期间冻结、稳定后无动画对齐（见上）
+    // 【v1.4.6】与 bg 完全同一套：设 bounds + center，绝不写 frame
     dim.autoresizingMask = UIViewAutoresizingNone;
     if (!cellAnimating) {
         [UIView performWithoutAnimation:^{
-            dim.frame = cellView.bounds;
+            CGRect db = dim.bounds;
+            db.size = cellView.bounds.size;
+            dim.bounds = db;
+            dim.center = CGPointMake(CGRectGetMidX(cellView.bounds),
+                                     CGRectGetMidY(cellView.bounds));
         }];
     }
     [dim setNeedsLayout];
@@ -1228,14 +1268,22 @@ static void LNBApplyButtonBackground(UIView *view) {
 
     // 铺图：插到最底层（index 0），系统自己的 label / imageView 天然浮在上面。
     // 【v1.3.9】不再假设它是 UIButton —— 用 view 本身即可（放宽后可能是任意视图）。
+    // 【v1.4.6】同卡片修复：设 bounds + center，不写 frame。
+    //   （view.bounds.origin 在按钮上通常是 (0,0)，但按钮内部若有更大的
+    //     坐标系，frame=bounds 同样会错位，统一用 bounds+center 更稳。）
     UIImageView *iv = [[UIImageView alloc] initWithFrame:view.bounds];
     iv.tag = tag;
     iv.contentMode = UIViewContentModeScaleAspectFill;
     iv.clipsToBounds = YES;
     iv.userInteractionEnabled = NO;
-    // 【v1.4.0】同卡片：不用 autoresizing，每次进来强制对齐尺寸
     iv.autoresizingMask = UIViewAutoresizingNone;
-    iv.frame = view.bounds;
+    {
+        CGRect ib = iv.bounds;
+        ib.size = view.bounds.size;
+        iv.bounds = ib;
+        iv.center = CGPointMake(CGRectGetMidX(view.bounds),
+                                CGRectGetMidY(view.bounds));
+    }
     iv.alpha = prefs.suppAlpha;
 
     UIImage *img = [UIImage imageWithContentsOfFile:LNBPathForResource(imgName)];
