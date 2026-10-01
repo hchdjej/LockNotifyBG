@@ -519,19 +519,19 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 - (void)layoutSubviews {
     [super layoutSubviews];
 
-    // 【v1.4.3】内部图层必须跟容器同尺寸。
-    // 原来 imageView / dimView 靠 autoresizingMask 自适应，但容器尺寸是我们在
-    // 外部每次"强制 frame = cell.bounds"改的，autoresizing 只在 superview
-    // 尺寸变化时按比例调整，和 cell 的 transform 动画节奏对不齐 ——
-    // 中间帧就会出现图比容器小一圈、露出容器底色的情况。
-    // 改为每次布局都硬对齐，和外部对齐时机一致。
-    if (!CGRectEqualToRect(_imageView.frame, self.bounds)) {
-        _imageView.frame = self.bounds;
+    // 【v1.4.4】内部图层与容器对齐 —— 但容器自身在被 CA 动画（尺寸渐变）
+    // 时不要硬对齐，否则中间帧尺寸会把图案压扁（与外部 bg.frame 冻结策略
+    // 配套）。动画期间内部图层保持不动，交给 clipsToBounds 裁剪。
+    BOOL animating = (self.layer.animationKeys.count > 0);
+    if (!animating) {
+        if (!CGRectEqualToRect(_imageView.frame, self.bounds)) {
+            _imageView.frame = self.bounds;
+        }
+        if (!CGRectEqualToRect(_dimView.frame, self.bounds)) {
+            _dimView.frame = self.bounds;
+        }
     }
-    if (!CGRectEqualToRect(_dimView.frame, self.bounds)) {
-        _dimView.frame = self.bounds;
-    }
-    // 保持播放层始终与容器同尺寸
+    // 播放层始终与容器同尺寸（视频层不参与图案定位，直接跟 bounds 走）
     if (self.playerLayer) {
         self.playerLayer.frame = self.bounds;
     }
@@ -943,35 +943,34 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [bg removeFromSuperview];
         [cellView insertSubview:bg atIndex:0];
     }
-    // 【v1.4.0 修「滑动时背景不跟随」】
-    // 根因：NCNotificationListCell 在首次 layout 时 bounds 是 {401,160}（未收敛），
-    // 之后才变成真实卡片几何 {308,123}。旧代码只在挂载那一刻设一次 frame，
-    // 后续不再同步；而 cell 滑动用的是 transform 动画，autoresizingMask 也不会
-    // 在 transform 变化时生效 —— 于是背景尺寸/位置与卡片脱节，滑动时就露馅。
+    // 【v1.4.0 修「滑动时背景不跟随」→ v1.4.4 推翻重写】
     //
-    // 修法：① 每次进来都强制对齐 frame 到当前 bounds（本函数在每次
-    //          layoutSubviews / 扫描时都会被调，天然形成同步）；
-    //       ② 把 autoresizingMask 设为 None，避免自动布局与手动 frame 打架；
-    //       ③ 背景直接作为 cell 的直接子视图且 index:0，随 cell 一同做 transform。
+    // 【1.4.0~1.4.3 的思路为什么是错的】
+    //   1.4.0：「每次 layout 都把 bg.frame 强制写成 cellView.bounds」；
+    //   1.4.3：再加 clipsToBounds + bg 内部图层每帧硬对齐。
+    //   在 cell 尺寸【稳定】时这没问题；但用户视频（RPReplay）逐帧实证：
+    //   折叠/展开动画中系统每帧都在改 cell.bounds，于是每帧都把【中间帧
+    //   尺寸】写进了 bg —— 背景图案被反复拉伸压扁（f022 帧小人被水平
+    //   压缩、出现压缩竖线），动画结束又跳回 —— 用户看到的正是
+    //   「素材不跟着滑动定位」。
+    //
+    // 【v1.4.4 正确做法：动画期间冻结，稳定后对齐】
+    //   cell.layer.animationKeys 非空 = 正在跑 CA 动画（折叠/展开/位移）。
+    //   此时【不要碰 bg.frame】：bg 是 cell 的子视图，cell 平移它自然跟着
+    //   平移（图案相对卡片纹丝不动），尺寸变化的中间帧交给 clipsToBounds
+    //   裁剪，图案绝不会被压缩。
+    //   动画结束（animationKeys 为空）后再一次性对齐最终 bounds。
     bg.autoresizingMask = UIViewAutoresizingNone;
-    bg.frame = cellView.bounds;
-    // 【v1.4.3 关键修复 —— 用户报「滑动通知时背景素材不跟着变换位置」】
-    //
-    // 病灶：背景在 *动画中途* 从卡片里滑出来，露出下面另一张卡片的图，
-    // 视觉上就变成了"背景粘在原地不跟着走"。
-    //
-    // 为什么 frame 每次都强制对齐了还是会脱节：
-    //   iOS 16 通知卡片的滑入/滑出用的是 transform 动画。transform 不改变
-    //   superview.bounds、不触发布局，但 **子视图会跟着一起被 transform 渲染**。
-    //   问题出在 cell 自身被 transform 的同时，系统对 cell.bounds 的收尾调整
-    //   （401x160 → 308x123）与动画不同帧 —— 中间帧上 cell 的有效可视区
-    //   比 cell.bounds 小，而我们的背景按旧 bounds 铺、又没有任何裁剪，
-    //   于是溢出到卡片轮廓之外，看起来就是背景跑到了别的卡片位置上。
-    //
-    // 修法：给 cell 本体开 clipsToBounds。背景在 index:0、尺寸恒等于
-    // cell.bounds，一旦父层裁剪，它永远不可能露出卡片轮廓之外。
-    // 这一步必须放在最后 —— LNBSetCardMaterialsHidden 之后设置，
-    // 避免被系统在 layout 里重置。
+    BOOL cellAnimating = (cellView.layer.animationKeys.count > 0);
+    if (!cellAnimating) {
+        // 稳定态对齐禁止隐式动画：否则动画结束后 bg 从冻结尺寸过渡到
+        // 最终尺寸时又会自己播一段补间，图案"软着陆"反而多一次跳动。
+        [UIView performWithoutAnimation:^{
+            bg.frame = cellView.bounds;
+        }];
+    }
+    // 给 cell 本体开裁剪：动画中间帧上 bg 可能比 cell 大或小，
+    // 裁剪保证无论哪种情况都不会溢出卡片轮廓之外。
     cellView.clipsToBounds = YES;
     [bg setNeedsLayout];
     [bg layoutIfNeeded];
@@ -996,9 +995,13 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [cellView addSubview:dim];
     }
     [cellView insertSubview:dim aboveSubview:bg];
-    // 【v1.4.0】与 bg 同样处理：不用 autoresizing，每次进来强制对齐，避免滑动脱节
+    // 【v1.4.4】与 bg 同一套策略：动画期间冻结、稳定后无动画对齐（见上）
     dim.autoresizingMask = UIViewAutoresizingNone;
-    dim.frame = cellView.bounds;
+    if (!cellAnimating) {
+        [UIView performWithoutAnimation:^{
+            dim.frame = cellView.bounds;
+        }];
+    }
     [dim setNeedsLayout];
     [dim layoutIfNeeded];
 
@@ -1137,6 +1140,11 @@ static void LNBLogButtonCandidate(UIView *v, BOOL accepted) {
 static void LNBApplyButtonBackground(UIView *view) {
     if (!view) return;
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
+
+    // 【v1.4.4】动画期间（折叠/展开/位移）不动按钮背景：
+    // 本函数每次进入都会"删旧图、铺新图"，动画中每帧进来都会按【中间帧
+    // 尺寸】重建图片视图 —— 图案被反复压缩。动画中直接返回，保留现状。
+    if (view.layer.animationKeys.count > 0) return;
 
     BOOL wantOn = prefs.enabled && prefs.suppModuleEnabled;
 
