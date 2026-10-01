@@ -357,7 +357,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 
         // ---- 1. 通知卡片背景（主功能）----
         [specs addObject:LNBGroup(@"通知卡片背景",
-                                  @"给锁屏上的每一条通知单独加背景。图片按「填充满整块卡片并裁剪」显示，卡片圆角自动跟随系统。")];
+                                  @"给锁屏上的每一条通知单独加背景。图片会盖在卡片的白色毛玻璃底之上，完全覆盖整个模块；文字仍显示在图片上方。")];
         [specs addObject:LNBSwitch(self, @"卡片背景开关", @"cardEnabled")];
         [specs addObject:LNBButton(self, @"选择卡片图片", @selector(lnbPickCardImage:), @"pickCardImage")];
         [specs addObject:LNBSlider(self, @"卡片背景不透明度", @"cardAlpha", 0.2, 1.0)];

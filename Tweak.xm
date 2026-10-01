@@ -389,21 +389,55 @@ static void LNBEnsureGlobalBackground(UIView *candidateHost) {
 static const NSInteger kCardBGViewTag = 0x1F0B7;
 static const NSInteger kCardDimViewTag = 0x1F0B8;
 
+// 在 cell 子树里找「卡片背景载体」——系统画白色毛玻璃底的那个视图。
+//
+// 【踩坑】iOS 16 锁屏通知卡片的白色底**不是** cell 自己的 backgroundColor，
+// 而是内部的毛玻璃/材质视图（UIVisualEffectView 一族，或类名含
+// Material / Blur / Effect 的私有材质视图）。把背景图插到 cell 的
+// atIndex:0 最底层，会被这层白色完全盖住 —— 用户看到的就是
+// 「一圈白框、图片没反应」。
+// 解法：把自定义图片**盖在材质视图之上、文字之下**，毛玻璃自然被完全覆盖；
+// 关闭时把图摘掉即可原样恢复，不破坏任何系统视图。
+static UIView *LNBFindCardBackingView(UIView *root) {
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:root];
+    while (queue.count > 0) {
+        UIView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        if (v != root) {
+            NSString *cls = NSStringFromClass(v.class);
+            if ([v isKindOfClass:[UIVisualEffectView class]] ||
+                [cls containsString:@"Material"] ||
+                [cls containsString:@"Blur"] ||
+                [cls containsString:@"Effect"]) {
+                return v;
+            }
+        }
+        for (UIView *sub in v.subviews) [queue addObject:sub];
+    }
+    return nil;
+}
+
 // 给「每一条通知」的宿主视图铺一张背景图。
 //
 // 【设计说明】
 // 这里是本插件的主功能：锁屏上每一条通知各自带背景，而不是整个通知列表铺底。
 //
-// 早期版本用 [UIColor colorWithPatternImage:] 设置 backgroundColor，想靠
-// 「UIColor 是值对象、系统重建层级不丢」来抗刷新。实际有两个硬伤：
-//   1. pattern image 是 **原尺寸平铺**，不是 ScaleAspectFill，图片会被切碎成网格，
-//      所以看起来像「图案重复、位置不对」；
-//   2. 只有当 cell 自身 backgroundColor 未被系统覆盖时才可见，而锁屏通知卡片
-//      通常由内部 content view / 毛玻璃层提供底色，pattern color 被盖住 → 没效果。
-// 因此改回真实子视图 + UIImageView(ScaleAspectFill)，这是唯一能保证
-// 「填充满整块区域并裁剪」的方案。
+// 版本沿革：
+//   1.1.x 用 [UIColor colorWithPatternImage:] 设 backgroundColor —— pattern 是
+//      原尺寸平铺不是填充裁剪，且被系统毛玻璃盖住，双双失败；
+//   1.2.0 改插 UIImageView 到 cell atIndex:0 最底层 —— 图还在毛玻璃下面，
+//      用户看到「一圈白框、图片没反应」；
+//   1.2.1 起定位系统材质视图，把图**盖到它上面**：毛玻璃被完全覆盖，
+//      文字仍在图上，关闭时摘图即恢复原状。
 static void LNBApplyCardBackground(UIView *cellView) {
     if (!cellView) return;
+
+    // 【防双份】NCNotificationListCell 和它内部的 NCNotificationShortLookView
+    // 都挂了 hook。若祖先链上已经挂了背景图，说明更外层的入口已处理过，
+    // 这里直接跳过，避免同一条通知叠两张图。
+    for (UIView *p = cellView.superview; p; p = p.superview) {
+        if ([p viewWithTag:kCardBGViewTag]) return;
+    }
 
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
     UIView *existing = [cellView viewWithTag:kCardBGViewTag];
@@ -434,35 +468,45 @@ static void LNBApplyCardBackground(UIView *cellView) {
     cellView.layer.cornerRadius = cellView.layer.cornerRadius > 0 ? cellView.layer.cornerRadius : 18.0;
     cellView.layer.masksToBounds = YES;
 
-    // ---- 背景图容器（最底层）----
+    // ---- 定位白色底的来源，把图盖到它上面 ----
+    UIView *backing = LNBFindCardBackingView(cellView);
+    UIView *container = backing.superview ?: cellView;
+
     UIImageView *bg = (UIImageView *)[cellView viewWithTag:kCardBGViewTag];
     if (!bg) {
-        bg = [[UIImageView alloc] initWithFrame:cellView.bounds];
+        bg = [[UIImageView alloc] initWithFrame:container.bounds];
         bg.tag = kCardBGViewTag;
         bg.userInteractionEnabled = NO;          // 绝不拦截通知的点击/滑动
         bg.contentMode = UIViewContentModeScaleAspectFill;  // 填充满 + 裁剪
         bg.clipsToBounds = YES;
-        bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [cellView insertSubview:bg atIndex:0];
-    } else if (bg.superview != cellView) {
-        [cellView insertSubview:bg atIndex:0];
     }
-    bg.frame = cellView.bounds;
+    if (bg.superview != container) {
+        [bg removeFromSuperview];
+        [container addSubview:bg];
+    }
+    if (backing) {
+        // 保证图在材质视图之上（盖住白底）、文字之下
+        [container insertSubview:bg aboveSubview:backing];
+    }
+    bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    bg.frame = container.bounds;
     bg.image = cardImage;
     bg.alpha = 1.0;
 
     // ---- 可读性遮罩（压在图上、文字下）----
     UIView *dim = [cellView viewWithTag:kCardDimViewTag];
     if (!dim) {
-        dim = [[UIView alloc] initWithFrame:cellView.bounds];
+        dim = [[UIView alloc] initWithFrame:container.bounds];
         dim.tag = kCardDimViewTag;
         dim.userInteractionEnabled = NO;
-        dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [cellView insertSubview:dim aboveSubview:bg];
-    } else if (dim.superview != cellView) {
-        [cellView insertSubview:dim aboveSubview:bg];
     }
-    dim.frame = cellView.bounds;
+    if (dim.superview != container) {
+        [dim removeFromSuperview];
+        [container addSubview:dim];
+    }
+    [container insertSubview:dim aboveSubview:bg];
+    dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    dim.frame = container.bounds;
 
     if (prefs.cardBlurOverlay) {
         // cardAlpha 越小 → 遮罩越重。0.9 → 10% 黑；0.2 → 80% 黑
