@@ -676,34 +676,58 @@ static void LNBSetCardMaterialsHidden(UIView *root, BOOL hidden) {
 //          图溢出到模块外面，卡片内只剩透出来的模糊色块；
 //   1.2.3 隐藏毛玻璃白底 + 图挂 cell 本体最底层、按 cell.bounds 铺：
 //          图的边界 = 模块的边界，清晰、精确、绝不外溢。
-static void LNBApplyCardBackground(UIView *cellView) {
+//
+// 【v1.3.4 泛化】本函数不再写死「通知卡片」，而是接受任意宿主视图。
+// 因为锁屏上除了通知卡片，「选项 / 全部清除」那一排按钮同样是一个独立的
+// 毛玻璃模块（NCNotificationListSupplementaryHostingView），用户希望它也
+// 铺上同一套素材、视觉完全一致。两者结构同源（都是 PLPlatterView + 材质底板），
+// 所以走完全相同的注入逻辑，只是日志标签不同。
+static void LNBApplyModuleBackground(UIView *cellView, NSString *label) {
     if (!cellView) return;
 
     // 【诊断】每次调用都记一条精简日志；视图树只在每个 cell 第一次时完整 dump
-    LNBTLog(@"[卡片] 入口 root=%@ enabled=%d cardEnabled=%d",
-            NSStringFromClass(cellView.class),
+    LNBTLog(@"[%@] 入口 root=%@ enabled=%d cardEnabled=%d",
+            label, NSStringFromClass(cellView.class),
             (int)[LNBPrefs sharedInstance].enabled,
             (int)[LNBPrefs sharedInstance].cardEnabled);
 
-    // 【防双份 v1.3.3 修复】扫描入口与 hook 入口可能同时触发，需要防重复挂载。
+    // 【防双份 v1.3.4 修正】扫描入口与 hook 入口可能同时触发，需要防重复挂载。
     //
-    // 【重大 bug】旧写法 [p viewWithTag:] 是递归搜索整棵子树！第一张卡片挂上
-    // 背景后，第二张卡片做检查时，通过共同祖先的子树能"看到"兄弟卡片的背景
-    // —— 于是第二张及以后的所有通知全部被误跳过，永远挂不上背景。
-    // 这就是"只有一张卡有背景 / 其余全是灰底"的直接原因。
-    // 修复：只检查祖先的【直接子视图】，语义精确为"这条通知的宿主链上已挂"。
-    for (UIView *p = cellView.superview; p; p = p.superview) {
-        for (UIView *sub in p.subviews) {
-            if (sub.tag == kCardBGViewTag) {
-                LNBTLog(@"[卡片] 防双份跳过 root=%@ 祖先=%@ 直接子视图中已有背景",
-                        NSStringFromClass(cellView.class), NSStringFromClass(p.class));
-                return;
+    // 演进史（每一条都是真机上踩出来的）：
+    //   v1.3.2 旧写法 [p viewWithTag:] 会**递归搜索整棵子树**。第一张卡片挂上
+    //          背景后，其余卡片通过共同祖先能"看到"兄弟卡片的背景，全部被误
+    //          跳过 —— 表现为「只有一张卡有背景，其余全是灰底」。
+    //   v1.3.3 改成遍历祖先的【直接子视图】。修好了兄弟卡片互相误伤，
+    //          但引入了新问题：附属按钮模块是 Cell 的子视图，而 Cell 的背景
+    //          也是 Cell 的直接子视图 —— 于是附属模块永远被误判为"已挂载"。
+    //   v1.3.4 最终语义：**只判断自己是不是已经有背景了**。
+    //          同一段逻辑既被扫描调用、又被 hook 调用，天然会重复进入；
+    //          与其猜"祖先挂没挂"，不如直接问"我挂没挂"——最精确，
+    //          也不会跨视图误伤。真正的重复挂载由下面 existing viewWithTag 兜住。
+    for (UIView *sub in cellView.subviews) {
+        if (sub.tag == kCardBGViewTag) {
+            // 已经有背景了，同步一下配置即可（透明度/素材可能变了），不重复插入
+            LNBPrefs *p0 = [LNBPrefs sharedInstance];
+            if (p0.enabled && p0.cardEnabled) {
+                [(LNBGlobalBackgroundView *)sub applyConfig:p0];
+                for (UIView *d in cellView.subviews) {
+                    if (d.tag == kCardDimViewTag) {
+                        d.hidden = !p0.cardBlurOverlay;
+                        d.backgroundColor = p0.cardBlurOverlay
+                            ? [UIColor colorWithWhite:0.0 alpha:(1.0 - p0.cardAlpha)]
+                            : [UIColor clearColor];
+                    }
+                }
+                if (p0.diagMode) LNBDiagMarkCard(cellView);
             }
+            LNBTLog(@"[%@] 已有背景，跳过重复挂载 root=%@",
+                    label, NSStringFromClass(cellView.class));
+            return;
         }
     }
 
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
-    LNBLogCardTreeOnce(cellView, @"首次处理");
+    LNBLogCardTreeOnce(cellView, label);
 
     // 【设备日志实证】必须等卡片完成布局再挂。
     // ShortLookView 在 layout 早期是 {0,0}，把背景挂上去 = 挂在零面积视图上，
@@ -728,7 +752,7 @@ static void LNBApplyCardBackground(UIView *cellView) {
         }
         LNBSetCardMaterialsHidden(cellView, NO);
         LNBDiagClearView(cellView);
-        LNBTLog(@"[卡片] 开关关闭，已还原");
+        LNBTLog(@"[%@] 开关关闭，已还原", label);
         return;
     }
 
@@ -746,7 +770,7 @@ static void LNBApplyCardBackground(UIView *cellView) {
         // 看起来像"卡片被标红了但没背景"，误导排查方向。
         LNBDiagClearTree(cellView);
         // 【v1.3.3】打印每个素材的存在性，一眼看出缺什么
-        LNBTLog(@"[卡片] 无任何可用素材！card.jpg=%d card.mp4=%d global.jpg=%d global.mp4=%d ——— 请到设置里用「选择卡片图片」选图",
+        LNBTLog(@"[%@] 无任何可用素材！card.jpg=%d card.mp4=%d global.jpg=%d global.mp4=%d ——— 请到设置里用「选择卡片图片」选图", label,
                 (int)hasCardImage, (int)hasCardVideo,
                 (int)LNBFileExists(LNBPathForResource(kBGGlobalImage)),
                 (int)LNBFileExists(LNBPathForResource(kBGGlobalVideo)));
@@ -784,8 +808,8 @@ static void LNBApplyCardBackground(UIView *cellView) {
     bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     bg.frame = cellView.bounds;
     [bg applyConfig:prefs];
-    LNBTLog(@"[卡片] 背景已挂载 superview=%@ 尺寸=%0.0fx%0.0f 视频=%d 素材=%@",
-            NSStringFromClass(bg.superview.class),
+    LNBTLog(@"[%@] 背景已挂载 superview=%@ 尺寸=%0.0fx%0.0f 视频=%d 素材=%@",
+            label, NSStringFromClass(bg.superview.class),
             bg.frame.size.width, bg.frame.size.height,
             (int)bg.preferVideo,
             bg.preferVideo ? kBGCardVideo : kBGCardImage);
@@ -817,19 +841,25 @@ static void LNBApplyCardBackground(UIView *cellView) {
     // 4) 诊断模式：给卡片与关键子视图上彩色边框，方便肉眼确认层级
     if (prefs.diagMode) {
         LNBDiagMarkCard(cellView);
-        LNBTLog(@"[诊断] 已标记卡片 org=%@", NSStringFromCGRect(cellView.frame));
+        LNBTLog(@"[诊断] 已标记 %@ org=%@", label, NSStringFromCGRect(cellView.frame));
     }
 }
 
-// 【v1.3.1 核心修复】在通知列表子树里扫描每一条通知并应用卡片背景。
+// 【v1.3.1 核心修复】在通知列表子树里扫描每一个「毛玻璃模块」并铺背景。
 //
-// 【为什么只认 NCNotificationListCell】v1.3.0 用「类名含 LookView」扫描，
-// 结果命中的 NCNotificationShortLookView 在 layout 早期尺寸是 {0,0}
-//（设备日志实证：26 次视图树 dump 里尺寸全是 0x0），背景挂上去 = 零面积，
-// 用户永远看不到；而 NCNotificationListCell 的 frame 是
-// {{46.1, 18.4}, {308.8, 123.2}} —— 正好是屏幕上那张卡片的实际位置和大小。
-// 所以：只认 NCNotificationListCell（有真实几何的卡片容器），
-// ShortLookView 交给它内部防双份逻辑忽略。
+// 【为什么不用「类名含 LookView」】v1.3.0 那样扫描，命中的
+// NCNotificationShortLookView 在 layout 早期尺寸是 {0,0}（设备日志实证：26 次
+// 视图树 dump 里尺寸全是 0x0），背景挂上去 = 零面积，用户永远看不到；
+// 而 NCNotificationListCell 的 frame 是 {{46.1, 18.4}, {308.8, 123.2}}，
+// 正好是屏幕上那张卡片的实际位置和大小。
+//
+// 【v1.3.4 扩展】除通知卡片外，再加一个目标：
+//   NCNotificationListSupplementaryHostingView
+// 这是「选项 / 全部清除」那一排按钮的宿主（设备日志第 174 行实证：它包着
+// PLPlatterView + PLPlatterCustomContentView，结构和通知卡片同源），
+// 用户要求它和通知卡片视觉一致。两类走同一个注入函数。
+static const void *kLNBModuleLabel = &kLNBModuleLabel;   // 关联对象：模块用途标签
+
 static void LNBScanAndApplyCards(UIView *root) {
     // 【诊断关闭时的全树清扫】diagMode 一关，必须把上一轮画上去的彩框全部擦掉。
     // 放在扫描入口做，因为这里每次列表 layout 都会走到，覆盖最全。
@@ -845,8 +875,14 @@ static void LNBScanAndApplyCards(UIView *root) {
         if (v != root) {
             NSString *cls = NSStringFromClass(v.class);
             if ([cls isEqualToString:@"NCNotificationListCell"]) {
-                LNBApplyCardBackground(v);
+                LNBApplyModuleBackground(v, @"卡片");
                 continue;   // 卡片内部不再展开，避免命中 0x0 的 ShortLookView
+            }
+            if ([cls isEqualToString:@"NCNotificationListSupplementaryHostingView"]) {
+                // 「选项 / 全部清除」按钮模块。它内部也是 PLPlatterView + 材质底板，
+                // 走同一套注入；同样不展开，避免误伤内部按钮子视图。
+                LNBApplyModuleBackground(v, @"附属按钮");
+                continue;
             }
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
@@ -886,7 +922,9 @@ static void LNBReloadConfiguration(void) {
 
             NSString *cls = NSStringFromClass(view.class);
             if ([cls isEqualToString:@"NCNotificationListCell"]) {
-                LNBApplyCardBackground(view);
+                LNBApplyModuleBackground(view, @"卡片");
+            } else if ([cls isEqualToString:@"NCNotificationListSupplementaryHostingView"]) {
+                LNBApplyModuleBackground(view, @"附属按钮");
             }
 
             for (UIView *sub in view.subviews) {
@@ -926,7 +964,21 @@ static void LNBReloadConfiguration(void) {
 
 - (void)layoutSubviews {
     %orig;
-    LNBApplyCardBackground((UIView *)self);
+    LNBApplyModuleBackground((UIView *)self, @"卡片");
+}
+
+%end
+
+// 【v1.3.4 新增】「选项 / 全部清除」按钮模块。
+// 设备日志实证它是独立的一层视图（包着 PLPlatterView + 按钮内容），
+// 嵌在 NCNotificationListCell 内部；因为扫描到 Cell 就 continue 了，
+// 它从来没被处理过。这里直接 hook 它自己的 layoutSubviews，
+// 让它和通知卡片一样铺素材。
+%hook NCNotificationListSupplementaryHostingView
+
+- (void)layoutSubviews {
+    %orig;
+    LNBApplyModuleBackground((UIView *)self, @"附属按钮");
 }
 
 %end
