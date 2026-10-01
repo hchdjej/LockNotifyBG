@@ -152,11 +152,16 @@ static void LNBLogCardTreeOnce(UIView *cellView, NSString *reason) {
 // 「主卡片和选项糊成一块」这类问题需要在【展开动作发生时】看层级，
 // 而 LNBLogCardTreeOnce 每个 cell 只 dump 第一次（挂背景时），
 // 那时按钮还没出现。这里提供一个不限次数、可指定触发原因的 dump，
-// 由 LNBApplyCardBackground / LNBApplyButtonBackground 的关键分支调用。
+// 由 LNBDumpCellHierarchyIfNeeded / LNBApplyButtonBackground 调用。
+//
+// 【范围】会把 root 及其整棵子树打印出来（每层含 frame/bounds/center/
+// transform/z序/hidden/alpha/clip/tag/bg）。调用方负责把 root 选在
+// 合适的层级，避免打印整屏。
 static void LNBLogTreeNow(UIView *root, NSString *reason) {
     if (!root) return;
     NSMutableString *out = [NSMutableString stringWithFormat:
-        @"--- 视图树快照 (%@) 根=%@ ---\n", reason, NSStringFromClass(root.class)];
+        @"\n===== 视图树快照 (%@) 根=%@ =====\n",
+        reason, NSStringFromClass(root.class)];
     LNBLogViewTree(root, 0, out);
     LNBTLog(@"%@", out);
 }
@@ -1526,15 +1531,13 @@ static void LNBApplyButtonBackground(UIView *view) {
                 break;
             }
         }
-        NSMutableString *out = [NSMutableString stringWithFormat:
-            @"\n===== 按钮铺图后 层级快照 (%@) 按钮=%@ 祖先根=%@ =====\n",
-            label.length ? label : @"(无文字)", NSStringFromClass(view.class),
-            NSStringFromClass(root.class)];
-        [out appendFormat:@"按钮自身: frame=%@ bounds=%@ center=(%.1f,%.1f)\n",
-            NSStringFromCGRect(view.frame), NSStringFromCGRect(view.bounds),
-            view.center.x, view.center.y];
-        LNBLogViewTree(root, 0, out);
-        LNBTLog(@"%@", out);
+        // 按钮自身的几何单独先打一行，方便和树里的记录对照
+        LNBTLog(@"[按钮定位] %@ frame=%@ bounds=%@ center=(%.1f,%.1f)",
+                NSStringFromClass(view.class),
+                NSStringFromCGRect(view.frame), NSStringFromCGRect(view.bounds),
+                view.center.x, view.center.y);
+        LNBLogTreeNow(root, ([NSString stringWithFormat:@"按钮铺图后 \"%@\"",
+                              label.length ? label : @"(无文字)"]));
     }
 }
 
@@ -1715,11 +1718,15 @@ static void LNBDumpCellHierarchyIfNeeded(UIView *cell) {
             break;
         }
     }
+
+    // 先用 LNBLogTreeNow 打完整层级（含每层 frame/bounds/center/transform/z序）
+    LNBLogTreeNow(root, ([NSString stringWithFormat:@"%@ cell=%@",
+                          state, NSStringFromClass(cell.class)]));
+
+    // 再补一段「我方视图定位」小结：把我们挂的三个东西的几何单独列出来，
+    // 直击「谁盖谁 / 谁跑偏了」这个问题，不用在长树里翻找。
     NSMutableString *out = [NSMutableString stringWithFormat:
-        @"\n===== 层级快照 (%@) cell=%@ root=%@ =====\n",
-        state, NSStringFromClass(cell.class), NSStringFromClass(root.class)];
-    // 额外标注"我们挂的背景"和"按钮图"各自的绝对位置，直击问题
-    [out appendString:@"[我方视图定位]\n"];
+        @"[我方视图定位] cell=%@\n", NSStringFromClass(cell.class)];
     UIView *myBG = [cell viewWithTag:kCardBGViewTag];
     if (myBG) {
         [out appendFormat:@"  卡片背景 tag=0x%lX frame=%@ bounds=%@ center=(%.1f,%.1f) tf=%d z=%ld\n",
@@ -1736,6 +1743,8 @@ static void LNBDumpCellHierarchyIfNeeded(UIView *cell) {
             (long)kCardDimViewTag, NSStringFromCGRect(myDim.frame),
             (long)[cell.subviews indexOfObject:myDim]];
     }
+    // 按钮图可能挂在 cell 直系，也可能挂在按钮自己身上（多数情况）。
+    // 这里两种情况都扫一遍，便于确认它到底在哪一层。
     for (UIView *b1 in cell.subviews) {
         if (b1.tag == kSuppBtn1Tag || b1.tag == kSuppBtn2Tag) {
             [out appendFormat:@"  按钮图 tag=0x%lX 挂在【cell 直系】frame=%@ z=%ld\n",
@@ -1743,8 +1752,20 @@ static void LNBDumpCellHierarchyIfNeeded(UIView *cell) {
                 (long)[cell.subviews indexOfObject:b1]];
         }
     }
-    [out appendString:@"[完整层级]\n"];
-    LNBLogViewTree(root, 0, out);
+    {
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
+        while (stack.count > 0) {
+            UIView *v = stack.lastObject; [stack removeLastObject];
+            for (UIView *sub in v.subviews) {
+                if (sub.tag == kSuppBtn1Tag || sub.tag == kSuppBtn2Tag) {
+                    [out appendFormat:@"  按钮图 tag=0x%lX 挂在【%@】frame=%@\n",
+                        (long)sub.tag, NSStringFromClass(v.class),
+                        NSStringFromCGRect(sub.frame)];
+                }
+                [stack addObject:sub];
+            }
+        }
+    }
     LNBTLog(@"%@", out);
 }
 
