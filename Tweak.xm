@@ -519,17 +519,17 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 - (void)layoutSubviews {
     [super layoutSubviews];
 
-    // 【v1.4.4】内部图层与容器对齐 —— 但容器自身在被 CA 动画（尺寸渐变）
-    // 时不要硬对齐，否则中间帧尺寸会把图案压扁（与外部 bg.frame 冻结策略
-    // 配套）。动画期间内部图层保持不动，交给 clipsToBounds 裁剪。
-    BOOL animating = (self.layer.animationKeys.count > 0);
-    if (!animating) {
-        if (!CGRectEqualToRect(_imageView.frame, self.bounds)) {
-            _imageView.frame = self.bounds;
-        }
-        if (!CGRectEqualToRect(_dimView.frame, self.bounds)) {
-            _dimView.frame = self.bounds;
-        }
+    // 【v1.4.7】内部图层与容器严格同尺寸。
+    // 之前用 animationKeys 判断"动画中就不对齐"，但日志证明 iOS 的
+    // UIView block 动画根本不产生 CA animationKeys（442/442 条
+    // animating=0），那个判断从未生效，纯属自欺欺人，这里删掉。
+    // 注意：self.bounds.origin 恒为 (0,0)，所以 frame = bounds 在这里
+    // 是安全的（这正是它与 cell 那种「bounds.origin 会偏移」的区别）。
+    if (!CGRectEqualToRect(_imageView.frame, self.bounds)) {
+        _imageView.frame = self.bounds;
+    }
+    if (!CGRectEqualToRect(_dimView.frame, self.bounds)) {
+        _dimView.frame = self.bounds;
     }
     // 播放层始终与容器同尺寸（视频层不参与图案定位，直接跟 bounds 走）
     if (self.playerLayer) {
@@ -879,9 +879,9 @@ static void LNBApplyCardBackground(UIView *cellView) {
     LNBLogCardTreeOnce(cellView, tagName);
 
     // 【设备日志实证】必须等卡片完成布局再挂。
-    // 布局早期 cell 的 bounds 是 {401,160}（未收敛），挂上去尺寸不对、后面还会脱节。
-    // 零尺寸时直接返回，等下一次 layoutSubviews（此时已有真实卡片几何）。
-    if (cellView.bounds.size.width < 1.0 || cellView.bounds.size.height < 1.0) {
+    // 【v1.4.7】零尺寸检查同时看 frame 和 bounds —— 只看 bounds 会漏掉
+    // 「bounds 有值但 frame 还是 0」的早期态，挂上去就是错的。
+    if (cellView.frame.size.width < 1.0 || cellView.frame.size.height < 1.0) {
         LNBDiagClearView(cellView);
         return;
     }
@@ -954,65 +954,64 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [cellView insertSubview:bg atIndex:0];
     }
 
-    // 【v1.4.6 ★ 真凶终于找到了：frame 与 bounds 混用】
+    // 【v1.4.7 ★★ 真正的原因：cell.bounds 在动画中【恒定不变】】
     //
-    // 视图树 dump 给出了铁证（13:56:35 那条）：
-    //   NCNotificationListCell frame={{46.1, 18.4}, {308.8, 123.2}}
-    //     UIView frame={{0, 0}, {401, 160}}          ← cell 内部更大的一层
+    // 用户第二次抓日志（186074 行），我加了 bgFrame/cellFrame/cellBounds
+    // 三组对照，终于拿到决定性数据：
     //
-    //   * cell.frame  = 308.8 x 123.2 → 卡片在屏幕上的真实几何
-    //   * cell.bounds = 309 x 66       → 是【内部坐标系】里的可视尺寸
-    //     日志里 5691 次 cellBounds=309x66 全部来自 bounds，而真实卡片
-    //     是 308x123 —— 两者根本不是一回事。
+    //   稳定态： cellFrame={{46.04, 0},  {308.93, 66}}  cellBounds={{0,0},{308.93, 66}}
+    //   动画中： cellFrame={{55.30, 0},  {290.39, 74}}  cellBounds={{0,0},{308.93, 66}}  ← !
+    //   动画中： cellFrame={{64.57, 11.6},{271.86, 70.4}} cellBounds={{0,0},{308.93, 66}} ← !
     //
-    // 【为什么之前只会"固定在一个位置"】
-    //   旧代码写的是 `bg.frame = cellView.bounds;`
-    //     bg.frame  是【父视图坐标系】的矩形（origin 通常是 0,0）
-    //     cellView.bounds 是【cell 自身坐标系】的矩形（origin 可能是 (0,0)
-    //       但 size 是内部尺寸 66 高）
-    //   把 bounds 直接赋给 frame，等于把"内部坐标系的尺寸"当成了
-    //   "父坐标系的位置 + 尺寸"。当 bounds.origin 非零或内部尺寸与
-    //   frame 尺寸不一致时，背景就被钉死在错误位置，且因为每次都写入
-    //   同一个错误值，它永远不动 —— 正是用户说的
-    //   「一直固定一个位置，不跟着通知模块滑动变换」。
+    // 配对统计（442 条）：
+    //     frameH=66 w=308.77  |  boundH=66 w=308.77   ← 稳定态一致
+    //     frameH=74 w=290.24  |  boundH=80 w=308.77   ← 动画中不一致
+    //     frameH=70.4 w=271.72|  boundH=80 w=308.77   ← 动画中不一致
     //
-    // 【正确做法】
-    //   背景要覆盖 cell 的整个可视区域 → 设 bg.bounds = cellView.bounds
-    //   （继承 cell 的坐标系尺寸），同时把 bg.center 对齐到 cell 的
-    //   bounds 中心。这样无论 bounds.origin 偏移多少，背景都精确覆盖。
-    //   —— 绝不再把 cellView.bounds 赋给 bg.frame。
+    // 结论：**动画期间 cell.frame 在变（308→290→271 缩小、y 从 0→11.6 位移），
+    //       而 cell.bounds 始终是 308.77x66/80 一动不动。**
     //
-    // 【v1.4.4 的动画冻结策略继续保留】动画期间不写尺寸，避免中间帧
-    //   拉伸图案；动画结束后一次性对齐。
+    // 所以我 1.4.6 写的 `bg.bounds.size = cellView.bounds.size` 永远得到
+    // 同一个值 —— 背景就永远停在固定的 308.77 位置，而卡片在收缩、在移动。
+    // 这正是用户说的「背景不跟着模块走，一直固定一个位置」。
+    //
+    // 【修复】改为跟踪 cellView.frame（父坐标系，动画中会变）：
+    //   背景是 cell 的子视图，要让它在【视觉上】覆盖住卡片，
+    //   就要用 cell.frame 的尺寸（卡片真实可视几何），而不是 bounds。
+    //   同时把 center 对齐到 cell 可视区的中心（用 bounds 的 origin+size 算）。
+    //
+    // 【顺带】1.4.4 的 `layer.animationKeys` 判断被证明是无效的 ——
+    //   442/442 条日志 animating=0，iOS 用的是 UIView block 动画，
+    //   不产生 CA animationKeys。所以动画冻结策略彻底移除，
+    //   改为「每次进来都按最新 cell.frame 同步」，跟上动画的每一帧。
     bg.autoresizingMask = UIViewAutoresizingNone;
-    BOOL cellAnimating = (cellView.layer.animationKeys.count > 0);
-    if (!cellAnimating) {
-        [UIView performWithoutAnimation:^{
-            // ① bounds 跟 cell 的坐标系尺寸一致
-            CGRect b = bg.bounds;
-            b.size = cellView.bounds.size;
-            bg.bounds = b;
-            // ② 中心点对齐到 cell 可视区中心（cell 坐标系）
-            bg.center = CGPointMake(CGRectGetMidX(cellView.bounds),
-                                    CGRectGetMidY(cellView.bounds));
-        }];
-    }
+    [UIView performWithoutAnimation:^{
+        // ① 尺寸取 cell.frame.size —— 动画中它会跟着卡片真实收缩
+        CGSize target = cellView.frame.size;
+        if (target.width < 1.0 || target.height < 1.0) {
+            target = cellView.bounds.size;   // 兜底
+        }
+        CGRect b = bg.bounds;
+        b.size = target;
+        bg.bounds = b;
+        // ② 中心对齐到 cell 可视区中心（cell 自身坐标系）
+        bg.center = CGPointMake(CGRectGetMidX(cellView.bounds),
+                                CGRectGetMidY(cellView.bounds));
+    }];
 
     // 给 cell 本体开裁剪：动画中间帧上 bg 可能比 cell 大或小，
     // 裁剪保证无论哪种情况都不会溢出卡片轮廓之外。
     cellView.clipsToBounds = YES;
 
-    // 【v1.4.6】日志改为打印 frame/bounds 两组值，便于下次定位：
-    //   cellFrame  = 卡片在屏幕上的真实几何（308x123）
-    //   cellBounds = cell 内部坐标系尺寸（309x66）
-    //   两者不一致正是本版修复的核心。
-    LNBTLog(@"[%@] 背景已挂载 superview=%@ bgFrame=%@ cellFrame=%@ cellBounds=%@ animating=%d 素材=%@",
+    // 【v1.4.7】日志保留 frame/bounds 双值对照 —— 这是本轮破案的关键字段：
+    //   cellFrame  动画中会变（308→290→271），是背景该跟的目标
+    //   cellBounds 恒定不变，正是旧代码跟错了的对象
+    LNBTLog(@"[%@] 已同步 superview=%@ bgFrame=%@ cellFrame=%@ cellBounds=%@ 素材=%@",
             tagName,
             NSStringFromClass(bg.superview.class),
             NSStringFromCGRect(bg.frame),
             NSStringFromCGRect(cellView.frame),
             NSStringFromCGRect(cellView.bounds),
-            (int)cellAnimating,
             bg.preferVideo ? vidName : imgName);
 
     [bg setNeedsLayout];
@@ -1031,17 +1030,17 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [cellView addSubview:dim];
     }
     [cellView insertSubview:dim aboveSubview:bg];
-    // 【v1.4.6】与 bg 完全同一套：设 bounds + center，绝不写 frame
+    // 【v1.4.7】与 bg 完全同一套：尺寸取 cell.frame.size（动画中会变）
     dim.autoresizingMask = UIViewAutoresizingNone;
-    if (!cellAnimating) {
-        [UIView performWithoutAnimation:^{
-            CGRect db = dim.bounds;
-            db.size = cellView.bounds.size;
-            dim.bounds = db;
-            dim.center = CGPointMake(CGRectGetMidX(cellView.bounds),
-                                     CGRectGetMidY(cellView.bounds));
-        }];
-    }
+    [UIView performWithoutAnimation:^{
+        CGSize target = cellView.frame.size;
+        if (target.width < 1.0 || target.height < 1.0) target = cellView.bounds.size;
+        CGRect db = dim.bounds;
+        db.size = target;
+        dim.bounds = db;
+        dim.center = CGPointMake(CGRectGetMidX(cellView.bounds),
+                                 CGRectGetMidY(cellView.bounds));
+    }];
     [dim setNeedsLayout];
     [dim layoutIfNeeded];
 
@@ -1211,10 +1210,9 @@ static void LNBApplyButtonBackground(UIView *view) {
     if (!view) return;
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
 
-    // 【v1.4.4】动画期间（折叠/展开/位移）不动按钮背景：
-    // 本函数每次进入都会"删旧图、铺新图"，动画中每帧进来都会按【中间帧
-    // 尺寸】重建图片视图 —— 图案被反复压缩。动画中直接返回，保留现状。
-    if (view.layer.animationKeys.count > 0) return;
+    // 【v1.4.7】移除 animationKeys 判断（日志证明它恒为 0，从未生效）。
+    // 按钮跟随的关键在下面：每次进来都按 view.frame.size 重建图片，
+    // 这样动画中每帧都会同步到最新尺寸。
 
     BOOL wantOn = prefs.enabled && prefs.suppModuleEnabled;
 
@@ -1268,9 +1266,8 @@ static void LNBApplyButtonBackground(UIView *view) {
 
     // 铺图：插到最底层（index 0），系统自己的 label / imageView 天然浮在上面。
     // 【v1.3.9】不再假设它是 UIButton —— 用 view 本身即可（放宽后可能是任意视图）。
-    // 【v1.4.6】同卡片修复：设 bounds + center，不写 frame。
-    //   （view.bounds.origin 在按钮上通常是 (0,0)，但按钮内部若有更大的
-    //     坐标系，frame=bounds 同样会错位，统一用 bounds+center 更稳。）
+    // 【v1.4.7】与卡片同一套逻辑：尺寸取 view.frame.size（动画中会变），
+    //   center 对齐到 view.bounds 的中心。
     UIImageView *iv = [[UIImageView alloc] initWithFrame:view.bounds];
     iv.tag = tag;
     iv.contentMode = UIViewContentModeScaleAspectFill;
@@ -1278,8 +1275,10 @@ static void LNBApplyButtonBackground(UIView *view) {
     iv.userInteractionEnabled = NO;
     iv.autoresizingMask = UIViewAutoresizingNone;
     {
+        CGSize ts = view.frame.size;
+        if (ts.width < 1.0 || ts.height < 1.0) ts = view.bounds.size;
         CGRect ib = iv.bounds;
-        ib.size = view.bounds.size;
+        ib.size = ts;
         iv.bounds = ib;
         iv.center = CGPointMake(CGRectGetMidX(view.bounds),
                                 CGRectGetMidY(view.bounds));
