@@ -487,18 +487,29 @@ static void LNBEnsureGlobalBackground(UIView *candidateHost) {
 static const NSInteger kCardBGViewTag = 0x1F0B7;
 static const NSInteger kCardDimViewTag = 0x1F0B8;
 
-// 判断一个视图是不是「毛玻璃白底」类。
-// vibrancy（UIVibrancyEffect）是透明的文字强调效果容器，**不是**白底来源，
-// 藏了会把文字一起变透明 —— 必须排除。
+// 判断一个视图是不是「卡片白底」类。
+//
+// 【设备日志实证】iOS 16.5 通知卡片的层级是：
+//   NCNotificationListCell → UIView → PLPlatterView
+//     ├ MTMaterialView                          ← 毛玻璃白底（要藏）
+//     ├ NCNotificationListStackDimmingOverlayView ← 纯白 alpha=0.90 遮罩（要藏）
+//     └ PLPlatterCustomContentView → 文字/图标
+// 所以白底来源有两处：MTMaterialView 与 StackDimmingOverlayView。
+// vibrancy（UIVibrancyEffect）是透明文字效果容器，**不是**白底，藏了文字会消失。
 static BOOL LNBIsBlurMaterial(UIView *v) {
     if ([v isKindOfClass:[UIVisualEffectView class]]) {
         UIVisualEffectView *evv = (UIVisualEffectView *)v;
         return ![evv.effect isKindOfClass:[UIVibrancyEffect class]];
     }
-    NSString *cls = NSStringFromClass(v.class).lowercaseString;
-    return [cls containsString:@"blur"] ||
-           [cls containsString:@"backdrop"] ||
-           [cls containsString:@"material"];
+    NSString *cls = NSStringFromClass(v.class);
+    if ([cls containsString:@"UIVibrancyEffect"]) return NO;
+    // 通知列表的白色堆叠遮罩：日志实测 bg=(1,1,1,1) alpha=0.90，是白底来源之一
+    if ([cls containsString:@"StackDimmingOverlay"]) return YES;
+
+    NSString *low = cls.lowercaseString;
+    return [low containsString:@"blur"] ||
+           [low containsString:@"backdrop"] ||
+           [low containsString:@"material"];
 }
 
 // 关联对象 key：标记「这个材质视图是我们隐藏的」，恢复时只恢复自己藏的，
@@ -557,15 +568,21 @@ static void LNBApplyCardBackground(UIView *cellView) {
             (int)[LNBPrefs sharedInstance].enabled,
             (int)[LNBPrefs sharedInstance].cardEnabled);
 
-    // 【防双份】NCNotificationListCell 和它内部的 NCNotificationShortLookView
-    // 都挂了 hook。若祖先链上已经挂了背景图，说明更外层的入口已处理过，
-    // 这里直接跳过，避免同一条通知叠两张图。
+    // 【防双份】扫描入口与 hook 入口可能同时触发。若祖先链上已经挂了背景，
+    // 说明外层入口已处理过，这里跳过，避免同一条通知叠两份背景。
     for (UIView *p = cellView.superview; p; p = p.superview) {
         if ([p viewWithTag:kCardBGViewTag]) return;
     }
 
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
     LNBLogCardTreeOnce(cellView, @"首次处理");
+
+    // 【设备日志实证】必须等卡片完成布局再挂。
+    // ShortLookView 在 layout 早期是 {0,0}，把背景挂上去 = 挂在零面积视图上，
+    // 永远看不见。零尺寸时直接返回，等下一次 layoutSubviews（此时已有真实尺寸）。
+    if (cellView.bounds.size.width < 1.0 || cellView.bounds.size.height < 1.0) {
+        return;
+    }
 
     UIView *existing = [cellView viewWithTag:kCardBGViewTag];
     UIView *existingDim = [cellView viewWithTag:kCardDimViewTag];
@@ -597,11 +614,16 @@ static void LNBApplyCardBackground(UIView *cellView) {
     cellView.layer.cornerRadius = cellView.layer.cornerRadius > 0 ? cellView.layer.cornerRadius : 18.0;
     cellView.layer.masksToBounds = YES;
 
-    // 1) 藏掉系统毛玻璃白底
+    // 1) 藏掉卡片白底（MTMaterialView + StackDimmingOverlayView）
     LNBSetCardMaterialsHidden(cellView, YES);
 
     // 2) 背景容器：与整块列表背景同一个类，参数化为卡片素材。
     //    支持图片或视频；卡片视频强制静音（锁屏上多条通知同时播，出声会叠成噪声）。
+    //
+    //    【挂载位置】直接挂到 NCNotificationListCell 上、atIndex:0。
+    //    设备日志确认 cell 的 frame 就是卡片实际几何
+    //   {{46.1,18.4},{308.8,123.2}}，背景按 cell.bounds 铺即精确覆盖卡片。
+    //    白底已藏，图不会被盖住；文字在更内层的子视图里，浮在图之上。
     LNBGlobalBackgroundView *bg = (LNBGlobalBackgroundView *)[cellView viewWithTag:kCardBGViewTag];
     if (!bg) {
         bg = [[LNBGlobalBackgroundView alloc] initWithFrame:cellView.bounds];
@@ -650,16 +672,15 @@ static void LNBApplyCardBackground(UIView *cellView) {
     }
 }
 
-// 【v1.3.0 核心修复】在通知列表子树里扫描每一条通知的视觉视图并应用卡片背景。
+// 【v1.3.1 核心修复】在通知列表子树里扫描每一条通知并应用卡片背景。
 //
-// 【为什么需要它】NCNotificationListCell 这个类名来自旧版 iOS 的 tweak 惯例，
-// 在 iOS 16.5 上很可能已经不存在 —— Logos %hook 一个不存在的类是**静默失败**，
-// 一个日志都不会留下。这正好解释了卡片背景从 v1.2.0 起怎么改都「无生效」：
-// hook 压根没命中，里面的逻辑一行都没跑。
-// 而 NCNotificationListView（列表本体）在 v1.1.0 时被证实是生效的（用户截图
-// 看到过整块背景）。所以改为：在列表 layout 后主动扫描子树，命中所有类名含
-// "LookView" 的视图（iOS 16 通知的视觉内容视图，ShortLook/LongLook），对其
-// 应用卡片背景。不再赌任何具体类名。
+// 【为什么只认 NCNotificationListCell】v1.3.0 用「类名含 LookView」扫描，
+// 结果命中的 NCNotificationShortLookView 在 layout 早期尺寸是 {0,0}
+//（设备日志实证：26 次视图树 dump 里尺寸全是 0x0），背景挂上去 = 零面积，
+// 用户永远看不到；而 NCNotificationListCell 的 frame 是
+// {{46.1, 18.4}, {308.8, 123.2}} —— 正好是屏幕上那张卡片的实际位置和大小。
+// 所以：只认 NCNotificationListCell（有真实几何的卡片容器），
+// ShortLookView 交给它内部防双份逻辑忽略。
 static void LNBScanAndApplyCards(UIView *root) {
     NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
     while (stack.count > 0) {
@@ -667,9 +688,9 @@ static void LNBScanAndApplyCards(UIView *root) {
         [stack removeLastObject];
         if (v != root) {
             NSString *cls = NSStringFromClass(v.class);
-            if ([cls containsString:@"LookView"]) {
+            if ([cls isEqualToString:@"NCNotificationListCell"]) {
                 LNBApplyCardBackground(v);
-                continue;   // 子树内部交给防双份逻辑，不再展开
+                continue;   // 卡片内部不再展开，避免命中 0x0 的 ShortLookView
             }
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
@@ -706,8 +727,7 @@ static void LNBReloadConfiguration(void) {
             }
 
             NSString *cls = NSStringFromClass(view.class);
-            if ([cls isEqualToString:@"NCNotificationListCell"] ||
-                [cls isEqualToString:@"NCNotificationShortLookView"]) {
+            if ([cls isEqualToString:@"NCNotificationListCell"]) {
                 LNBApplyCardBackground(view);
             }
 
@@ -742,7 +762,8 @@ static void LNBReloadConfiguration(void) {
 
 %end
 
-// 通知 cell 的通用 hook：NCNotificationListCell 是列表里每条通知的宿主视图
+// 通知 cell hook：NCNotificationListCell 是列表里每条通知的宿主视图，
+// 设备日志确认它的 frame 就是卡片实际几何。
 %hook NCNotificationListCell
 
 - (void)layoutSubviews {
@@ -752,15 +773,10 @@ static void LNBReloadConfiguration(void) {
 
 %end
 
-// 部分系统版本 cell 本体是 content view，额外兜一层
-%hook NCNotificationShortLookView
-
-- (void)layoutSubviews {
-    %orig;
-    LNBApplyCardBackground((UIView *)self);
-}
-
-%end
+// 【已移除】NCNotificationShortLookView 的 hook。
+// 设备日志显示它在 layout 早期尺寸恒为 {0,0}，挂背景等于挂零面积视图，
+// 不但看不见，还会抢先占掉 tag 让外层正确的 cell 被跳过。
+// 现在只在 NCNotificationListCell 上处理。
 
 #pragma mark - 生命周期与配置热重载
 
