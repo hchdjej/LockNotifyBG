@@ -30,6 +30,7 @@ static NSString *const kBGDirectory      = @"/var/mobile/Library/LockNotifyBG";
 static NSString *const kBGGlobalImage    = @"global.jpg";
 static NSString *const kBGGlobalVideo    = @"global.mp4";
 static NSString *const kBGCardImage      = @"card.jpg";
+static NSString *const kBGCardVideo      = @"card.mp4";
 static NSString *const kPrefsDomain      = @"com.hchdjej.locknotifybg";
 static NSString *const kReloadNotification = @"com.hchdjej.locknotifybg/reload";
 
@@ -107,6 +108,7 @@ static void LNBLogCardTreeOnce(UIView *cellView, NSString *reason) {
 @property (nonatomic, assign) BOOL globalUseVideo;
 @property (nonatomic, assign) CGFloat globalAlpha;
 @property (nonatomic, assign) BOOL cardEnabled;
+@property (nonatomic, assign) BOOL cardUseVideo;    // 卡片背景用视频（card.mp4）而不是图片
 @property (nonatomic, assign) CGFloat cardAlpha;
 @property (nonatomic, assign) BOOL cardBlurOverlay; // 卡片上是否叠一层半透明色保证文字可读
 
@@ -149,6 +151,7 @@ static void LNBLogCardTreeOnce(UIView *cellView, NSString *reason) {
     self.globalUseVideo   = saved[@"globalUseVideo"]   ? [saved[@"globalUseVideo"] boolValue]   : NO;
     self.globalAlpha      = saved[@"globalAlpha"]      ? [saved[@"globalAlpha"] doubleValue]    : 0.85;
     self.cardEnabled      = saved[@"cardEnabled"]      ? [saved[@"cardEnabled"] boolValue]      : YES;
+    self.cardUseVideo     = saved[@"cardUseVideo"]     ? [saved[@"cardUseVideo"] boolValue]     : NO;
     self.cardAlpha        = saved[@"cardAlpha"]        ? [saved[@"cardAlpha"] doubleValue]      : 0.9;
     self.cardBlurOverlay  = saved[@"cardBlurOverlay"]  ? [saved[@"cardBlurOverlay"] boolValue]  : YES;
 
@@ -211,8 +214,16 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 
 #pragma mark - 全局背景容器
 
-// 这个视图承载全局底图或视频层，同时提供一个轻量遮罩保证通知文字可读
+// 这个视图承载背景图或视频层（全局列表背景与通知卡片背景共用），
+// 同时提供一个轻量遮罩保证通知文字可读。
+// imageName / videoName / preferVideo / alphaOverride / muteAudio 由使用方设置，
+// 同一个类既能当「整块列表背景」也能当「单条卡片背景」。
 @interface LNBGlobalBackgroundView : UIView
+@property (nonatomic, copy) NSString *imageName;    // 背景图文件名（kBGDirectory 下）
+@property (nonatomic, copy) NSString *videoName;    // 背景视频文件名
+@property (nonatomic, assign) BOOL preferVideo;     // YES=视频模式
+@property (nonatomic, assign) CGFloat alphaOverride;// >=0 时覆盖全局 globalAlpha（卡片用 1.0）
+@property (nonatomic, assign) BOOL muteAudio;       // YES=强制静音（卡片视频多路叠加必须静音）
 @property (nonatomic, strong) UIImageView *imageView;
 @property (nonatomic, strong) UIView *dimView;
 @property (nonatomic, strong) AVPlayer *player;
@@ -251,21 +262,27 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 }
 
 - (void)applyConfig:(LNBPrefs *)prefs {
-    self.alpha = prefs.globalAlpha;
+    // alpha：卡片背景传 alphaOverride=1.0（整体不透明，可读性交给遮罩）；
+    // 整块列表背景沿用 globalAlpha
+    self.alpha = (self.alphaOverride >= 0) ? self.alphaOverride : prefs.globalAlpha;
 
-    if (prefs.globalUseVideo) {
+    BOOL useVideo = self.preferVideo;
+    NSString *imgName = self.imageName ?: kBGGlobalImage;
+    NSString *vidName = self.videoName ?: kBGGlobalVideo;
+
+    if (useVideo) {
         // 视频模式：隐藏图片，用 AVPlayerLayer 循环播放
         self.imageView.hidden = YES;
-        self.dimView.hidden = YES;   // 不再额外压黑，可读性交给系统原生的模糊层
+        self.dimView.hidden = YES;
         [self setupPlayerIfNeeded];
     } else {
-        // 图片模式：优先 global.jpg，若不存在则回退到视频首帧
+        // 图片模式：优先指定图片，若不存在则回退到视频首帧
         [self teardownPlayerIfNeeded];
         self.dimView.hidden = YES;
 
-        UIImage *image = [UIImage imageWithContentsOfFile:LNBPathForResource(kBGGlobalImage)];
+        UIImage *image = [UIImage imageWithContentsOfFile:LNBPathForResource(imgName)];
         if (!image) {
-            image = LNBThumbnailForVideo(LNBPathForResource(kBGGlobalVideo));
+            image = LNBThumbnailForVideo(LNBPathForResource(vidName));
         }
         self.imageView.image = image;
         self.imageView.hidden = (image == nil);
@@ -273,10 +290,12 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 }
 
 - (void)setupPlayerIfNeeded {
-    NSString *videoPath = LNBPathForResource(kBGGlobalVideo);
+    NSString *vidName = self.videoName ?: kBGGlobalVideo;
+    NSString *imgName = self.imageName ?: kBGGlobalImage;
+    NSString *videoPath = LNBPathForResource(vidName);
     if (!LNBFileExists(videoPath)) {
         // 视频文件缺失，直接退回静态模式，避免黑屏
-        self.imageView.image = [UIImage imageWithContentsOfFile:LNBPathForResource(kBGGlobalImage)];
+        self.imageView.image = [UIImage imageWithContentsOfFile:LNBPathForResource(imgName)];
         self.imageView.hidden = (self.imageView.image == nil);
         return;
     }
@@ -318,10 +337,11 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 - (void)applyAudioConfig:(LNBPrefs *)prefs {
     if (!self.player) return;
 
-    self.player.muted = prefs.videoMuted;
-    self.player.volume = prefs.videoVolume;
+    // 卡片视频多路叠加必须静音；整块背景视频跟随用户设置
+    self.player.muted = self.muteAudio ? YES : prefs.videoMuted;
+    self.player.volume = self.muteAudio ? 0.0 : prefs.videoVolume;
 
-    if (prefs.videoMuted) return;
+    if (self.player.muted) return;
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -550,7 +570,7 @@ static void LNBApplyCardBackground(UIView *cellView) {
     UIView *existing = [cellView viewWithTag:kCardBGViewTag];
     UIView *existingDim = [cellView viewWithTag:kCardDimViewTag];
 
-    // 关闭时：摘图 + 恢复被隐藏的毛玻璃，交还系统原始外观
+    // 关闭时：摘背景 + 恢复被隐藏的毛玻璃，交还系统原始外观
     if (!prefs.enabled || !prefs.cardEnabled) {
         if (existing) [existing removeFromSuperview];
         if (existingDim) [existingDim removeFromSuperview];
@@ -559,19 +579,17 @@ static void LNBApplyCardBackground(UIView *cellView) {
         return;
     }
 
-    UIImage *cardImage = [UIImage imageWithContentsOfFile:LNBPathForResource(kBGCardImage)];
-    if (!cardImage) {
-        // 卡片图缺失时，回退用全局视频首帧，再不行就全局图片
-        cardImage = LNBThumbnailForVideo(LNBPathForResource(kBGGlobalVideo));
-        if (!cardImage) {
-            cardImage = [UIImage imageWithContentsOfFile:LNBPathForResource(kBGGlobalImage)];
-        }
-    }
-    if (!cardImage) {
+    // 素材检查：卡片支持图片（card.jpg）或视频（card.mp4）。
+    // 都没有时回退全局素材；再没有才跳过。
+    BOOL hasCardImage = LNBFileExists(LNBPathForResource(kBGCardImage));
+    BOOL hasCardVideo = LNBFileExists(LNBPathForResource(kBGCardVideo));
+    BOOL hasAnyFallback = LNBFileExists(LNBPathForResource(kBGGlobalImage)) ||
+                          LNBFileExists(LNBPathForResource(kBGGlobalVideo));
+    if (!hasCardImage && !hasCardVideo && !hasAnyFallback) {
         if (existing) [existing removeFromSuperview];
         if (existingDim) [existingDim removeFromSuperview];
         LNBSetCardMaterialsHidden(cellView, NO);
-        LNBTLog(@"[卡片] 无可用图片（card.jpg/global.jpg 都不存在），跳过");
+        LNBTLog(@"[卡片] 无任何可用素材，跳过");
         return;
     }
 
@@ -582,29 +600,32 @@ static void LNBApplyCardBackground(UIView *cellView) {
     // 1) 藏掉系统毛玻璃白底
     LNBSetCardMaterialsHidden(cellView, YES);
 
-    // 2) 图挂在卡片本体最底层，边界 = 模块边界
-    UIImageView *bg = (UIImageView *)[cellView viewWithTag:kCardBGViewTag];
+    // 2) 背景容器：与整块列表背景同一个类，参数化为卡片素材。
+    //    支持图片或视频；卡片视频强制静音（锁屏上多条通知同时播，出声会叠成噪声）。
+    LNBGlobalBackgroundView *bg = (LNBGlobalBackgroundView *)[cellView viewWithTag:kCardBGViewTag];
     if (!bg) {
-        bg = [[UIImageView alloc] initWithFrame:cellView.bounds];
+        bg = [[LNBGlobalBackgroundView alloc] initWithFrame:cellView.bounds];
         bg.tag = kCardBGViewTag;
-        bg.userInteractionEnabled = NO;          // 绝不拦截通知的点击/滑动
-        bg.contentMode = UIViewContentModeScaleAspectFill;  // 填充满 + 裁剪
-        bg.clipsToBounds = YES;
+        bg.alphaOverride = 1.0;
+        bg.muteAudio = YES;
     }
+    bg.imageName = kBGCardImage;
+    bg.videoName = kBGCardVideo;
+    bg.preferVideo = prefs.cardUseVideo && hasCardVideo;
     if (bg.superview != cellView) {
         [bg removeFromSuperview];
         [cellView insertSubview:bg atIndex:0];
     }
     bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     bg.frame = cellView.bounds;
-    bg.image = cardImage;
-    bg.alpha = 1.0;
-    LNBTLog(@"[卡片] 图已挂载 superview=%@ frame=%@ 尺寸=%0.0fx%0.0f",
+    [bg applyConfig:prefs];
+    LNBTLog(@"[卡片] 背景已挂载 superview=%@ 尺寸=%0.0fx%0.0f 视频=%d 素材=%@",
             NSStringFromClass(bg.superview.class),
-            NSStringFromCGRect(bg.frame),
-            bg.frame.size.width, bg.frame.size.height);
+            bg.frame.size.width, bg.frame.size.height,
+            (int)bg.preferVideo,
+            bg.preferVideo ? kBGCardVideo : kBGCardImage);
 
-    // 3) 可读性遮罩（图上、文字下）
+    // 3) 可读性遮罩（背景上、文字下）
     UIView *dim = [cellView viewWithTag:kCardDimViewTag];
     if (!dim) {
         dim = [[UIView alloc] initWithFrame:cellView.bounds];
@@ -626,6 +647,32 @@ static void LNBApplyCardBackground(UIView *cellView) {
     } else {
         dim.hidden = YES;
         dim.backgroundColor = [UIColor clearColor];
+    }
+}
+
+// 【v1.3.0 核心修复】在通知列表子树里扫描每一条通知的视觉视图并应用卡片背景。
+//
+// 【为什么需要它】NCNotificationListCell 这个类名来自旧版 iOS 的 tweak 惯例，
+// 在 iOS 16.5 上很可能已经不存在 —— Logos %hook 一个不存在的类是**静默失败**，
+// 一个日志都不会留下。这正好解释了卡片背景从 v1.2.0 起怎么改都「无生效」：
+// hook 压根没命中，里面的逻辑一行都没跑。
+// 而 NCNotificationListView（列表本体）在 v1.1.0 时被证实是生效的（用户截图
+// 看到过整块背景）。所以改为：在列表 layout 后主动扫描子树，命中所有类名含
+// "LookView" 的视图（iOS 16 通知的视觉内容视图，ShortLook/LongLook），对其
+// 应用卡片背景。不再赌任何具体类名。
+static void LNBScanAndApplyCards(UIView *root) {
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count > 0) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if (v != root) {
+            NSString *cls = NSStringFromClass(v.class);
+            if ([cls containsString:@"LookView"]) {
+                LNBApplyCardBackground(v);
+                continue;   // 子树内部交给防双份逻辑，不再展开
+            }
+        }
+        for (UIView *sub in v.subviews) [stack addObject:sub];
     }
 }
 
@@ -686,7 +733,11 @@ static void LNBReloadConfiguration(void) {
 
 - (void)layoutSubviews {
     %orig;
+    // 整块列表背景（附加功能，默认关闭）
     LNBEnsureGlobalBackground((UIView *)self);
+    // 【v1.3.0 核心修复】主动扫描子树给每条通知挂卡片背景——
+    // 不依赖 NCNotificationListCell 这个在 iOS 16.5 上可能不存在的类名
+    LNBScanAndApplyCards((UIView *)self);
 }
 
 %end

@@ -5,6 +5,6 @@
         detail = "NGBPrefsRootListController";
         icon = "icon.png";
         isController = 1;
-        label = "锁屏通知背景";
+        label = "坏叔叔";
     };
 }

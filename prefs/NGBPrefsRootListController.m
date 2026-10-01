@@ -81,6 +81,7 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 #define kBGGlobalImage      @"global.jpg"
 #define kBGGlobalVideo      @"global.mp4"
 #define kBGCardImage        @"card.jpg"
+#define kBGCardVideo        @"card.mp4"
 
 #pragma mark - 资源管理工具
 
@@ -263,7 +264,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
     @try {
         [super viewDidLoad];
         LNBLog(@"[5] super viewDidLoad 完成");
-        self.title = @"锁屏通知背景";
+        self.title = @"坏叔叔 — 通知卡片背景";
         [LNBFileManager ensureDirectory];
         LNBLog(@"[6] 目录就绪");
         [self seedDefaultsIfNeeded];
@@ -285,6 +286,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
     NSDictionary *defaults = @{@"enabled":         @YES,
                                @"cardEnabled":     @YES,
+                               @"cardUseVideo":    @NO,
                                @"cardAlpha":       @0.9,
                                @"cardBlurOverlay": @YES,
                                @"globalEnabled":   @NO,
@@ -367,9 +369,11 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 
         // ---- 1. 通知卡片背景（主功能）----
         [specs addObject:LNBGroup(@"通知卡片背景",
-                                  @"给锁屏上的每一条通知单独加背景。图片会盖在卡片的白色毛玻璃底之上，完全覆盖整个模块；文字仍显示在图片上方。")];
+                                  @"给锁屏上的每一条通知单独加背景，支持图片或视频（二选一，用「使用视频」开关切换）。图片/视频按「填充满整块卡片并裁剪」显示；卡片视频会强制静音。")];
         [specs addObject:LNBSwitch(self, @"卡片背景开关", @"cardEnabled")];
         [specs addObject:LNBButton(self, @"选择卡片图片", @selector(lnbPickCardImage:), @"pickCardImage")];
+        [specs addObject:LNBButton(self, @"选择卡片视频", @selector(lnbPickCardVideo:), @"pickCardVideo")];
+        [specs addObject:LNBSwitch(self, @"使用视频作为卡片背景", @"cardUseVideo")];
         [specs addObject:LNBSlider(self, @"卡片背景不透明度", @"cardAlpha", 0.2, 1.0)];
         [specs addObject:LNBSwitch(self, @"暗色遮罩（提升文字可读性）", @"cardBlurOverlay")];
 
@@ -428,6 +432,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
     if ([LNBFileManager fileExistsNamed:kBGGlobalImage]) [parts addObject:@"全局图"];
     if ([LNBFileManager fileExistsNamed:kBGGlobalVideo]) [parts addObject:@"视频"];
     if ([LNBFileManager fileExistsNamed:kBGCardImage])   [parts addObject:@"卡片图"];
+    if ([LNBFileManager fileExistsNamed:kBGCardVideo])   [parts addObject:@"卡片视频"];
     return parts.count ? [parts componentsJoinedByString:@" / "] : @"尚无资源";
 }
 
@@ -442,6 +447,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 - (void)lnbPickGlobalImage:(PSSpecifier *)spec { [self presentPickerForName:kBGGlobalImage isVideo:NO]; }
 - (void)lnbPickGlobalVideo:(PSSpecifier *)spec { [self presentPickerForName:kBGGlobalVideo isVideo:YES]; }
 - (void)lnbPickCardImage:(PSSpecifier *)spec   { [self presentPickerForName:kBGCardImage   isVideo:NO]; }
+- (void)lnbPickCardVideo:(PSSpecifier *)spec   { [self presentPickerForName:kBGCardVideo   isVideo:YES]; }
 
 - (void)lnbConfirmClearAll:(PSSpecifier *)spec {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"确认清除"
@@ -452,6 +458,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         [LNBFileManager removeFileNamed:kBGGlobalImage];
         [LNBFileManager removeFileNamed:kBGGlobalVideo];
         [LNBFileManager removeFileNamed:kBGCardImage];
+        [LNBFileManager removeFileNamed:kBGCardVideo];
         [LNBFileManager postReload];
         [self.table reloadData];
         [self lnbShowAlert:@"已清除" message:@"所有背景资源已删除。"];
@@ -499,7 +506,8 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         NSError *error = nil;
         BOOL ok = NO;
 
-        if ([targetName isEqualToString:kBGGlobalVideo]) {
+        BOOL isVideoPick = [targetName isEqualToString:kBGGlobalVideo] || [targetName isEqualToString:kBGCardVideo];
+        if (isVideoPick) {
             NSURL *videoURL = info[UIImagePickerControllerMediaURL];
             if (videoURL) ok = [LNBFileManager copyFileAtURL:videoURL toName:targetName error:&error];
         } else {
