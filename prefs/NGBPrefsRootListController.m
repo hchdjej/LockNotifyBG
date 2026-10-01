@@ -244,6 +244,14 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 
 @interface NGBPrefsRootListController : PSListController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 - (void)mirrorPreferencesToFile;
+// 按钮动作统一在此声明：LNBButton 用的是 SEL，@selector() 本身不要求方法
+// 已声明，但显式声明能让编译器帮忙校验签名，也便于阅读。
+- (void)lnbPickGlobalImage:(PSSpecifier *)spec;
+- (void)lnbPickGlobalVideo:(PSSpecifier *)spec;
+- (void)lnbPickCardImage:(PSSpecifier *)spec;
+- (void)lnbPickCardVideo:(PSSpecifier *)spec;
+- (void)lnbConfirmClearAll:(PSSpecifier *)spec;
+- (void)lnbClearDiagBorders:(PSSpecifier *)spec;
 @end
 
 @implementation NGBPrefsRootListController
@@ -294,7 +302,8 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
                                @"globalAlpha":     @0.85,
                                @"videoMuted":      @YES,
                                @"videoVolume":     @0.6,
-                               @"mixWithOthers":   @YES};
+                               @"mixWithOthers":   @YES,
+                               @"diagMode":        @NO};
     for (NSString *key in defaults) {
         if ([d objectForKey:key] == nil) [d setObject:defaults[key] forKey:key];
     }
@@ -393,7 +402,13 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         [specs addObject:LNBSlider(self, @"音量", @"videoVolume", 0.0, 1.0)];
         [specs addObject:LNBSwitch(self, @"与其他音频混音", @"mixWithOthers")];
 
-        // ---- 4. 其它 ----
+        // ---- 4. 诊断 ----
+        [specs addObject:LNBGroup(@"诊断（排查用）",
+                                  @"开启后会给锁屏通知的各层视图描上彩色边框，用于确认背景图挂在哪一层、被谁挡住。\n红=通知卡片容器　绿=我们的背景视图　紫=遮罩层　黄=被隐藏的系统白底　蓝=文字内容层　橙=整块背景宿主\n排查完请务必关闭，否则会一直显示彩色边框。")];
+        [specs addObject:LNBSwitch(self, @"诊断模式（彩色边框）", @"diagMode")];
+        [specs addObject:LNBButton(self, @"清除诊断彩框", @selector(lnbClearDiagBorders:), @"clearDiag")];
+
+        // ---- 5. 其它 ----
         [specs addObject:LNBGroup(@"其它", @"所有修改即时生效，无需注销。")];
 
         PSSpecifier *status = [PSSpecifier preferenceSpecifierNamed:@"资源状态"
@@ -466,6 +481,19 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
     [self presentViewController:alert animated:YES completion:nil];
 }
 
+// 关闭诊断模式并让 tweak 立刻清掉已画上的彩色边框。
+// 这里必须先把 diagMode 写 NO 再 postReload —— tweak 收到 reload 后会带着
+// 「当前未开启诊断」的状态重扫一遍视图树，把所有被标记过的视图恢复原样。
+- (void)lnbClearDiagBorders:(PSSpecifier *)spec {
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
+    [d setObject:@NO forKey:@"diagMode"];
+    [d synchronize];
+    [self mirrorPreferencesToFile];
+    [LNBFileManager postReload];
+    [self.table reloadData];
+    [self lnbShowAlert:@"已清除" message:@"诊断模式已关闭，彩色边框会在锁屏通知下一次刷新时消失。"];
+}
+
 // 兜底：若框架未触发 buttonAction，在 didSelectRowAtIndexPath 里按 lnbAction 分发
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
@@ -477,6 +505,8 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         if ([k isEqualToString:@"pickGlobalImage"]) { [self lnbPickGlobalImage:spec]; return; }
         if ([k isEqualToString:@"pickGlobalVideo"]) { [self lnbPickGlobalVideo:spec]; return; }
         if ([k isEqualToString:@"pickCardImage"])   { [self lnbPickCardImage:spec];   return; }
+        if ([k isEqualToString:@"pickCardVideo"])   { [self lnbPickCardVideo:spec];   return; }
+        if ([k isEqualToString:@"clearDiag"])       { [self lnbClearDiagBorders:spec]; return; }
         if ([k isEqualToString:@"clearAll"])        { [self lnbConfirmClearAll:spec]; return; }
     }
     [super tableView:tableView didSelectRowAtIndexPath:indexPath];

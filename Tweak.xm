@@ -36,6 +36,12 @@ static NSString *const kReloadNotification = @"com.hchdjej.locknotifybg/reload";
 
 // 背景容器视图的复用 tag，用于存在性检查，避免重复插入
 static const NSInteger kGlobalBGViewTag = 0x1F0B6;
+// 卡片背景 / 卡片遮罩的 tag。
+// 【注意】这三个 tag 必须定义在文件最上面：诊断标记函数 LNBDiagMarkCard（约 142 行）
+// 会引用 kCardBGViewTag / kCardDimViewTag，C 语言要求「先声明后使用」，
+// 常量定义如果放在它们后面就是编译错误（不是警告）。
+static const NSInteger kCardBGViewTag = 0x1F0B7;
+static const NSInteger kCardDimViewTag = 0x1F0B8;
 
 #pragma mark - 诊断日志（tweak 侧）
 
@@ -100,6 +106,82 @@ static void LNBLogCardTreeOnce(UIView *cellView, NSString *reason) {
     LNBTLog(@"%@", out);
 }
 
+#pragma mark - 视图层级彩色诊断（调试模式）
+
+// 前向声明：LNBIsBlurMaterial 定义在卡片逻辑区（下方），
+// 但诊断标记函数在上面就要用它，必须先声明。
+static BOOL LNBIsBlurMaterial(UIView *v);
+
+// 【用途】当素材「看不见」时，靠日志猜层级效率太低。这里给不同角色的视图
+// 描上不同颜色的边框，锁屏上一眼就能看出：
+//   红 = 卡片容器（背景该铺满这里）
+//   绿 = 我们挂的背景视图（它的边框就是素材实际覆盖范围）
+//   黄 = 被我们隐藏的白底（MTMaterialView / StackDimmingOverlayView）
+//   蓝 = 文字内容视图（背景不该盖住它）
+//   橙 = 整块列表背景宿主
+// 边框画在视图自身上，不影响功能；关掉「诊断模式」开关即全部移除。
+static const void *kLNBDiagBorder = &kLNBDiagBorder;
+static const void *kLNBDiagBorderColor = &kLNBDiagBorderColor;
+
+static void LNBDiagMarkView(UIView *v, UIColor *color, CGFloat width) {
+    if (!v || !color) return;
+    // 先记下原始状态，便于恢复
+    objc_setAssociatedObject(v, kLNBDiagBorder, @(v.layer.borderWidth), OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(v, kLNBDiagBorderColor,
+                             (__bridge id)v.layer.borderColor, OBJC_ASSOCIATION_RETAIN);
+    v.layer.borderColor = color.CGColor;
+    v.layer.borderWidth = width;
+}
+
+static void LNBDiagClearView(UIView *v) {
+    if (!v) return;
+    NSNumber *w = objc_getAssociatedObject(v, kLNBDiagBorder);
+    if (!w) return;
+    v.layer.borderWidth = [w doubleValue];
+    CGColorRef c = (__bridge CGColorRef)objc_getAssociatedObject(v, kLNBDiagBorderColor);
+    v.layer.borderColor = c;   // 可能为 NULL，即无边框，正确
+    objc_setAssociatedObject(v, kLNBDiagBorder, nil, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(v, kLNBDiagBorderColor, nil, OBJC_ASSOCIATION_RETAIN);
+}
+
+// 标记一个卡片及其关键子视图
+static void LNBDiagMarkCard(UIView *cell) {
+    if (!cell) return;
+    LNBDiagMarkView(cell, [UIColor redColor], 2.0);   // 卡片容器
+
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
+    while (stack.count > 0) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if (v == cell) {
+            // 跳过自己不重复描
+        } else {
+            NSString *cls = NSStringFromClass(v.class);
+            if (v.tag == kCardBGViewTag) {
+                LNBDiagMarkView(v, [UIColor greenColor], 2.0);       // 我们的背景
+            } else if (v.tag == kCardDimViewTag) {
+                LNBDiagMarkView(v, [UIColor purpleColor], 1.0);      // 遮罩层
+            } else if (LNBIsBlurMaterial(v)) {
+                LNBDiagMarkView(v, [UIColor yellowColor], 2.0);      // 被藏的白底
+            } else if ([cls containsString:@"ContentView"] ||
+                       [cls containsString:@"SeamlessContent"]) {
+                LNBDiagMarkView(v, [UIColor blueColor], 1.0);        // 文字内容层
+            }
+        }
+        for (UIView *sub in v.subviews) [stack addObject:sub];
+    }
+}
+
+// 递归清除整棵子树里所有被诊断标记过的边框。
+// 【为什么必须做】诊断边框只画在 layer 上、不参与布局，但一旦 diagMode 关掉，
+// 没有人会主动去「走一遍刚才标记过的地方」——卡片复用、列表滚动都可能让带框的
+// 视图留在屏幕上。所以关掉开关时对整个通知列表做一次全树清扫。
+static void LNBDiagClearTree(UIView *root) {
+    if (!root) return;
+    LNBDiagClearView(root);
+    for (UIView *sub in root.subviews) LNBDiagClearTree(sub);
+}
+
 #pragma mark - 配置管理
 
 @interface LNBPrefs : NSObject
@@ -109,6 +191,7 @@ static void LNBLogCardTreeOnce(UIView *cellView, NSString *reason) {
 @property (nonatomic, assign) CGFloat globalAlpha;
 @property (nonatomic, assign) BOOL cardEnabled;
 @property (nonatomic, assign) BOOL cardUseVideo;    // 卡片背景用视频（card.mp4）而不是图片
+@property (nonatomic, assign) BOOL diagMode;        // 诊断模式：给视图层级上彩色边框
 @property (nonatomic, assign) CGFloat cardAlpha;
 @property (nonatomic, assign) BOOL cardBlurOverlay; // 卡片上是否叠一层半透明色保证文字可读
 
@@ -152,6 +235,7 @@ static void LNBLogCardTreeOnce(UIView *cellView, NSString *reason) {
     self.globalAlpha      = saved[@"globalAlpha"]      ? [saved[@"globalAlpha"] doubleValue]    : 0.85;
     self.cardEnabled      = saved[@"cardEnabled"]      ? [saved[@"cardEnabled"] boolValue]      : YES;
     self.cardUseVideo     = saved[@"cardUseVideo"]     ? [saved[@"cardUseVideo"] boolValue]     : NO;
+    self.diagMode         = saved[@"diagMode"]         ? [saved[@"diagMode"] boolValue]         : NO;
     self.cardAlpha        = saved[@"cardAlpha"]        ? [saved[@"cardAlpha"] doubleValue]      : 0.9;
     self.cardBlurOverlay  = saved[@"cardBlurOverlay"]  ? [saved[@"cardBlurOverlay"] boolValue]  : YES;
 
@@ -472,20 +556,32 @@ static void LNBEnsureGlobalBackground(UIView *candidateHost) {
         bgView = [[LNBGlobalBackgroundView alloc] initWithFrame:hostView.bounds];
         bgView.tag = kGlobalBGViewTag;
         bgView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        // 插到最底层，绝不遮挡任何系统内容
+        // 【回归修复 v1.3.2】v1.3.0 把本类参数化后，applyConfig: 改为读
+        // self.imageName / self.videoName，而这条「整块列表背景」路径从没给它们
+        // 赋过值 —— 属性默认 nil，于是去找 (null) 文件，整块背景整个失效。
+        // 这里显式指定全局素材。
+        bgView.alphaOverride = -1.0;   // 用 prefs.globalAlpha
+        bgView.muteAudio = NO;         // 整块背景视频跟随用户声音设置
         [hostView insertSubview:bgView atIndex:0];
     } else if (bgView.superview != hostView) {
         [hostView insertSubview:bgView atIndex:0];
     }
+    bgView.imageName = kBGGlobalImage;
+    bgView.videoName = kBGGlobalVideo;
+    bgView.preferVideo = prefs.globalUseVideo;
     bgView.frame = hostView.bounds;
     [bgView applyConfig:prefs];
+
+    // 诊断模式：橙色边框标出「整块列表背景」的宿主范围
+    if (prefs.diagMode) {
+        LNBDiagMarkView(hostView, [UIColor orangeColor], 2.0);
+        LNBDiagMarkView(bgView, [UIColor greenColor], 2.0);
+        LNBTLog(@"[诊断] 整块背景 host=%@ frame=%@",
+                NSStringFromClass(hostView.class), NSStringFromCGRect(hostView.frame));
+    }
 }
 
 #pragma mark - 卡片背景注入逻辑
-
-// 卡片背景视图的复用 tag
-static const NSInteger kCardBGViewTag = 0x1F0B7;
-static const NSInteger kCardDimViewTag = 0x1F0B8;
 
 // 判断一个视图是不是「卡片白底」类。
 //
@@ -581,6 +677,7 @@ static void LNBApplyCardBackground(UIView *cellView) {
     // ShortLookView 在 layout 早期是 {0,0}，把背景挂上去 = 挂在零面积视图上，
     // 永远看不见。零尺寸时直接返回，等下一次 layoutSubviews（此时已有真实尺寸）。
     if (cellView.bounds.size.width < 1.0 || cellView.bounds.size.height < 1.0) {
+        LNBDiagClearView(cellView);
         return;
     }
 
@@ -589,9 +686,16 @@ static void LNBApplyCardBackground(UIView *cellView) {
 
     // 关闭时：摘背景 + 恢复被隐藏的毛玻璃，交还系统原始外观
     if (!prefs.enabled || !prefs.cardEnabled) {
-        if (existing) [existing removeFromSuperview];
-        if (existingDim) [existingDim removeFromSuperview];
+        if (existing) {
+            LNBDiagClearView(existing);
+            [existing removeFromSuperview];
+        }
+        if (existingDim) {
+            LNBDiagClearView(existingDim);
+            [existingDim removeFromSuperview];
+        }
         LNBSetCardMaterialsHidden(cellView, NO);
+        LNBDiagClearView(cellView);
         LNBTLog(@"[卡片] 开关关闭，已还原");
         return;
     }
@@ -670,6 +774,12 @@ static void LNBApplyCardBackground(UIView *cellView) {
         dim.hidden = YES;
         dim.backgroundColor = [UIColor clearColor];
     }
+
+    // 4) 诊断模式：给卡片与关键子视图上彩色边框，方便肉眼确认层级
+    if (prefs.diagMode) {
+        LNBDiagMarkCard(cellView);
+        LNBTLog(@"[诊断] 已标记卡片 org=%@", NSStringFromCGRect(cellView.frame));
+    }
 }
 
 // 【v1.3.1 核心修复】在通知列表子树里扫描每一条通知并应用卡片背景。
@@ -682,6 +792,13 @@ static void LNBApplyCardBackground(UIView *cellView) {
 // 所以：只认 NCNotificationListCell（有真实几何的卡片容器），
 // ShortLookView 交给它内部防双份逻辑忽略。
 static void LNBScanAndApplyCards(UIView *root) {
+    // 【诊断关闭时的全树清扫】diagMode 一关，必须把上一轮画上去的彩框全部擦掉。
+    // 放在扫描入口做，因为这里每次列表 layout 都会走到，覆盖最全。
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    if (!prefs.diagMode) {
+        LNBDiagClearTree(root);
+    }
+
     NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
     while (stack.count > 0) {
         UIView *v = stack.lastObject;
