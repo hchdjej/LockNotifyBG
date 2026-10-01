@@ -20,6 +20,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <stdarg.h>
 #import <notify.h>
 
 #pragma mark - 常量定义
@@ -81,7 +82,7 @@ static void LNBLogViewTree(UIView *v, NSInteger depth, NSMutableString *out) {
     }
     [out appendFormat:@"%@%@ frame=%@ hidden=%d alpha=%.2f tag=%ld bg=%@\n",
         indent, NSStringFromClass(v.class),
-        NSStringFromCGRect(v.frame), v.hidden, v.alpha, (long)v.tag, bg];
+        NSStringFromCGRect(v.frame), (int)v.hidden, (double)v.alpha, (long)v.tag, bg];
 
     for (UIView *sub in v.subviews) LNBLogViewTree(sub, depth + 1, out);
 }
@@ -533,8 +534,8 @@ static void LNBApplyCardBackground(UIView *cellView) {
     // 【诊断】每次调用都记一条精简日志；视图树只在每个 cell 第一次时完整 dump
     LNBTLog(@"[卡片] 入口 root=%@ enabled=%d cardEnabled=%d",
             NSStringFromClass(cellView.class),
-            [LNBPrefs sharedInstance].enabled,
-            [LNBPrefs sharedInstance].cardEnabled);
+            (int)[LNBPrefs sharedInstance].enabled,
+            (int)[LNBPrefs sharedInstance].cardEnabled);
 
     // 【防双份】NCNotificationListCell 和它内部的 NCNotificationShortLookView
     // 都挂了 hook。若祖先链上已经挂了背景图，说明更外层的入口已处理过，
@@ -601,7 +602,7 @@ static void LNBApplyCardBackground(UIView *cellView) {
     LNBTLog(@"[卡片] 图已挂载 superview=%@ frame=%@ 尺寸=%0.0fx%0.0f",
             NSStringFromClass(bg.superview.class),
             NSStringFromCGRect(bg.frame),
-            bg.frame.size.width, bg.frame.height);
+            bg.frame.size.width, bg.frame.size.height);
 
     // 3) 可读性遮罩（图上、文字下）
     UIView *dim = [cellView viewWithTag:kCardDimViewTag];
