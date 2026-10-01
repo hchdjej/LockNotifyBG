@@ -518,6 +518,19 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 
 - (void)layoutSubviews {
     [super layoutSubviews];
+
+    // 【v1.4.3】内部图层必须跟容器同尺寸。
+    // 原来 imageView / dimView 靠 autoresizingMask 自适应，但容器尺寸是我们在
+    // 外部每次"强制 frame = cell.bounds"改的，autoresizing 只在 superview
+    // 尺寸变化时按比例调整，和 cell 的 transform 动画节奏对不齐 ——
+    // 中间帧就会出现图比容器小一圈、露出容器底色的情况。
+    // 改为每次布局都硬对齐，和外部对齐时机一致。
+    if (!CGRectEqualToRect(_imageView.frame, self.bounds)) {
+        _imageView.frame = self.bounds;
+    }
+    if (!CGRectEqualToRect(_dimView.frame, self.bounds)) {
+        _dimView.frame = self.bounds;
+    }
     // 保持播放层始终与容器同尺寸
     if (self.playerLayer) {
         self.playerLayer.frame = self.bounds;
@@ -942,6 +955,24 @@ static void LNBApplyCardBackground(UIView *cellView) {
     //       ③ 背景直接作为 cell 的直接子视图且 index:0，随 cell 一同做 transform。
     bg.autoresizingMask = UIViewAutoresizingNone;
     bg.frame = cellView.bounds;
+    // 【v1.4.3 关键修复 —— 用户报「滑动通知时背景素材不跟着变换位置」】
+    //
+    // 病灶：背景在 *动画中途* 从卡片里滑出来，露出下面另一张卡片的图，
+    // 视觉上就变成了"背景粘在原地不跟着走"。
+    //
+    // 为什么 frame 每次都强制对齐了还是会脱节：
+    //   iOS 16 通知卡片的滑入/滑出用的是 transform 动画。transform 不改变
+    //   superview.bounds、不触发布局，但 **子视图会跟着一起被 transform 渲染**。
+    //   问题出在 cell 自身被 transform 的同时，系统对 cell.bounds 的收尾调整
+    //   （401x160 → 308x123）与动画不同帧 —— 中间帧上 cell 的有效可视区
+    //   比 cell.bounds 小，而我们的背景按旧 bounds 铺、又没有任何裁剪，
+    //   于是溢出到卡片轮廓之外，看起来就是背景跑到了别的卡片位置上。
+    //
+    // 修法：给 cell 本体开 clipsToBounds。背景在 index:0、尺寸恒等于
+    // cell.bounds，一旦父层裁剪，它永远不可能露出卡片轮廓之外。
+    // 这一步必须放在最后 —— LNBSetCardMaterialsHidden 之后设置，
+    // 避免被系统在 layout 里重置。
+    cellView.clipsToBounds = YES;
     [bg setNeedsLayout];
     [bg layoutIfNeeded];
     [bg applyConfig:prefs];
