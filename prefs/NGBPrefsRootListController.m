@@ -82,7 +82,7 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 #define kBGGlobalVideo      @"global.mp4"
 #define kBGCardImage        @"card.jpg"
 #define kBGCardVideo        @"card.mp4"
-// v1.3.5：附属按钮（选项 / 全部清除）独立素材
+// v1.3.6：附属按钮模块（删除 / 选项）独立素材
 #define kBGSuppImage        @"supp.jpg"
 #define kBGSuppVideo        @"supp.mp4"
 
@@ -303,10 +303,11 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
                                @"cardAlpha":       @0.9,
                                @"cardBlurOverlay": @YES,
                                @"suppEnabled":     @YES,
-                               @"suppIndependent": @NO,
                                @"suppUseVideo":    @NO,
                                @"suppAlpha":       @0.9,
                                @"suppBlurOverlay": @YES,
+                               @"suppVideoSound":  @NO,
+                               @"suppForceMode":   @NO,
                                @"globalEnabled":   @NO,
                                @"globalUseVideo":  @NO,
                                @"globalAlpha":     @0.85,
@@ -396,16 +397,19 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         [specs addObject:LNBSlider(self, @"卡片背景不透明度", @"cardAlpha", 0.2, 1.0)];
         [specs addObject:LNBSwitch(self, @"暗色遮罩（提升文字可读性）", @"cardBlurOverlay")];
 
-        // ---- 2. 附属按钮背景（与通知卡片独立控制）----
-        [specs addObject:LNBGroup(@"附属按钮背景（选项 / 全部清除）",
-                                  @"锁屏通知列表底部那排「选项 / 全部清除」按钮，也可以单独铺背景。\n默认「跟随卡片」，即与通知卡片用同一套素材、同样的开关和透明度；\n改成「独立设置」后，下面这几项才会生效，可以用完全不同的图和透明度。")];
-        [specs addObject:LNBSwitch(self, @"附属按钮背景开关", @"suppEnabled")];
-        [specs addObject:LNBSwitch(self, @"独立设置（不跟随卡片）", @"suppIndependent")];
+        // ---- 2. 附属按钮模块背景（删除 / 选项）----
+        // 用户要求：这两个模块的背景逻辑与通知卡片完全一致，
+        // 所以这里的设置项也和卡片分组一一对应。
+        [specs addObject:LNBGroup(@"附属按钮背景（删除 / 选项）",
+                                  @"锁屏通知底部的「删除」「选项」按钮模块，背景逻辑与通知卡片完全一致。\n默认开启并自动沿用卡片素材；也可以在这里单独选图/视频。")];
+        [specs addObject:LNBSwitch(self, @"按钮背景开关", @"suppEnabled")];
         [specs addObject:LNBButton(self, @"选择按钮图片", @selector(lnbPickSuppImage:), @"pickSuppImage")];
         [specs addObject:LNBButton(self, @"选择按钮视频", @selector(lnbPickSuppVideo:), @"pickSuppVideo")];
         [specs addObject:LNBSwitch(self, @"使用视频作为按钮背景", @"suppUseVideo")];
+        [specs addObject:LNBSwitch(self, @"按钮视频播放声音", @"suppVideoSound")];
         [specs addObject:LNBSlider(self, @"按钮背景不透明度", @"suppAlpha", 0.2, 1.0)];
         [specs addObject:LNBSwitch(self, @"暗色遮罩（提升文字可读性）", @"suppBlurOverlay")];
+        [specs addObject:LNBSwitch(self, @"强制模式（放宽按钮模块识别）", @"suppForceMode")];
 
         // ---- 3. 全局背景（附加玩法，默认关闭）----
         [specs addObject:LNBGroup(@"整块列表背景（附加功能）",
@@ -416,7 +420,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         [specs addObject:LNBSwitch(self, @"使用视频作为背景", @"globalUseVideo")];
         [specs addObject:LNBSlider(self, @"整块背景不透明度", @"globalAlpha", 0.2, 1.0)];
 
-        // ---- 4. 声音 ----
+        // ---- 3. 声音 ----
         [specs addObject:LNBGroup(@"声音",
                                   @"仅对「整块背景」的视频模式有效。背景视频默认静音；打开声音后若同时开启「与其他音频混音」，播放背景视频不会中断你正在听的音乐。")];
         [specs addObject:LNBSwitch(self, @"静音", @"videoMuted")];
@@ -486,8 +490,6 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 - (void)lnbPickGlobalVideo:(PSSpecifier *)spec { [self presentPickerForName:kBGGlobalVideo isVideo:YES]; }
 - (void)lnbPickCardImage:(PSSpecifier *)spec   { [self presentPickerForName:kBGCardImage   isVideo:NO]; }
 - (void)lnbPickCardVideo:(PSSpecifier *)spec   { [self presentPickerForName:kBGCardVideo   isVideo:YES]; }
-- (void)lnbPickSuppImage:(PSSpecifier *)spec   { [self presentPickerForName:kBGSuppImage   isVideo:NO]; }
-- (void)lnbPickSuppVideo:(PSSpecifier *)spec   { [self presentPickerForName:kBGSuppVideo   isVideo:YES]; }
 
 - (void)lnbConfirmClearAll:(PSSpecifier *)spec {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"确认清除"
