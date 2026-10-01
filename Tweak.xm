@@ -270,14 +270,32 @@ static NSString *LNBPathForResource(NSString *fileName) {
     return [kBGDirectory stringByAppendingPathComponent:fileName];
 }
 
-// 判断文件是否存在且非空
+// 判断文件是否存在且非空。
+// 【v1.3.3 加缓存】每轮 layout 每张卡片要查 4 个文件，设备日志实测入口被调
+// 上万次 —— 不加缓存就是几万次磁盘 IO，锁屏动画掉帧。缓存随配置 reload 清空，
+// 所以「刚选完图 → postReload → 缓存失效重查」的时效性不受影响。
+static NSMutableDictionary *sLNBFileExistsCache = nil;
+
 static BOOL LNBFileExists(NSString *path) {
     if (!path) return NO;
+    if (!sLNBFileExistsCache) sLNBFileExistsCache = [NSMutableDictionary dictionary];
+    NSNumber *cached = sLNBFileExistsCache[path];
+    if (cached) return cached.boolValue;
+
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
-    if (![fm fileExistsAtPath:path isDirectory:&isDir] || isDir) return NO;
-    NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
-    return ([attrs fileSize] > 0);
+    BOOL result = NO;
+    if ([fm fileExistsAtPath:path isDirectory:&isDir] && !isDir) {
+        NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+        result = ([attrs fileSize] > 0);
+    }
+    sLNBFileExistsCache[path] = @(result);
+    return result;
+}
+
+// 配置重载时清空文件存在性缓存（选完图/清完资源后调用）
+static void LNBInvalidateFileCache(void) {
+    [sLNBFileExistsCache removeAllObjects];
 }
 
 // 从视频首帧生成一张静态图（用于卡片级背景，卡片不做视频）
@@ -548,6 +566,9 @@ static void LNBEnsureGlobalBackground(UIView *candidateHost) {
     if (!prefs.enabled || !prefs.globalEnabled) {
         UIView *existing = [hostView viewWithTag:kGlobalBGViewTag];
         if (existing) [existing removeFromSuperview];
+        // 【v1.3.3】整块背景关闭后清掉残留的橙色诊断框 —— 之前不清，
+        // 橙框永远挂在列表容器上，看起来像"有东西把通知区域框住了"。
+        LNBDiagClearView(hostView);
         return;
     }
 
@@ -664,10 +685,21 @@ static void LNBApplyCardBackground(UIView *cellView) {
             (int)[LNBPrefs sharedInstance].enabled,
             (int)[LNBPrefs sharedInstance].cardEnabled);
 
-    // 【防双份】扫描入口与 hook 入口可能同时触发。若祖先链上已经挂了背景，
-    // 说明外层入口已处理过，这里跳过，避免同一条通知叠两份背景。
+    // 【防双份 v1.3.3 修复】扫描入口与 hook 入口可能同时触发，需要防重复挂载。
+    //
+    // 【重大 bug】旧写法 [p viewWithTag:] 是递归搜索整棵子树！第一张卡片挂上
+    // 背景后，第二张卡片做检查时，通过共同祖先的子树能"看到"兄弟卡片的背景
+    // —— 于是第二张及以后的所有通知全部被误跳过，永远挂不上背景。
+    // 这就是"只有一张卡有背景 / 其余全是灰底"的直接原因。
+    // 修复：只检查祖先的【直接子视图】，语义精确为"这条通知的宿主链上已挂"。
     for (UIView *p = cellView.superview; p; p = p.superview) {
-        if ([p viewWithTag:kCardBGViewTag]) return;
+        for (UIView *sub in p.subviews) {
+            if (sub.tag == kCardBGViewTag) {
+                LNBTLog(@"[卡片] 防双份跳过 root=%@ 祖先=%@ 直接子视图中已有背景",
+                        NSStringFromClass(cellView.class), NSStringFromClass(p.class));
+                return;
+            }
+        }
     }
 
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
@@ -710,7 +742,14 @@ static void LNBApplyCardBackground(UIView *cellView) {
         if (existing) [existing removeFromSuperview];
         if (existingDim) [existingDim removeFromSuperview];
         LNBSetCardMaterialsHidden(cellView, NO);
-        LNBTLog(@"[卡片] 无任何可用素材，跳过");
+        // 【v1.3.3】这个分支必须清诊断框：之前不清，红框会残留在卡片上，
+        // 看起来像"卡片被标红了但没背景"，误导排查方向。
+        LNBDiagClearTree(cellView);
+        // 【v1.3.3】打印每个素材的存在性，一眼看出缺什么
+        LNBTLog(@"[卡片] 无任何可用素材！card.jpg=%d card.mp4=%d global.jpg=%d global.mp4=%d ——— 请到设置里用「选择卡片图片」选图",
+                (int)hasCardImage, (int)hasCardVideo,
+                (int)LNBFileExists(LNBPathForResource(kBGGlobalImage)),
+                (int)LNBFileExists(LNBPathForResource(kBGGlobalVideo)));
         return;
     }
 
@@ -818,6 +857,8 @@ static void LNBScanAndApplyCards(UIView *root) {
 
 static void LNBReloadConfiguration(void) {
     [[LNBPrefs sharedInstance] reload];
+    // 【v1.3.3】素材可能刚被选/删，文件存在性缓存必须失效
+    LNBInvalidateFileCache();
     // 让所有已存在的背景视图立即刷新
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *window = nil;
