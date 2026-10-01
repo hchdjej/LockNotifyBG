@@ -410,6 +410,10 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 @property (nonatomic, strong) UIView *dimView;
 @property (nonatomic, strong) AVPlayer *player;
 @property (nonatomic, strong) AVPlayerLayer *playerLayer;
+// 【v1.4.13】重入保护标记：syncToHostIfNeeded 执行期间置 YES，
+//   防止「设置几何 → 触发 layoutSubviews → 又调 sync」的无限递归。
+//   这类保护是 v1.4.12 卡死事故的直接补救，必须保留。
+@property (nonatomic, assign) BOOL lnbSyncing;
 - (void)applyConfig:(LNBPrefs *)prefs;
 - (void)applyAudioConfig:(LNBPrefs *)prefs;
 - (void)teardownPlayerIfNeeded;
@@ -615,42 +619,41 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 //     不再只比尺寸，而是把"我自己的 transform 是否还是恒等"也纳入判断
 //     （因为 1.4.9 残留的逆矩阵必须被清掉），两者都对才 return。
 //
-// ── v1.4.12 ★★★ 第五次也是真正最后一次：改用【视觉尺寸 frame】+ 自己的逆变换 ──
+// ── v1.4.13 ★★★ 【紧急回退】frame + 逆矩阵方案导致手机卡死 ──
 //
-//   【用户给的参考视频是这个需求的正解】
-//     参考视频（9/27 录的，那会儿是 1.3.9）里：卡片展开变身时，卡片里的素材
-//     是【跟着卡片一起变大】的，屏幕四周、卡片间隙始终只有壁纸。
+//   【v1.4.12 为什么卡死 —— 这是本插件史上最严重的一次事故，必须记清楚】
+//     v1.4.12 我写了这套"看起来很美"的公式：
+//         bg.transform = Invert(cell.transform)
+//         bg.frame     = cell.frame
+//     它有一个致命的自相矛盾：
+//       · UIKit 里 frame 的 setter 会把传入矩形当作【变换后】的视觉矩形，
+//         反算出 center 存起来；
+//       · frame 的 getter 又用 center + bounds × transform 重新算回去。
+//     设了逆矩阵之后，"设进去的 frame" 和 "读出来的 frame" 永远差一截
+//     （实测 46.1 → 32.7，差 13 个点）。
+//     于是判据 CGRectEqualToRect(self.frame, hostFrameVis) 永远为假 →
+//     下面这段同步代码【每次调用都会真的执行】→ 而设置 frame/bounds/transform
+//     又会让 UIKit 标记"需要重新布局" → layoutSubviews 再来一遍 → 无限递归。
+//     叠加上 v1.4.12 新加的四个 setter hook，主线程被彻底锁死，
+//     表现就是用户说的「一加素材手机就卡死」。
 //
-//   【为什么 v1.4.11 的"bounds 天然跟随"还不够】
-//     v1.4.11 的模型是：背景是 cell 子视图 → 自动继承父层 transform → 视觉尺寸
-//     自动等于 cell 的视觉尺寸。这个模型【在"背景尺寸恰好等于 cell.bounds"时成立】。
-//     但有一条它没法覆盖：**父层 transform 的锚点不是背景中心**。
-//     展开动画里 cell 除了被缩放，还会被平移（绕着列表中心的锚点放大），
-//     子视图继承的是同一个矩阵，位置会跟着偏移；而背景只设了 center，
-//     没有跟随那部分平移 → 动画中间帧背景与卡片错开。
+//   【教训】凡是"设置值 → 读回值 → 比较是否相等"的收敛判据，
+//     绝对不能经过带变换的往返计算，否则浮点与语义双重不收敛。
 //
-//   【v1.4.12 的做法：反向求解】
-//     设背景在父层坐标系里的 frame 为 F。父层 transform 记为 T。
-//     背景在【屏幕/祖父坐标系】上的视觉矩形 = T ∘ F。
-//     我们要求：屏幕上的视觉矩形 ≡ host.frame（host 的视觉矩形）。
-//         T ∘ (自变换 ∘ 背景局部矩形) = host.frame
-//     取背景局部矩形 = (0,0,bw,bh) 且令自变换 = T⁻¹，则
-//         T ∘ T⁻¹ ∘ (背景) = 背景 = host.frame
-//     ⇒ 自变换取 T⁻¹，再把背景 frame 直接设成 host.frame，屏幕上就严丝合缝。
+// ── v1.4.13 回退方案：v1.4.11 的 bounds + center（transform 恒等）──
+//   背景是 host 的子视图，父层 transform 会【自动】作用于它，无需干预。
+//   只需保证两件事：
+//     ① 尺寸 = host.bounds.size（真实尺寸，不含 transform）
+//     ② center = host 中心
+//   判据全是直接比较（不经变换往返），必然收敛，不可能死循环。
 //
-//     ⚠️ 这和 1.4.9 的错法【差在尺寸取哪个】：
-//        1.4.9：bounds.size = host.FRAME.size（视觉尺寸） + 逆矩阵
-//               → 父层再缩放一次 = 双重缩放 = 反向放大 10 倍（盖住「选项」按钮）
-//        v1.4.12：FRAME        = host.FRAME（父坐标系里的矩形）
-//                bounds.size  = host.BOUNDS.size（真实尺寸，不含 transform）
-//                → 父层缩放的就是"原始尺寸"，缩放后正好等于视觉尺寸，只缩放一次
-//     一句话：**bounds 管尺寸，frame 管位置**，逆矩阵只负责把父层的缩放和
-//     平移在屏幕上抵消回来。
+//   【与 1.4.8 的差别】1.4.8 那句 `if (sizeOk) return;` 单独用时会把整段
+//   逻辑短路（因为 target 恒等于 host.bounds.size）。这里把 transform
+//   是否恒等也纳入判据，残留的旧矩阵（1.4.9/1.4.12 留下的）能清干净。
 //
-//   【为什么之前几轮都想不到"位置"这件事】
-//     因为折叠态 transform 恒等、展开态只看尺寸日志（bgVis 恒 308.77x66），
-//     从来没量过背景【中心点】在屏幕上的投影位置 —— 直到看了参考视频，
-//     才发现卡片放大时素材是一起放大的，而不是"原地换了一张更大的图"。
+//   【用户要的"展开时素材跟着放大"靠什么实现】
+//   靠父层的自动继承：cell 缩放 → 背景跟着缩放 → 视觉尺寸一致。
+//   再配合 cell 侧四个 setter hook 逐帧叫醒背景，中间帧也不会掉队。
 //
 // 【范围限定】只处理通知卡片（NCNotificationListCell）。
 - (void)syncToHostIfNeeded {
@@ -659,38 +662,37 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
     NSString *hostCls = NSStringFromClass(host.class);
     if (![hostCls isEqualToString:@"NCNotificationListCell"]) return;
 
-    // 目标视觉矩形 = 宿主的 frame（父坐标系里含 transform 的矩形）
-    CGRect hostFrameVis = host.frame;
-    if (hostFrameVis.size.width < 1.0 || hostFrameVis.size.height < 1.0) return;
-    // 目标真实尺寸 = 宿主的 bounds（不含 transform）
-    CGSize hostRealSize = host.bounds.size;
-    if (hostRealSize.width < 1.0 || hostRealSize.height < 1.0) {
-        hostRealSize = hostFrameVis.size;
-    }
+    // 真实尺寸（不含 transform）—— 父层 transform 会自然作用于它
+    CGSize target = host.bounds.size;
+    if (target.width < 1.0 || target.height < 1.0) target = host.frame.size;
+    if (target.width < 1.0 || target.height < 1.0) return;
 
-    CGAffineTransform wantTf = CGAffineTransformInvert(host.transform);
+    CGPoint wantCenter = CGPointMake(CGRectGetMidX(host.bounds),
+                                     CGRectGetMidY(host.bounds));
 
-    BOOL sizeOk = CGSizeEqualToSize(self.bounds.size, hostRealSize);
-    BOOL frameOk = CGRectEqualToRect(self.frame, hostFrameVis);
-    // 【关键】自变换是否已等于父层 transform 的逆。残留的旧矩阵（含 1.4.9 的
-    // 逆矩阵）必须清掉，所以每次都要比。
-    BOOL tfOk = (self.transform.a == wantTf.a && self.transform.b == wantTf.b &&
-                 self.transform.c == wantTf.c && self.transform.d == wantTf.d &&
-                 self.transform.tx == wantTf.tx && self.transform.ty == wantTf.ty);
-    if (sizeOk && frameOk && tfOk) return;   // 三项全对才跳过
+    BOOL sizeOk = CGSizeEqualToSize(self.bounds.size, target);
+    // 【关键】必须把"我的 transform 是否还是恒等"纳入判据 ——
+    // 1.4.9 / 1.4.12 留下的逆矩阵必须被清掉，否则会一直反向缩放。
+    BOOL tfOk = CGAffineTransformIsIdentity(self.transform);
+    // center 用容差比较即可（这里是父坐标系里的直接值，不经变换往返）
+    BOOL centerOk = (fabs(self.center.x - wantCenter.x) < 0.01 &&
+                     fabs(self.center.y - wantCenter.y) < 0.01);
+    if (sizeOk && tfOk && centerOk) return;   // 三项全对才跳过（必然收敛）
 
     self.autoresizingMask = UIViewAutoresizingNone;
     [UIView performWithoutAnimation:^{
-        // ① 真实尺寸（不含 transform）—— 父层 transform 作用于它，只缩放一次
+        // ① 真实尺寸（不含 transform）
         CGRect b = self.bounds;
-        b.size = hostRealSize;
+        b.size = target;
         self.bounds = b;
-        // ② 自变换 = 父层 transform 的逆 → 屏幕上抵消父层的缩放与平移
-        self.transform = wantTf;
-        // ③ 【最后设 frame】frame 是 bounds/center/transform 的派生量，
-        //    前面的 bounds/transform 都改完后，这里直接把父坐标系矩形对齐，
-        //    位置一次到位（先设 center 会被 transform 干扰，故弃用 center 写法）。
-        self.frame = hostFrameVis;
+        // ② 确保没有残留的自我 transform
+        //    ⚠️ 绝不能设 Invert(host.transform)：父层 transform 是渲染时的继承，
+        //    子视图再叠一个逆矩阵 = 反向放大（1.4.9 的 bug）。
+        if (!CGAffineTransformIsIdentity(self.transform)) {
+            self.transform = CGAffineTransformIdentity;
+        }
+        // ③ center 对齐 host 中心（host.bounds.origin 恒为 0，844/844 实证）
+        self.center = wantCenter;
     }];
     [self setNeedsLayout];
 }
@@ -707,8 +709,19 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 //   setFrame:/setBounds:/setCenter:/setTransform: 一旦被调用，就通知背景：
 //   "宿主几何变了，你再算一遍"。syncToHostIfNeeded 里带了三项判据，
 //   真的没变化时会直接 return，不会产生多余开销。
+// 【⚠️ v1.4.13 必加的重入保护 —— v1.4.12 卡死的第二重隐患】
+//   syncToHostIfNeeded 内部会设置 self.bounds / self.center，
+//   这会让 UIKit 标记"需要重新布局" → 稍后回调 self.layoutSubviews
+//   → 而 layoutSubviews 第一件事又调 syncToHostIfNeeded。
+//   正常情况判据会收敛（v1.4.13 的判据全是直接比较、不经变换往返），
+//   但只要出现任何意料之外的抖动，就会变成【无限递归】把主线程锁死。
+//   加一个"正在同步中"的内存标记：递归进来时直接返回。
+//   这类保护在 hook 系统视图时是必须的 —— 别指望判据一定完美。
 - (void)notifyHostGeometryChanged {
+    if (self.lnbSyncing) return;   // 正在同步中，直接返回，物理杜绝递归
+    self.lnbSyncing = YES;
     [self syncToHostIfNeeded];
+    self.lnbSyncing = NO;
 }
 
 - (void)dealloc {
@@ -1188,28 +1201,29 @@ static void LNBApplyCardBackground(UIView *cellView) {
     //   判断恒为"相等" → 每次都 return，自跟踪代码从没执行过。
     //   所以问题不在"跟 bounds 还是跟 frame"，而在那句 return 写错了。
     //
-    // ── v1.4.12 最终几何对齐公式（背景 / 遮罩共用一套）──
-    //   目标视觉矩形 = cellView.frame        （父坐标系里含 transform 的矩形）
-    //   自变换       = cellView.transform 的逆（在屏幕上抵消父层缩放与平移）
-    //   bounds.size  = cellView.bounds.size  （真实尺寸，父层只缩放它一次）
-    //   最后设 frame = 目标视觉矩形
+    // ── v1.4.13 【回退 v1.4.12 的 frame + 逆矩阵方案】──
+    //   v1.4.12 的 `bg.transform = Invert(cell.transform); bg.frame = cell.frame`
+    //   导致手机卡死（详见 syncToHostIfNeeded 上方的完整事故复盘）：
+    //   设了逆矩阵后，"设进去的 frame" 与 "读出来的 frame" 永远不相等，
+    //   判据不收敛 → 反复设置 → 触发 layoutSubviews → 无限递归。
     //
-    //   ⚠️ 与 1.4.9 的关键差异：尺寸取 bounds 而【不是】取 frame。
-    //      1.4.9 取 frame（已含缩放）再让父层缩放一次 = 双重缩放 = 反向放大 10 倍。
+    //   正确做法（v1.4.11 已验证可用）：bounds 管尺寸、center 管位置、
+    //   自己的 transform 保持恒等，父层 transform 自动继承。
     {
-        CGRect visRect = cellView.frame;
-        CGSize realSize = cellView.bounds.size;
-        if (realSize.width < 1.0 || realSize.height < 1.0) realSize = visRect.size;
-        if (visRect.size.width >= 1.0 && visRect.size.height >= 1.0 &&
-            realSize.width >= 1.0 && realSize.height >= 1.0) {
-            CGAffineTransform wantTf = CGAffineTransformInvert(cellView.transform);
+        CGSize target = cellView.bounds.size;
+        if (target.width < 1.0 || target.height < 1.0) target = cellView.frame.size;
+        if (target.width >= 1.0 && target.height >= 1.0) {
+            CGPoint wantCenter = CGPointMake(CGRectGetMidX(cellView.bounds),
+                                             CGRectGetMidY(cellView.bounds));
             bg.autoresizingMask = UIViewAutoresizingNone;
             [UIView performWithoutAnimation:^{
                 CGRect b = bg.bounds;
-                b.size = realSize;
+                b.size = target;
                 bg.bounds = b;
-                bg.transform = wantTf;
-                bg.frame = visRect;
+                if (!CGAffineTransformIsIdentity(bg.transform)) {
+                    bg.transform = CGAffineTransformIdentity;
+                }
+                bg.center = wantCenter;
             }];
         }
     }
@@ -1275,22 +1289,22 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [cellView addSubview:dim];
     }
     [cellView insertSubview:dim aboveSubview:bg];
-    // 【v1.4.12】与 bg 完全同一套几何公式（视觉矩形 + 逆变换 + 真实尺寸），
-    //   保证遮罩和背景在任何动画帧都严丝合缝地重合。
+    // 【v1.4.13】与 bg 完全同一套（回退到 bounds + center + transform 恒等）。
     {
-        CGRect dvisRect = cellView.frame;
-        CGSize drealSize = cellView.bounds.size;
-        if (drealSize.width < 1.0 || drealSize.height < 1.0) drealSize = dvisRect.size;
-        if (dvisRect.size.width >= 1.0 && dvisRect.size.height >= 1.0 &&
-            drealSize.width >= 1.0 && drealSize.height >= 1.0) {
-            CGAffineTransform dwantTf = CGAffineTransformInvert(cellView.transform);
+        CGSize dtarget = cellView.bounds.size;
+        if (dtarget.width < 1.0 || dtarget.height < 1.0) dtarget = cellView.frame.size;
+        if (dtarget.width >= 1.0 && dtarget.height >= 1.0) {
+            CGPoint dwantCenter = CGPointMake(CGRectGetMidX(cellView.bounds),
+                                              CGRectGetMidY(cellView.bounds));
             dim.autoresizingMask = UIViewAutoresizingNone;
             [UIView performWithoutAnimation:^{
                 CGRect db = dim.bounds;
-                db.size = drealSize;
+                db.size = dtarget;
                 dim.bounds = db;
-                dim.transform = dwantTf;
-                dim.frame = dvisRect;
+                if (!CGAffineTransformIsIdentity(dim.transform)) {
+                    dim.transform = CGAffineTransformIdentity;
+                }
+                dim.center = dwantCenter;
             }];
         }
     }
@@ -1763,8 +1777,24 @@ static void LNBReloadConfiguration(void) {
 // 【为什么用 setNeedsLayout 而不是直接同步算】
 //   只是打标记，同一轮 runloop 内多次调用会被合并；
 //   真正干活的是各视图自己的 layoutSubviews → syncToHostIfNeeded。
+//
+// 【v1.4.13 加时间闸门：每帧最多放行一次】
+//   viewWithTag: 是递归遍历整棵子树的操作，展开动画每帧十几次调用
+//   在锁屏上是可观的主线程负担（v1.4.12 卡死的一个诱因）。
+//   这里用 CACurrentMediaTime 做闸门：间隔小于 1/120 秒的调用直接跳过。
+//   代价最多是 8ms 的延迟（肉眼不可见），收益是主线程负载降一个量级。
+//
+//   【为什么跳过是安全的】cell 的 layoutSubviews 里还有一次兜底同步，
+//   最坏也只错过动画中间的一帧，下一帧立刻补上，不会"永远停在旧位置"。
 static void LNBSyncBGGeometry(UIView *cell) {
     if (!cell) return;
+
+    // ── 时间闸门 ──
+    static CFTimeInterval sLastSync = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - sLastSync < (1.0 / 120.0)) return;   // 同一帧内只放行一次
+    sLastSync = now;
+
     UIView *bg = [cell viewWithTag:kCardBGViewTag];
     if ([bg isKindOfClass:[LNBGlobalBackgroundView class]]) {
         [(LNBGlobalBackgroundView *)bg notifyHostGeometryChanged];
@@ -1828,6 +1858,16 @@ static void LNBDumpCellHierarchyIfNeeded(UIView *cell);
 //   frame setter 会连带改 center+bounds，但在 objc 消息转发下
 //   【不会】再走一遍 setBounds:/setCenter:，所以只 hook 一个是不够的。
 //   四个都 hook，用 setNeedsLayout 做合并去重，避免重复计算。
+
+// 【⚠️ v1.4.13 性能约束 —— 这是 v1.4.12 卡死的诱因之一】
+//   v1.4.12 把 LNBSyncBGGeometry 直接接在四个 setter 上，展开动画里
+//   每帧会调用十几次，而它内部要做 viewWithTag:（递归遍历 cell 整棵子树，
+//   几十个视图）。在锁屏这种主线程本就紧张的场景下是实打实的负担。
+//   v1.4.13 的应对有两层：
+//     ① LNBSyncBGGeometry 内部加"每帧只放行一次"的时间闸门；
+//     ② 真正的几何写入具备收敛性（bounds + center，不经变换往返），
+//        配合重入保护，从机制上不可能形成递归。
+//   宁可少同步一帧，也绝不能让锁屏卡顿 —— 这是 v1.4.12 事故的教训。
 - (void)setFrame:(CGRect)frame {
     %orig(frame);
     LNBSyncBGGeometry((UIView *)self);
