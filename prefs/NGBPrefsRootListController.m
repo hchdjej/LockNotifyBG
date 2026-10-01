@@ -402,6 +402,16 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         [status setProperty:@NO forKey:@"enabled"];
         [specs addObject:status];
 
+        PSSpecifier *ver = [PSSpecifier preferenceSpecifierNamed:@"插件版本"
+                                                          target:self
+                                                             set:nil
+                                                             get:@selector(lnbVersionDetail:)
+                                                          detail:nil
+                                                            cell:PSStaticTextCell
+                                                            edit:nil];
+        [ver setProperty:@NO forKey:@"enabled"];
+        [specs addObject:ver];
+
         [specs addObject:LNBButton(self, @"清除所有背景资源", @selector(lnbConfirmClearAll:), @"clearAll")];
 
         _specifiers = specs;
@@ -419,6 +429,12 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
     if ([LNBFileManager fileExistsNamed:kBGGlobalVideo]) [parts addObject:@"视频"];
     if ([LNBFileManager fileExistsNamed:kBGCardImage])   [parts addObject:@"卡片图"];
     return parts.count ? [parts componentsJoinedByString:@" / "] : @"尚无资源";
+}
+
+- (id)lnbVersionDetail:(PSSpecifier *)specifier {
+    NSString *v = [[NSBundle bundleForClass:[self class]]
+                   objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+    return [NSString stringWithFormat:@"当前安装 v%@ — 卡片图务必用「选择卡片图片」选", v ?: @"?"];
 }
 
 #pragma mark 点击处理（buttonAction 主路径 + didSelect 兜底）

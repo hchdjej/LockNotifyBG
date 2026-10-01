@@ -35,6 +35,69 @@ static NSString *const kReloadNotification = @"com.hchdjej.locknotifybg/reload";
 // 背景容器视图的复用 tag，用于存在性检查，避免重复插入
 static const NSInteger kGlobalBGViewTag = 0x1F0B6;
 
+#pragma mark - 诊断日志（tweak 侧）
+
+// 写 /var/mobile/Library/LockNotifyBG/tweak.log，Filza 可直接查看。
+// 用于定位真机上通知卡片的真实视图层级。
+static void LNBTLog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+
+    NSString *dir = @"/var/mobile/Library/LockNotifyBG";
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *path = [dir stringByAppendingPathComponent:@"tweak.log"];
+    static NSDateFormatter *df = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"HH:mm:ss.SSS";
+    });
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
+
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } else {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    }
+}
+
+// 递归 dump 视图树：类名 / frame / hidden / alpha / backgroundColor
+static void LNBLogViewTree(UIView *v, NSInteger depth, NSMutableString *out) {
+    if (!v || depth > 9) return;
+    NSMutableString *indent = [NSMutableString string];
+    for (NSInteger i = 0; i < depth; i++) [indent appendString:@"  "];
+
+    NSString *bg = @"nil";
+    if (v.backgroundColor) {
+        CGFloat r, g, b, a;
+        [v.backgroundColor getRed:&r green:&g blue:&b alpha:&a];
+        bg = [NSString stringWithFormat:@"(%0.2f,%0.2f,%0.2f,%.2f)", r, g, b, a];
+    }
+    [out appendFormat:@"%@%@ frame=%@ hidden=%d alpha=%.2f tag=%ld bg=%@\n",
+        indent, NSStringFromClass(v.class),
+        NSStringFromCGRect(v.frame), v.hidden, v.alpha, (long)v.tag, bg];
+
+    for (UIView *sub in v.subviews) LNBLogViewTree(sub, depth + 1, out);
+}
+
+// 每个 cell 只 dump 一次完整视图树（用关联对象标记）
+static const void *kLNBDumpedTree = &kLNBDumpedTree;
+static void LNBLogCardTreeOnce(UIView *cellView, NSString *reason) {
+    if (objc_getAssociatedObject(cellView, kLNBDumpedTree)) return;
+    objc_setAssociatedObject(cellView, kLNBDumpedTree, @YES, OBJC_ASSOCIATION_RETAIN);
+
+    NSMutableString *out = [NSMutableString stringWithFormat:@"--- 卡片视图树 (%@) 根=%@ ---\n",
+                            reason, NSStringFromClass(cellView.class)];
+    LNBLogViewTree(cellView, 0, out);
+    LNBTLog(@"%@", out);
+}
+
 #pragma mark - 配置管理
 
 @interface LNBPrefs : NSObject
@@ -431,6 +494,7 @@ static const void *kLNBHiddenByTweak = &kLNBHiddenByTweak;
 // 位置一像素都不会错；白底藏掉后图清晰可见；实色文字浮在最上层不受影响。
 static void LNBSetCardMaterialsHidden(UIView *root, BOOL hidden) {
     NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    NSInteger touched = 0;
     while (stack.count > 0) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
@@ -439,6 +503,7 @@ static void LNBSetCardMaterialsHidden(UIView *root, BOOL hidden) {
                 if (!v.hidden) {
                     objc_setAssociatedObject(v, kLNBHiddenByTweak, @YES, OBJC_ASSOCIATION_RETAIN);
                     v.hidden = YES;
+                    touched++;
                 }
             } else if (objc_getAssociatedObject(v, kLNBHiddenByTweak)) {
                 v.hidden = NO;
@@ -446,6 +511,10 @@ static void LNBSetCardMaterialsHidden(UIView *root, BOOL hidden) {
             }
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
+    }
+    if (hidden && touched > 0) {
+        LNBTLog(@"[卡片] 已隐藏 %ld 个毛玻璃材质视图（root=%@）",
+                (long)touched, NSStringFromClass(root.class));
     }
 }
 
@@ -461,6 +530,12 @@ static void LNBSetCardMaterialsHidden(UIView *root, BOOL hidden) {
 static void LNBApplyCardBackground(UIView *cellView) {
     if (!cellView) return;
 
+    // 【诊断】每次调用都记一条精简日志；视图树只在每个 cell 第一次时完整 dump
+    LNBTLog(@"[卡片] 入口 root=%@ enabled=%d cardEnabled=%d",
+            NSStringFromClass(cellView.class),
+            [LNBPrefs sharedInstance].enabled,
+            [LNBPrefs sharedInstance].cardEnabled);
+
     // 【防双份】NCNotificationListCell 和它内部的 NCNotificationShortLookView
     // 都挂了 hook。若祖先链上已经挂了背景图，说明更外层的入口已处理过，
     // 这里直接跳过，避免同一条通知叠两张图。
@@ -469,6 +544,8 @@ static void LNBApplyCardBackground(UIView *cellView) {
     }
 
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    LNBLogCardTreeOnce(cellView, @"首次处理");
+
     UIView *existing = [cellView viewWithTag:kCardBGViewTag];
     UIView *existingDim = [cellView viewWithTag:kCardDimViewTag];
 
@@ -477,6 +554,7 @@ static void LNBApplyCardBackground(UIView *cellView) {
         if (existing) [existing removeFromSuperview];
         if (existingDim) [existingDim removeFromSuperview];
         LNBSetCardMaterialsHidden(cellView, NO);
+        LNBTLog(@"[卡片] 开关关闭，已还原");
         return;
     }
 
@@ -492,6 +570,7 @@ static void LNBApplyCardBackground(UIView *cellView) {
         if (existing) [existing removeFromSuperview];
         if (existingDim) [existingDim removeFromSuperview];
         LNBSetCardMaterialsHidden(cellView, NO);
+        LNBTLog(@"[卡片] 无可用图片（card.jpg/global.jpg 都不存在），跳过");
         return;
     }
 
@@ -519,6 +598,10 @@ static void LNBApplyCardBackground(UIView *cellView) {
     bg.frame = cellView.bounds;
     bg.image = cardImage;
     bg.alpha = 1.0;
+    LNBTLog(@"[卡片] 图已挂载 superview=%@ frame=%@ 尺寸=%0.0fx%0.0f",
+            NSStringFromClass(bg.superview.class),
+            NSStringFromCGRect(bg.frame),
+            bg.frame.size.width, bg.frame.height);
 
     // 3) 可读性遮罩（图上、文字下）
     UIView *dim = [cellView viewWithTag:kCardDimViewTag];
