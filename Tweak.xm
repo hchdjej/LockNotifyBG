@@ -1050,7 +1050,11 @@ static NSString *LNBGatherText(UIView *v) {
                     if ([val isKindOfClass:[NSString class]] && [val length]) {
                         [acc appendFormat:@" %@", val];
                     }
-                } @catch (__unused NSException *e) {}
+                } @catch (NSException *e) {
+                    // 【v1.3.9 注意】这里不能写 __unused —— 该宏在 @catch 位置
+                    // 会被 clang 当成类型名，报 unknown type name '__unused'。
+                    (void)e;
+                }
             }
         }
         for (UIView *sub in cur.subviews) [stack addObject:sub];
