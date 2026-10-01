@@ -490,6 +490,8 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 - (void)lnbPickGlobalVideo:(PSSpecifier *)spec { [self presentPickerForName:kBGGlobalVideo isVideo:YES]; }
 - (void)lnbPickCardImage:(PSSpecifier *)spec   { [self presentPickerForName:kBGCardImage   isVideo:NO]; }
 - (void)lnbPickCardVideo:(PSSpecifier *)spec   { [self presentPickerForName:kBGCardVideo   isVideo:YES]; }
+- (void)lnbPickSuppImage:(PSSpecifier *)spec   { [self presentPickerForName:kBGSuppImage   isVideo:NO]; }
+- (void)lnbPickSuppVideo:(PSSpecifier *)spec   { [self presentPickerForName:kBGSuppVideo   isVideo:YES]; }
 
 - (void)lnbConfirmClearAll:(PSSpecifier *)spec {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"确认清除"
