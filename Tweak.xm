@@ -366,6 +366,7 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 - (void)applyConfig:(LNBPrefs *)prefs;
 - (void)applyAudioConfig:(LNBPrefs *)prefs;
 - (void)teardownPlayerIfNeeded;
+- (void)syncToHostIfNeeded;   // 【v1.4.8】自跟踪宿主尺寸（卡片场景）
 @end
 
 @implementation LNBGlobalBackgroundView
@@ -517,6 +518,11 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 }
 
 - (void)layoutSubviews {
+    // 【v1.4.8】第一件事：自跟踪宿主尺寸。
+    // 放在最前面，保证 _imageView/_dimView 在下面按 self.bounds 对齐时，
+    // self.bounds 已经是最新的 —— 这样内部图层和背景容器永远是同一帧的尺寸。
+    [self syncToHostIfNeeded];
+
     [super layoutSubviews];
 
     // 【v1.4.7】内部图层与容器严格同尺寸。
@@ -535,6 +541,47 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
     if (self.playerLayer) {
         self.playerLayer.frame = self.bounds;
     }
+}
+
+// 【v1.4.8 ★★★ 跟随的根本保证】
+// 背景容器自己的尺寸 = 宿主视图的 bounds 尺寸（自跟踪）。
+//
+// 【为什么必须在上一层的 layoutSubviews 里做，而不是只在 LNBApplyCardBackground 里做】
+//   LNBApplyCardBackground 只在 ① cell 的 layoutSubviews ② 列表扫描 时被调用。
+//   而 cell 滑动 / 折叠 / 展开时，触发的是【中间父容器】的 layout，
+//   如果系统这几帧没回调 cell 的 layoutSubviews，背景就停在上一帧的尺寸上
+//   —— 用户看到的就是「背景固定不动、和卡片脱节」。
+//
+//   把自跟踪放在这里，等于给背景装了个「自动跟随」：只要它被 layout
+//   （父层尺寸变化必然传导下来），就会立刻重新贴合宿主 bounds。
+//
+// 【为什么用 bounds 而不是 frame】
+//   背景是宿主的子视图，渲染时自动继承宿主的 transform。若用宿主的
+//   frame（已含 transform 缩放）当尺寸，会再被乘一次 → 双重缩放。
+//   必须用 bounds（transform 作用前的真实尺寸），让 transform 只作用一次。
+//
+// 【范围限定】只有当宿主是通知卡片（NCNotificationListCell）时才自跟踪，
+//   全局背景那个宿主是整块列表，尺寸策略不同，不在此处干预。
+- (void)syncToHostIfNeeded {
+    UIView *host = self.superview;
+    if (!host) return;
+    NSString *hostCls = NSStringFromClass(host.class);
+    if (![hostCls isEqualToString:@"NCNotificationListCell"]) return;
+
+    CGSize target = host.bounds.size;
+    if (target.width < 1.0 || target.height < 1.0) return;
+
+    if (CGSizeEqualToSize(self.bounds.size, target)) return;
+
+    self.autoresizingMask = UIViewAutoresizingNone;
+    [UIView performWithoutAnimation:^{
+        CGRect b = self.bounds;
+        b.size = target;
+        self.bounds = b;
+        self.center = CGPointMake(CGRectGetMidX(host.bounds),
+                                  CGRectGetMidY(host.bounds));
+    }];
+    [self setNeedsLayout];
 }
 
 - (void)dealloc {
@@ -879,9 +926,10 @@ static void LNBApplyCardBackground(UIView *cellView) {
     LNBLogCardTreeOnce(cellView, tagName);
 
     // 【设备日志实证】必须等卡片完成布局再挂。
-    // 【v1.4.7】零尺寸检查同时看 frame 和 bounds —— 只看 bounds 会漏掉
-    // 「bounds 有值但 frame 还是 0」的早期态，挂上去就是错的。
-    if (cellView.frame.size.width < 1.0 || cellView.frame.size.height < 1.0) {
+    // 【v1.4.8】改回只看 bounds —— 因为「真实尺寸」的定义就是 bounds。
+    // 1.4.7 用 frame 判断在 transform 缩放时会把「视觉尺寸」当真实尺寸，
+    // 视觉尺寸被缩到 0.x 倍时会误判为「太小」，这里统一到 bounds。
+    if (cellView.bounds.size.width < 1.0 || cellView.bounds.size.height < 1.0) {
         LNBDiagClearView(cellView);
         return;
     }
@@ -954,47 +1002,47 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [cellView insertSubview:bg atIndex:0];
     }
 
-    // 【v1.4.7 ★★ 真正的原因：cell.bounds 在动画中【恒定不变】】
+    // 【v1.4.8 ★★★ 定论：必须用 bounds，不能用 frame —— 因为 transform】
     //
-    // 用户第二次抓日志（186074 行），我加了 bgFrame/cellFrame/cellBounds
-    // 三组对照，终于拿到决定性数据：
+    // 第三次抓日志（193175 行），把 frame / bounds 的比值算出来之后，
+    // 规律干净得可怕：
     //
-    //   稳定态： cellFrame={{46.04, 0},  {308.93, 66}}  cellBounds={{0,0},{308.93, 66}}
-    //   动画中： cellFrame={{55.30, 0},  {290.39, 74}}  cellBounds={{0,0},{308.93, 66}}  ← !
-    //   动画中： cellFrame={{64.57, 11.6},{271.86, 70.4}} cellBounds={{0,0},{308.93, 66}} ← !
+    //   frame/bounds 比值统计：       次数
+    //     1.000                     354   ← 无缩放（稳定态）
+    //     0.940                      ~100
+    //     0.880                      ~100
+    //     0.770                      ~200  ← 明显缩小
     //
-    // 配对统计（442 条）：
-    //     frameH=66 w=308.77  |  boundH=66 w=308.77   ← 稳定态一致
-    //     frameH=74 w=290.24  |  boundH=80 w=308.77   ← 动画中不一致
-    //     frameH=70.4 w=271.72|  boundH=80 w=308.77   ← 动画中不一致
+    //   而且每一行的【宽高比值完全相同】（0.770/0.770、0.880/0.880）——
+    //   这是典型的**等比 transform 缩放**。
     //
-    // 结论：**动画期间 cell.frame 在变（308→290→271 缩小、y 从 0→11.6 位移），
-    //       而 cell.bounds 始终是 308.77x66/80 一动不动。**
+    //   cellFrame       = transform 作用【后】的视觉尺寸（331 x 106）
+    //   cellBounds      = transform 作用【前】的真实尺寸（430 x 138）
+    //   验证：331 / 430 = 0.770，106 / 138 = 0.770  ✓ 完全吻合
     //
-    // 所以我 1.4.6 写的 `bg.bounds.size = cellView.bounds.size` 永远得到
-    // 同一个值 —— 背景就永远停在固定的 308.77 位置，而卡片在收缩、在移动。
-    // 这正是用户说的「背景不跟着模块走，一直固定一个位置」。
+    // 【为什么 1.4.7 跟 frame 是错的】
+    //   背景 bg 是 cell 的【子视图】，渲染时会自动继承父层的 transform。
+    //   如果我把 bg 尺寸设成 cell.frame（已经含了 0.77 缩放），
+    //   那么它显示时会被父层再乘一次 0.77 → 净缩放 0.77 × 0.77 = 0.59。
+    //   等于缩放算了两遍，背景永远比卡片小、位置也对不上 ——
+    //   这正是用户说的「还是没有跟着变位置」。
     //
-    // 【修复】改为跟踪 cellView.frame（父坐标系，动画中会变）：
-    //   背景是 cell 的子视图，要让它在【视觉上】覆盖住卡片，
-    //   就要用 cell.frame 的尺寸（卡片真实可视几何），而不是 bounds。
-    //   同时把 center 对齐到 cell 可视区的中心（用 bounds 的 origin+size 算）。
+    // 【正确做法】bg 尺寸设成 cell.bounds.size（不含 transform 的真实尺寸），
+    //   父层的 transform 会自然作用于它，尺寸与卡片严丝合缝。
+    //   同时日志证明 cellBounds.origin 恒为 (0,0)（844/844 次），
+    //   所以 center 直接取 bounds 的中点即可。
     //
-    // 【顺带】1.4.4 的 `layer.animationKeys` 判断被证明是无效的 ——
-    //   442/442 条日志 animating=0，iOS 用的是 UIView block 动画，
-    //   不产生 CA animationKeys。所以动画冻结策略彻底移除，
-    //   改为「每次进来都按最新 cell.frame 同步」，跟上动画的每一帧。
+    // 【顺带】1.4.4 的 layer.animationKeys 判断是无效代码
+    //   （442/442 条 animating=0，iOS 用 UIView block 动画，不产生
+    //    CA animationKeys），已彻底移除，改为逐帧同步。
     bg.autoresizingMask = UIViewAutoresizingNone;
     [UIView performWithoutAnimation:^{
-        // ① 尺寸取 cell.frame.size —— 动画中它会跟着卡片真实收缩
-        CGSize target = cellView.frame.size;
-        if (target.width < 1.0 || target.height < 1.0) {
-            target = cellView.bounds.size;   // 兜底
-        }
+        // 尺寸取 cell.bounds.size —— 不含 transform 的真实尺寸，
+        // 让父层的 transform 自然作用于 bg（绝不能取 frame，那会双重缩放）
         CGRect b = bg.bounds;
-        b.size = target;
+        b.size = cellView.bounds.size;
         bg.bounds = b;
-        // ② 中心对齐到 cell 可视区中心（cell 自身坐标系）
+        // 中心对齐到 cell 可视区中心（cellBounds.origin 恒为 0）
         bg.center = CGPointMake(CGRectGetMidX(cellView.bounds),
                                 CGRectGetMidY(cellView.bounds));
     }];
@@ -1003,13 +1051,16 @@ static void LNBApplyCardBackground(UIView *cellView) {
     // 裁剪保证无论哪种情况都不会溢出卡片轮廓之外。
     cellView.clipsToBounds = YES;
 
-    // 【v1.4.7】日志保留 frame/bounds 双值对照 —— 这是本轮破案的关键字段：
-    //   cellFrame  动画中会变（308→290→271），是背景该跟的目标
-    //   cellBounds 恒定不变，正是旧代码跟错了的对象
-    LNBTLog(@"[%@] 已同步 superview=%@ bgFrame=%@ cellFrame=%@ cellBounds=%@ 素材=%@",
+    // 【v1.4.8】日志加 bgBounds —— 这才是判断「有没有双重缩放」的直接依据：
+    //   bgBounds 应恒等于 cellBounds（真实尺寸一致），
+    //   bgFrame  应恒等于 cellFrame（父层 transform 作用下视觉尺寸也一致）。
+    //   若 bgBounds==cellBounds 而 bgFrame!=cellFrame，说明是 transform 差异；
+    //   若 bgBounds!=cellBounds，说明同步逻辑本身没跑到。
+    LNBTLog(@"[%@] 已同步 superview=%@ bgFrame=%@ bgBounds=%@ cellFrame=%@ cellBounds=%@ 素材=%@",
             tagName,
             NSStringFromClass(bg.superview.class),
             NSStringFromCGRect(bg.frame),
+            NSStringFromCGRect(bg.bounds),
             NSStringFromCGRect(cellView.frame),
             NSStringFromCGRect(cellView.bounds),
             bg.preferVideo ? vidName : imgName);
@@ -1030,13 +1081,11 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [cellView addSubview:dim];
     }
     [cellView insertSubview:dim aboveSubview:bg];
-    // 【v1.4.7】与 bg 完全同一套：尺寸取 cell.frame.size（动画中会变）
+    // 【v1.4.8】与 bg 完全同一套：用 bounds（不含 transform 的真实尺寸）
     dim.autoresizingMask = UIViewAutoresizingNone;
     [UIView performWithoutAnimation:^{
-        CGSize target = cellView.frame.size;
-        if (target.width < 1.0 || target.height < 1.0) target = cellView.bounds.size;
         CGRect db = dim.bounds;
-        db.size = target;
+        db.size = cellView.bounds.size;
         dim.bounds = db;
         dim.center = CGPointMake(CGRectGetMidX(cellView.bounds),
                                  CGRectGetMidY(cellView.bounds));
@@ -1061,6 +1110,45 @@ static void LNBApplyCardBackground(UIView *cellView) {
 }
 
 #pragma mark - 按钮（选项 / 清除）独立铺图 【v1.3.8】
+
+// 【v1.4.8 ★★★】自动跟随宿主的图片视图。
+//
+// 【为什么需要这个子类】
+//   1.4.7 及之前，按钮图是普通 UIImageView，尺寸只在 LNBApplyButtonBackground
+//   被调用时同步一次。而按钮在「通知折叠 / 展开 / 列表滚动」时，其 layout
+//   由系统驱动，中间若干帧不一定回调到我们的扫描逻辑 → 图就停在旧尺寸上，
+//   表现为用户说的「不跟着按钮走」。
+//
+//   这里做成一个会自跟踪的子类：每次自己 layoutSubviews 时，先把自己
+//   的尺寸重新对齐到 superview（按钮）的 bounds，再走正常渲染。
+//   这样只要按钮动一帧，我们就在同一帧跟上，不依赖任何外部调度。
+//
+// 【为什么用 bounds 而不是 frame】
+//   图片是按钮的子视图，渲染时自动继承按钮的 transform。用按钮的 frame
+//   （已含 transform 缩放）当尺寸，会被再乘一次 → 双重缩放。
+@interface LNBFollowImageView : UIImageView
+@end
+
+@implementation LNBFollowImageView
+
+- (void)layoutSubviews {
+    UIView *host = self.superview;
+    if (host) {
+        CGSize target = host.bounds.size;
+        if (target.width >= 1.0 && target.height >= 1.0 &&
+            !CGSizeEqualToSize(self.bounds.size, target)) {
+            self.autoresizingMask = UIViewAutoresizingNone;
+            CGRect b = self.bounds;
+            b.size = target;
+            self.bounds = b;
+            self.center = CGPointMake(CGRectGetMidX(host.bounds),
+                                      CGRectGetMidY(host.bounds));
+        }
+    }
+    [super layoutSubviews];
+}
+
+@end
 
 // 取一个视图上所有可见文字（UIButton 的 title、UILabel、私有按钮的字符串属性），
 // 用于判定它到底是「选项」还是「清除」。iOS 通知按钮未必是 UIButton，
@@ -1211,8 +1299,10 @@ static void LNBApplyButtonBackground(UIView *view) {
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
 
     // 【v1.4.7】移除 animationKeys 判断（日志证明它恒为 0，从未生效）。
-    // 按钮跟随的关键在下面：每次进来都按 view.frame.size 重建图片，
-    // 这样动画中每帧都会同步到最新尺寸。
+    // 【v1.4.8 ★★★】按钮尺寸取 view.bounds.size（不含 transform 的真实尺寸）。
+    //   与卡片背景同一套定论：图片是按钮的子视图，渲染时自动继承按钮的
+    //   transform。若用 frame.size（已含缩放），父层会再乘一次 → 双重缩放。
+    //   按钮虽然通常不缩放，但保持一致才能避免用户在折叠/展开动画中看到抖动。
 
     BOOL wantOn = prefs.enabled && prefs.suppModuleEnabled;
 
@@ -1266,17 +1356,20 @@ static void LNBApplyButtonBackground(UIView *view) {
 
     // 铺图：插到最底层（index 0），系统自己的 label / imageView 天然浮在上面。
     // 【v1.3.9】不再假设它是 UIButton —— 用 view 本身即可（放宽后可能是任意视图）。
-    // 【v1.4.7】与卡片同一套逻辑：尺寸取 view.frame.size（动画中会变），
-    //   center 对齐到 view.bounds 的中心。
-    UIImageView *iv = [[UIImageView alloc] initWithFrame:view.bounds];
-    iv.tag = tag;
+    // 【v1.4.7】与卡片同一套逻辑。
+    // 【v1.4.8 ★★★】尺寸来源从 frame.size 改回 bounds.size —— 理由同卡片：
+    //   transform 会由父层自动作用于子视图，用 frame 就是双重缩放。
+    //   同时换成 LNBFollowImageView（自跟踪子类），保证按钮 layout 时
+    //   图片自动贴合按钮 bounds，不依赖扫描重跑 —— 这是「跟着按钮走」的根本保证。
+    LNBFollowImageView *iv = [[LNBFollowImageView alloc] initWithFrame:view.bounds];
     iv.contentMode = UIViewContentModeScaleAspectFill;
     iv.clipsToBounds = YES;
     iv.userInteractionEnabled = NO;
     iv.autoresizingMask = UIViewAutoresizingNone;
+    iv.tag = tag;
     {
-        CGSize ts = view.frame.size;
-        if (ts.width < 1.0 || ts.height < 1.0) ts = view.bounds.size;
+        CGSize ts = view.bounds.size;
+        if (ts.width < 1.0 || ts.height < 1.0) ts = iv.bounds.size;
         CGRect ib = iv.bounds;
         ib.size = ts;
         iv.bounds = ib;
