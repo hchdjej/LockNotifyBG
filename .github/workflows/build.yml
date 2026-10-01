@@ -60,12 +60,9 @@ jobs:
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless >> /tmp/build.log 2>&1
           RC=$?
           set -e
-          echo "==================== 错误行（error:） ===================="
-          grep -n "error:" /tmp/build.log || echo "(无 error: 行)"
-          echo "==================== 警告行（warning:） ===================="
-          grep -n "warning:" /tmp/build.log | head -40 || true
-          echo "==================== 日志最后 80 行 ===================="
-          tail -80 /tmp/build.log
+          echo "==================== 日志全文（共 $(wc -l < /tmp/build.log) 行）===================="
+          cat -n /tmp/build.log || true
+          echo "==================== 日志结束 ===================="
           if [ "$RC" -ne 0 ]; then
             echo "::error::编译失败，退出码 $RC"
             exit 1
