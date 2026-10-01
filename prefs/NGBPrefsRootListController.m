@@ -284,12 +284,12 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 - (void)seedDefaultsIfNeeded {
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
     NSDictionary *defaults = @{@"enabled":         @YES,
-                               @"globalEnabled":   @YES,
-                               @"globalUseVideo":  @NO,
-                               @"globalAlpha":     @0.85,
-                               @"cardEnabled":     @NO,
+                               @"cardEnabled":     @YES,
                                @"cardAlpha":       @0.9,
                                @"cardBlurOverlay": @YES,
+                               @"globalEnabled":   @NO,
+                               @"globalUseVideo":  @NO,
+                               @"globalAlpha":     @0.85,
                                @"videoMuted":      @YES,
                                @"videoVolume":     @0.6,
                                @"mixWithOthers":   @YES};
@@ -355,29 +355,29 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         [specs addObject:LNBGroup(@"功能开关", @"关闭后所有背景设置立即失效，但资源文件会保留。")];
         [specs addObject:LNBSwitch(self, @"启用插件", @"enabled")];
 
-        // ---- 1. 全局背景 ----
-        [specs addObject:LNBGroup(@"全局背景（通知列表整块）",
-                                  @"作用于锁屏通知列表整体区域。视频模式会在系统刷新时重新挂载播放层，可能出现短暂闪烁。")];
-        [specs addObject:LNBSwitch(self, @"全局背景开关", @"globalEnabled")];
+        // ---- 1. 通知卡片背景（主功能）----
+        [specs addObject:LNBGroup(@"通知卡片背景",
+                                  @"给锁屏上的每一条通知单独加背景。图片按「填充满整块卡片并裁剪」显示，卡片圆角自动跟随系统。")];
+        [specs addObject:LNBSwitch(self, @"卡片背景开关", @"cardEnabled")];
+        [specs addObject:LNBButton(self, @"选择卡片图片", @selector(lnbPickCardImage:), @"pickCardImage")];
+        [specs addObject:LNBSlider(self, @"卡片背景不透明度", @"cardAlpha", 0.2, 1.0)];
+        [specs addObject:LNBSwitch(self, @"暗色遮罩（提升文字可读性）", @"cardBlurOverlay")];
+
+        // ---- 2. 全局背景（附加玩法，默认关闭）----
+        [specs addObject:LNBGroup(@"整块列表背景（附加功能）",
+                                  @"把锁屏上聚在一起的通知当成一整块区域，铺一张底图或视频。默认关闭，需要时再开。")];
+        [specs addObject:LNBSwitch(self, @"整块背景开关", @"globalEnabled")];
         [specs addObject:LNBButton(self, @"选择背景图片", @selector(lnbPickGlobalImage:), @"pickGlobalImage")];
         [specs addObject:LNBButton(self, @"选择背景视频", @selector(lnbPickGlobalVideo:), @"pickGlobalVideo")];
         [specs addObject:LNBSwitch(self, @"使用视频作为背景", @"globalUseVideo")];
-        [specs addObject:LNBSlider(self, @"背景透明度", @"globalAlpha", 0.2, 1.0)];
+        [specs addObject:LNBSlider(self, @"整块背景不透明度", @"globalAlpha", 0.2, 1.0)];
 
-        // ---- 2. 声音 ----
+        // ---- 3. 声音 ----
         [specs addObject:LNBGroup(@"声音",
-                                  @"背景视频默认静音。打开声音后，若同时开启「与其他音频混音」，播放背景视频不会中断你正在听的音乐。")];
+                                  @"仅对「整块背景」的视频模式有效。背景视频默认静音；打开声音后若同时开启「与其他音频混音」，播放背景视频不会中断你正在听的音乐。")];
         [specs addObject:LNBSwitch(self, @"静音", @"videoMuted")];
         [specs addObject:LNBSlider(self, @"音量", @"videoVolume", 0.0, 1.0)];
         [specs addObject:LNBSwitch(self, @"与其他音频混音", @"mixWithOthers")];
-
-        // ---- 3. 卡片背景 ----
-        [specs addObject:LNBGroup(@"通知卡片背景（单条）",
-                                  @"作用于每一条通知。卡片仅支持静态图片。")];
-        [specs addObject:LNBSwitch(self, @"卡片背景开关", @"cardEnabled")];
-        [specs addObject:LNBButton(self, @"选择卡片图片", @selector(lnbPickCardImage:), @"pickCardImage")];
-        [specs addObject:LNBSlider(self, @"卡片透明度", @"cardAlpha", 0.2, 1.0)];
-        [specs addObject:LNBSwitch(self, @"暗色遮罩（提升可读性）", @"cardBlurOverlay")];
 
         // ---- 4. 其它 ----
         [specs addObject:LNBGroup(@"其它", @"所有修改即时生效，无需注销。")];

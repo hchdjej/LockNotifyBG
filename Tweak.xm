@@ -6,10 +6,12 @@
 //  适配无根越狱（Dopamine / palera1n rootless）
 //
 //  设计原则（稳定性优先）：
-//   1. 全局背景 —— 在通知列表容器视图上挂一个 bg 容器（UIImageView 或 AVPlayerLayer）。
-//      每次 layoutSubviews 只做「检查是否存在」，不存在才插入，避免无脑重建导致闪烁。
-//   2. 卡片背景 —— 不使用子视图，改用 colorWithPatternImage 直接设置 backgroundColor。
-//      UIColor 是值对象，系统重建 view 层级时不会丢失，这是 iOS 16 上最稳的卡片方案。
+//   1. 通知卡片背景（主功能）—— 给每一条通知的宿主视图插一个 UIImageView 子视图，
+//      contentMode = ScaleAspectFill，填充满卡片并裁剪。这是用户要的效果：
+//      通知模块自己带背景，而不是整个锁屏铺底。
+//   2. 整块列表背景（附加功能，默认关闭）—— 在通知列表容器上挂一个 bg 容器
+//      （UIImageView 或 AVPlayerLayer）。每次 layoutSubviews 只做「检查是否存在」，
+//      不存在才插入，避免无脑重建导致闪烁。
 //   3. 只依赖最少的私有类名，不做方法级深度 hook，降低随系统更新失效的概率。
 //
 
@@ -75,12 +77,14 @@ static const NSInteger kGlobalBGViewTag = 0x1F0B6;
         saved = [fallback dictionaryRepresentation];
     }
 
-    // 默认值：安装后开箱即可用「静态图片」模式，视频需用户在设置里选文件
+    // 默认值：主功能是「每条通知卡片各自带背景」，所以 cardEnabled 默认 YES。
+    // globalEnabled 是「整个通知列表铺一张底图」的附加玩法，默认关闭——
+    // 它会在锁屏上铺一大块，容易和壁纸打架。
     self.enabled          = saved[@"enabled"]          ? [saved[@"enabled"] boolValue]          : YES;
-    self.globalEnabled    = saved[@"globalEnabled"]    ? [saved[@"globalEnabled"] boolValue]    : YES;
+    self.globalEnabled    = saved[@"globalEnabled"]    ? [saved[@"globalEnabled"] boolValue]    : NO;
     self.globalUseVideo   = saved[@"globalUseVideo"]   ? [saved[@"globalUseVideo"] boolValue]   : NO;
     self.globalAlpha      = saved[@"globalAlpha"]      ? [saved[@"globalAlpha"] doubleValue]    : 0.85;
-    self.cardEnabled      = saved[@"cardEnabled"]      ? [saved[@"cardEnabled"] boolValue]      : NO;
+    self.cardEnabled      = saved[@"cardEnabled"]      ? [saved[@"cardEnabled"] boolValue]      : YES;
     self.cardAlpha        = saved[@"cardAlpha"]        ? [saved[@"cardAlpha"] doubleValue]      : 0.9;
     self.cardBlurOverlay  = saved[@"cardBlurOverlay"]  ? [saved[@"cardBlurOverlay"] boolValue]  : YES;
 
@@ -381,13 +385,34 @@ static void LNBEnsureGlobalBackground(UIView *candidateHost) {
 
 #pragma mark - 卡片背景注入逻辑
 
-// 为通知 cell 应用背景图：使用 pattern color 而非子视图，天然抵抗层级重建
+// 卡片背景视图的复用 tag
+static const NSInteger kCardBGViewTag = 0x1F0B7;
+static const NSInteger kCardDimViewTag = 0x1F0B8;
+
+// 给「每一条通知」的宿主视图铺一张背景图。
+//
+// 【设计说明】
+// 这里是本插件的主功能：锁屏上每一条通知各自带背景，而不是整个通知列表铺底。
+//
+// 早期版本用 [UIColor colorWithPatternImage:] 设置 backgroundColor，想靠
+// 「UIColor 是值对象、系统重建层级不丢」来抗刷新。实际有两个硬伤：
+//   1. pattern image 是 **原尺寸平铺**，不是 ScaleAspectFill，图片会被切碎成网格，
+//      所以看起来像「图案重复、位置不对」；
+//   2. 只有当 cell 自身 backgroundColor 未被系统覆盖时才可见，而锁屏通知卡片
+//      通常由内部 content view / 毛玻璃层提供底色，pattern color 被盖住 → 没效果。
+// 因此改回真实子视图 + UIImageView(ScaleAspectFill)，这是唯一能保证
+// 「填充满整块区域并裁剪」的方案。
 static void LNBApplyCardBackground(UIView *cellView) {
     if (!cellView) return;
 
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    UIView *existing = [cellView viewWithTag:kCardBGViewTag];
+    UIView *existingDim = [cellView viewWithTag:kCardDimViewTag];
+
+    // 关闭时把插进去的视图摘干净，交还系统原始外观
     if (!prefs.enabled || !prefs.cardEnabled) {
-        // 不干预，交还系统
+        if (existing) [existing removeFromSuperview];
+        if (existingDim) [existingDim removeFromSuperview];
         return;
     }
 
@@ -399,32 +424,54 @@ static void LNBApplyCardBackground(UIView *cellView) {
             cardImage = [UIImage imageWithContentsOfFile:LNBPathForResource(kBGGlobalImage)];
         }
     }
-    if (!cardImage) return;
-
-    // colorWithPatternImage + alpha：不插子视图，系统重建后 UIColor 语义仍然生效
-    UIColor *patternColor = [UIColor colorWithPatternImage:cardImage];
-
-    // 保留圆角观感
-    cellView.layer.cornerRadius = 18.0;
-    cellView.layer.masksToBounds = YES;
-
-    // 如果宿主本身是带毛玻璃的容器，pattern color 可能被覆盖，
-    // 因此这里同时设置 backgroundColor，双保险
-    if (prefs.cardBlurOverlay) {
-        // 叠一层半透明黑，保证通知文字可读
-        UIView *dim = [cellView viewWithTag:kGlobalBGViewTag + 1];
-        if (!dim) {
-            dim = [[UIView alloc] initWithFrame:cellView.bounds];
-            dim.tag = kGlobalBGViewTag + 1;
-            dim.userInteractionEnabled = NO;
-            dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            [cellView insertSubview:dim atIndex:0];
-        }
-        dim.backgroundColor = [UIColor colorWithWhite:0.0 alpha:(1.0 - prefs.cardAlpha)];
-        dim.frame = cellView.bounds;
+    if (!cardImage) {
+        if (existing) [existing removeFromSuperview];
+        if (existingDim) [existingDim removeFromSuperview];
+        return;
     }
 
-    cellView.backgroundColor = patternColor;
+    // 圆角跟随卡片本身，保证背景不会溢出圆角
+    cellView.layer.cornerRadius = cellView.layer.cornerRadius > 0 ? cellView.layer.cornerRadius : 18.0;
+    cellView.layer.masksToBounds = YES;
+
+    // ---- 背景图容器（最底层）----
+    UIImageView *bg = (UIImageView *)[cellView viewWithTag:kCardBGViewTag];
+    if (!bg) {
+        bg = [[UIImageView alloc] initWithFrame:cellView.bounds];
+        bg.tag = kCardBGViewTag;
+        bg.userInteractionEnabled = NO;          // 绝不拦截通知的点击/滑动
+        bg.contentMode = UIViewContentModeScaleAspectFill;  // 填充满 + 裁剪
+        bg.clipsToBounds = YES;
+        bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [cellView insertSubview:bg atIndex:0];
+    } else if (bg.superview != cellView) {
+        [cellView insertSubview:bg atIndex:0];
+    }
+    bg.frame = cellView.bounds;
+    bg.image = cardImage;
+    bg.alpha = 1.0;
+
+    // ---- 可读性遮罩（压在图上、文字下）----
+    UIView *dim = [cellView viewWithTag:kCardDimViewTag];
+    if (!dim) {
+        dim = [[UIView alloc] initWithFrame:cellView.bounds];
+        dim.tag = kCardDimViewTag;
+        dim.userInteractionEnabled = NO;
+        dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [cellView insertSubview:dim aboveSubview:bg];
+    } else if (dim.superview != cellView) {
+        [cellView insertSubview:dim aboveSubview:bg];
+    }
+    dim.frame = cellView.bounds;
+
+    if (prefs.cardBlurOverlay) {
+        // cardAlpha 越小 → 遮罩越重。0.9 → 10% 黑；0.2 → 80% 黑
+        dim.hidden = NO;
+        dim.backgroundColor = [UIColor colorWithWhite:0.0 alpha:(1.0 - prefs.cardAlpha)];
+    } else {
+        dim.hidden = YES;
+        dim.backgroundColor = [UIColor clearColor];
+    }
 }
 
 #pragma mark - 重载通知
@@ -444,14 +491,24 @@ static void LNBReloadConfiguration(void) {
         }
         if (!window) return;
 
-        // 遍历寻找背景容器并刷新
+        // 遍历：全局背景容器刷新配置；通知卡片重新套用卡片背景。
+        // 卡片这块必须一起刷，否则改完「卡片背景开关 / 透明度」要等下次
+        // cell 重新 layout 才生效，体感就是「改了没用」。
         NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:window];
         while (stack.count > 0) {
             UIView *view = [stack lastObject];
             [stack removeLastObject];
+
             if ([view isKindOfClass:[LNBGlobalBackgroundView class]]) {
                 [(LNBGlobalBackgroundView *)view applyConfig:[LNBPrefs sharedInstance]];
             }
+
+            NSString *cls = NSStringFromClass(view.class);
+            if ([cls isEqualToString:@"NCNotificationListCell"] ||
+                [cls isEqualToString:@"NCNotificationShortLookView"]) {
+                LNBApplyCardBackground(view);
+            }
+
             for (UIView *sub in view.subviews) {
                 [stack addObject:sub];
             }
