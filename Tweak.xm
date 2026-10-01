@@ -1747,6 +1747,32 @@ static void LNBReloadConfiguration(void) {
     });
 }
 
+
+
+// 【v1.4.12】cell 的几何同步助手：找出挂在它身上的背景 / 遮罩，叫它们重算。
+//
+// 【⚠️ 为什么是 C 函数而不是 UIView 分类方法】
+//   Logos 展开后，%hook 块里的 self 类型是 `@class NCNotificationListCell`
+//   —— 一个【前向声明】（iOS 16.5 公开 SDK 里没有这个私有类），
+//   对前向声明的类型发自定义消息会直接编译报错：
+//       error: receiver type 'NCNotificationListCell' for instance message
+//              is a forward declaration
+//   所以这里改成普通 C 函数，形参用 UIView*（完整类型），
+//   hook 里传 (UIView *)self 即可，绕开 self 的类型问题。
+//
+// 【为什么用 setNeedsLayout 而不是直接同步算】
+//   只是打标记，同一轮 runloop 内多次调用会被合并；
+//   真正干活的是各视图自己的 layoutSubviews → syncToHostIfNeeded。
+static void LNBSyncBGGeometry(UIView *cell) {
+    if (!cell) return;
+    UIView *bg = [cell viewWithTag:kCardBGViewTag];
+    if ([bg isKindOfClass:[LNBGlobalBackgroundView class]]) {
+        [(LNBGlobalBackgroundView *)bg notifyHostGeometryChanged];
+    }
+    UIView *dim = [cell viewWithTag:kCardDimViewTag];
+    if (dim) [dim setNeedsLayout];
+}
+
 #pragma mark - Hook 入口
 
 // 【v1.4.10】层级 dump 函数定义在下方（紧跟 NCNotificationListCell hook 之后），
@@ -1804,56 +1830,27 @@ static void LNBDumpCellHierarchyIfNeeded(UIView *cell);
 //   四个都 hook，用 setNeedsLayout 做合并去重，避免重复计算。
 - (void)setFrame:(CGRect)frame {
     %orig(frame);
-    [self lnbSyncBGGeometry];
+    LNBSyncBGGeometry((UIView *)self);
 }
 
 - (void)setBounds:(CGRect)bounds {
     %orig(bounds);
-    [self lnbSyncBGGeometry];
+    LNBSyncBGGeometry((UIView *)self);
 }
 
 - (void)setCenter:(CGPoint)center {
     %orig(center);
-    [self lnbSyncBGGeometry];
+    LNBSyncBGGeometry((UIView *)self);
 }
 
 - (void)setTransform:(CGAffineTransform)transform {
     %orig(transform);
-    [self lnbSyncBGGeometry];
+    LNBSyncBGGeometry((UIView *)self);
 }
 
 %end
 
-// 【v1.4.12】cell 的几何同步助手：找出挂在它身上的背景 / 遮罩，叫它们重算。
-// 用 setNeedsLayout 而非直接同步调用 —— 会把同一轮 runloop 内的
-// 多次调用合并成一次，展开动画里每帧十几个 setter 调用也不会产生
-// 十几个重复计算（真正干活的是它们各自的 layoutSubviews）。
-//
-// 【为什么用分类而不是直接在 hook 里写】
-//   hook 块里的 self 是 NCNotificationListCell 指针，直接给 UIView 加个
-//   分类方法最省事，也不影响任何系统类。
-//
-// 【⚠️ 死循环排查笔记】setNeedsLayout 只是打标记，不会立刻回调
-//   layoutSubviews，所以我们 hook 的 setter 不会被自己的调用再次触发。
-//   但为保险起见，分类里不做任何 frame/bounds 赋值，只打标记 ——
-//   几何的真正写入统一发生在 LNBGlobalBackgroundView.layoutSubviews →
-//   syncToHostIfNeeded 里，那里是一次性的赋值，不会自我递归。
-@interface UIView (LNBGeometrySync)
-- (void)lnbSyncBGGeometry;
-@end
 
-@implementation UIView (LNBGeometrySync)
-
-- (void)lnbSyncBGGeometry {
-    UIView *bg = [self viewWithTag:kCardBGViewTag];
-    if ([bg isKindOfClass:[LNBGlobalBackgroundView class]]) {
-        [(LNBGlobalBackgroundView *)bg notifyHostGeometryChanged];
-    }
-    UIView *dim = [self viewWithTag:kCardDimViewTag];
-    if (dim) [dim setNeedsLayout];
-}
-
-@end
 
 // 【v1.4.10 ★★★ 新增：视图层级 dump hook】
 //

@@ -12,7 +12,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = LockNotifyBG
 LockNotifyBG_FILES = Tweak.xm
-LockNotifyBG_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-arc-performSelector-leaks
+LockNotifyBG_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-arc-performSelector-leaks
 LockNotifyBG_FRAMEWORKS = UIKit Foundation AVFoundation CoreMedia QuartzCore
 LockNotifyBG_PRIVATE_FRAMEWORKS = BulletinBoard
 
