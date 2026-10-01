@@ -1092,7 +1092,16 @@ static void LNBLogButtonCandidate(UIView *v, BOOL accepted) {
 }
 
 // 给【单个按钮】铺自己的圆角图 —— 每个模块各自跟自己的框走。
-// 归属判定：优先看文字（"选项"/"清除"），拿不到文字时沿用已挂图；
+//
+// 【v1.4.2 对齐目标效果】（用户给的参照截图：选项=黑猫图、清除=橙恐龙图，
+// 各自独立圆角方块，文字浮在图上；折叠按钮裸着不铺图）
+// 归属判定：
+//   文字含「清除」 → supp2.jpg
+//   文字含「选项」 → supp.jpg
+//   文字含「折叠」 → 【跳过不铺】—— 日志实证 NCToggleControlPair 是
+//       「折叠+清除」并排容器，两个都是 NCToggleControl，旧代码会让
+//       「折叠」落进默认分支误穿「选项」的图。
+//   无文字（图标态） → 默认 supp.jpg 兜底（很可能是「选项」的图标形态）
 // 素材回退：清除 -> supp2.jpg，选项 -> supp.jpg，缺图再退 supp -> card。
 static void LNBApplyButtonBackground(UIView *view) {
     if (!view) return;
@@ -1106,9 +1115,16 @@ static void LNBApplyButtonBackground(UIView *view) {
     }
     if (!wantOn) return;
 
-    // 归属：文字里找「清除 / 选项」关键字
+    // 归属：文字里找「清除 / 选项 / 折叠」关键字
     NSString *label = LNBGatherText(view);
     NSString *lower = label.lowercaseString;
+
+    // 【v1.4.2】折叠按钮：裸的，不铺图
+    if ([label containsString:@"折叠"] ||
+        [lower containsString:@"collapse"] || [lower containsString:@"fold"]) {
+        LNBTLog(@"[按钮] ⏭ 跳过折叠按钮 cls=%@ text=\"%@\"", NSStringFromClass(view.class), label);
+        return;
+    }
 
     NSInteger tag = kSuppBtn1Tag;
     if ([label containsString:@"清除"] || [lower containsString:@"clear"]) {
