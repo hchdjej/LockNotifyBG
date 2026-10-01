@@ -403,58 +403,61 @@ static void LNBEnsureGlobalBackground(UIView *candidateHost) {
 static const NSInteger kCardBGViewTag = 0x1F0B7;
 static const NSInteger kCardDimViewTag = 0x1F0B8;
 
-// 在 cell 子树里找「卡片背景载体」——系统画白色毛玻璃底的那个视图。
-//
-// 【踩坑一】白色底不是 cell 自己的 backgroundColor，而是内部的毛玻璃/材质
-// 视图（UIVisualEffectView 一族，或类名含 Material / Blur / Effect 的
-// 私有材质视图）。图插在它们之下永远被盖住。
-//
-// 【踩坑二】材质视图往往不止一个，浅层的可能比白色卡片本身还大（比如挂在
-// cell 级的大块模糊容器）。v1.2.1 取"第一个命中"，再把图铺到它父视图的
-// bounds 上 —— 父视图带留白，图就溢出到模块外面了。
-// 因此这里**收集全部候选，选 bounds 面积最小且不小于卡片 20% 的那个**：
-// 面积最小 = 最贴近卡片本身的视觉区域；下限约束 = 排除无关的小控件材质。
-static UIView *LNBFindCardBackingView(UIView *root) {
-    CGFloat rootArea = root.bounds.size.width * root.bounds.size.height;
-    if (rootArea <= 0) return nil;
+// 判断一个视图是不是「毛玻璃白底」类。
+// vibrancy（UIVibrancyEffect）是透明的文字强调效果容器，**不是**白底来源，
+// 藏了会把文字一起变透明 —— 必须排除。
+static BOOL LNBIsBlurMaterial(UIView *v) {
+    if ([v isKindOfClass:[UIVisualEffectView class]]) {
+        UIVisualEffectView *evv = (UIVisualEffectView *)v;
+        return ![evv.effect isKindOfClass:[UIVibrancyEffect class]];
+    }
+    NSString *cls = NSStringFromClass(v.class).lowercaseString;
+    return [cls containsString:@"blur"] ||
+           [cls containsString:@"backdrop"] ||
+           [cls containsString:@"material"];
+}
 
-    UIView *best = nil;
-    CGFloat bestArea = CGFLOAT_MAX;
+// 关联对象 key：标记「这个材质视图是我们隐藏的」，恢复时只恢复自己藏的，
+// 不碰系统本来就隐藏的视图。
+static const void *kLNBHiddenByTweak = &kLNBHiddenByTweak;
 
+// 隐藏 / 恢复 cell 子树内全部毛玻璃白底。
+//
+// 【v1.2.3 思路转变】v1.2.1 / v1.2.2 都在猜「哪个材质视图是卡片白底」，
+// 猜中了尺寸就挂它里面 —— 实际设备上命中的是比单张卡片更大的材质层，
+// 图铺到了模块外面；或者图被卡片自己的毛玻璃压在下面，只能透出模糊色块。
+// 与其继续猜，不如反过来：**把毛玻璃全部隐藏，图挂在卡片本体最底层**。
+// 卡片（cell）的边界就是用户看到的模块边界，图按 cell.bounds 铺，
+// 位置一像素都不会错；白底藏掉后图清晰可见；实色文字浮在最上层不受影响。
+static void LNBSetCardMaterialsHidden(UIView *root, BOOL hidden) {
     NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
     while (stack.count > 0) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
-        if (v != root) {
-            NSString *cls = NSStringFromClass(v.class);
-            if ([v isKindOfClass:[UIVisualEffectView class]] ||
-                [cls containsString:@"Material"] ||
-                [cls containsString:@"Blur"] ||
-                [cls containsString:@"Effect"]) {
-                CGFloat area = v.bounds.size.width * v.bounds.size.height;
-                if (area >= rootArea * 0.2 && area < bestArea) {
-                    best = v;
-                    bestArea = area;
+        if (v != root && LNBIsBlurMaterial(v)) {
+            if (hidden) {
+                if (!v.hidden) {
+                    objc_setAssociatedObject(v, kLNBHiddenByTweak, @YES, OBJC_ASSOCIATION_RETAIN);
+                    v.hidden = YES;
                 }
+            } else if (objc_getAssociatedObject(v, kLNBHiddenByTweak)) {
+                v.hidden = NO;
+                objc_setAssociatedObject(v, kLNBHiddenByTweak, nil, OBJC_ASSOCIATION_RETAIN);
             }
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
     }
-    return best;
 }
 
 // 给「每一条通知」的宿主视图铺一张背景图。
 //
-// 【设计说明】
-// 这里是本插件的主功能：锁屏上每一条通知各自带背景，而不是整个通知列表铺底。
-//
 // 版本沿革：
-//   1.1.x 用 [UIColor colorWithPatternImage:] 设 backgroundColor —— pattern 是
-//      原尺寸平铺不是填充裁剪，且被系统毛玻璃盖住，双双失败；
-//   1.2.0 改插 UIImageView 到 cell atIndex:0 最底层 —— 图还在毛玻璃下面，
-//      用户看到「一圈白框、图片没反应」；
-//   1.2.1 起定位系统材质视图，把图**盖到它上面**：毛玻璃被完全覆盖，
-//      文字仍在图上，关闭时摘图即恢复原状。
+//   1.1.x colorWithPatternImage 设 backgroundColor —— 平铺且被毛玻璃盖住，失败；
+//   1.2.0 图插 cell 最底层 —— 被系统毛玻璃压住，只见白框；
+//   1.2.1/1.2.2 往「找到的材质视图」里挂 —— 设备上命中比卡片更大的材质层，
+//          图溢出到模块外面，卡片内只剩透出来的模糊色块；
+//   1.2.3 隐藏毛玻璃白底 + 图挂 cell 本体最底层、按 cell.bounds 铺：
+//          图的边界 = 模块的边界，清晰、精确、绝不外溢。
 static void LNBApplyCardBackground(UIView *cellView) {
     if (!cellView) return;
 
@@ -469,10 +472,11 @@ static void LNBApplyCardBackground(UIView *cellView) {
     UIView *existing = [cellView viewWithTag:kCardBGViewTag];
     UIView *existingDim = [cellView viewWithTag:kCardDimViewTag];
 
-    // 关闭时把插进去的视图摘干净，交还系统原始外观
+    // 关闭时：摘图 + 恢复被隐藏的毛玻璃，交还系统原始外观
     if (!prefs.enabled || !prefs.cardEnabled) {
         if (existing) [existing removeFromSuperview];
         if (existingDim) [existingDim removeFromSuperview];
+        LNBSetCardMaterialsHidden(cellView, NO);
         return;
     }
 
@@ -487,6 +491,7 @@ static void LNBApplyCardBackground(UIView *cellView) {
     if (!cardImage) {
         if (existing) [existing removeFromSuperview];
         if (existingDim) [existingDim removeFromSuperview];
+        LNBSetCardMaterialsHidden(cellView, NO);
         return;
     }
 
@@ -494,54 +499,41 @@ static void LNBApplyCardBackground(UIView *cellView) {
     cellView.layer.cornerRadius = cellView.layer.cornerRadius > 0 ? cellView.layer.cornerRadius : 18.0;
     cellView.layer.masksToBounds = YES;
 
-    // ---- 把图挂进材质视图内部，尺寸精确等于卡片 ----
-    //
-    // 【踩坑】v1.2.1 把图挂在 backing 的**父视图**上、frame 用父视图 bounds。
-    // 父视图通常比白色卡片大一圈（有留白/padding），图就铺到模块外面去了。
-    // 现在改挂到 backing **内部**：
-    //   - UIVisualEffectView → 挂 contentView atIndex:0（contentView 的内容
-    //     显示在毛玻璃之上，正好盖住白底），frame = contentView.bounds
-    //   - 其他材质视图 → 直接挂 atIndex:0
-    // 这样图的边界 = 材质视图边界 = 用户看到的模块，一像素都不溢出。
-    UIView *backing = LNBFindCardBackingView(cellView);
-    UIView *host = cellView;
-    if ([backing isKindOfClass:[UIVisualEffectView class]]) {
-        host = ((UIVisualEffectView *)backing).contentView ?: cellView;
-    } else if (backing) {
-        host = backing;
-    }
+    // 1) 藏掉系统毛玻璃白底
+    LNBSetCardMaterialsHidden(cellView, YES);
 
+    // 2) 图挂在卡片本体最底层，边界 = 模块边界
     UIImageView *bg = (UIImageView *)[cellView viewWithTag:kCardBGViewTag];
     if (!bg) {
-        bg = [[UIImageView alloc] initWithFrame:host.bounds];
+        bg = [[UIImageView alloc] initWithFrame:cellView.bounds];
         bg.tag = kCardBGViewTag;
         bg.userInteractionEnabled = NO;          // 绝不拦截通知的点击/滑动
         bg.contentMode = UIViewContentModeScaleAspectFill;  // 填充满 + 裁剪
         bg.clipsToBounds = YES;
     }
-    if (bg.superview != host) {
+    if (bg.superview != cellView) {
         [bg removeFromSuperview];
-        [host insertSubview:bg atIndex:0];
+        [cellView insertSubview:bg atIndex:0];
     }
     bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    bg.frame = host.bounds;
+    bg.frame = cellView.bounds;
     bg.image = cardImage;
     bg.alpha = 1.0;
 
-    // ---- 可读性遮罩（与图同容器，压在图上）----
+    // 3) 可读性遮罩（图上、文字下）
     UIView *dim = [cellView viewWithTag:kCardDimViewTag];
     if (!dim) {
-        dim = [[UIView alloc] initWithFrame:host.bounds];
+        dim = [[UIView alloc] initWithFrame:cellView.bounds];
         dim.tag = kCardDimViewTag;
         dim.userInteractionEnabled = NO;
     }
-    if (dim.superview != host) {
+    if (dim.superview != cellView) {
         [dim removeFromSuperview];
-        [host addSubview:dim];
+        [cellView addSubview:dim];
     }
-    [host insertSubview:dim aboveSubview:bg];
+    [cellView insertSubview:dim aboveSubview:bg];
     dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    dim.frame = host.bounds;
+    dim.frame = cellView.bounds;
 
     if (prefs.cardBlurOverlay) {
         // cardAlpha 越小 → 遮罩越重。0.9 → 10% 黑；0.2 → 80% 黑
