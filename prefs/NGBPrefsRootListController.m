@@ -296,6 +296,16 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
     for (NSString *key in defaults) {
         if ([d objectForKey:key] == nil) [d setObject:defaults[key] forKey:key];
     }
+
+    // v1.2.2 一次性迁移：1.1.x 时代 globalEnabled 默认 YES，老用户升级后
+    // 「整块列表背景」会残留开启 —— 用户要的是卡片背景，不是整块铺底。
+    // 用标记位保证只跑一次，之后用户手动开整块背景不会被这里改掉。
+    if ([d objectForKey:@"lnbMigrated122"] == nil) {
+        [d setObject:@NO  forKey:@"globalEnabled"];
+        [d setObject:@YES forKey:@"cardEnabled"];
+        [d setObject:@YES forKey:@"lnbMigrated122"];
+    }
+
     [d synchronize];
     [self mirrorPreferencesToFile];
 }
