@@ -582,36 +582,37 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
     }
 }
 
-// 【v1.4.9 ★★★ 第三次破案：究竟该怎么跟】
+// 【v1.4.11 ★★★ 第四次也是最后一次破案：背景天然跟随，不需要任何 transform 操作】
 //
-// ── 现场证据（197414 行日志，1138 条「已同步」配对）──
-//   bgBounds == cellBounds : 1138/1138 (100%)   ← 尺寸确实照我说的写对了
-//   bgFrame  == cellBounds : 1138/1138 (100%)   ← 但背景的视觉尺寸也 = cellBounds
-//   cellFrame/cellBounds 出现的缩放比: 0.1 / 0.92 / 0.94 / 0.975 / 0.989 / 1.0
+// ── 1.4.9/1.4.10 为什么错 ──
+//   1.4.9 给背景加了逆矩阵：self.transform = CGAffineTransformInvert(host.transform)
+//   我以为"背景是子视图会自动继承父层 transform，所以要抵消"。
+//   这是对 UIKit 语义的误读：
+//     · 父层 transform 作用于子视图，是渲染时的【继承】，子视图的 bounds
+//       与父层 transform 无关；
+//     · 子视图自己再设一个逆矩阵，等于在继承之外又叠加一层反向缩放，
+//       结果是【反向放大】—— cell 缩到 0.1 时背景被放大 10 倍，撑爆到卡片
+//       外面，把「选项」按钮整个盖住。
+//   → 用户反馈的"主卡片和选项给删除搞一块了"就是这个。
 //
-//   典型逐帧（展开动画）：
-//     cellFrame= 30.88x 6.60  scale=0.100 | bgFrame=308.77x66.00  ← 卡片缩到 10%
-//     cellFrame=308.77x66.00  scale=1.000 | bgFrame=308.77x66.00
-//     cellFrame= 30.88x 6.60  scale=0.100 | bgFrame=308.77x66.00  ← 背景纹丝不动
+// ── 1.4.8 为什么"看起来没生效" ──
+//   1.4.8 的做法其实是对的（bounds + center），但代码里有一句致命 return：
+//       if (CGSizeEqualToSize(self.bounds.size, target)) return;
+//   而 target = host.bounds.size 恒为 308.77x66（不含 transform），
+//   所以判断【永远为真】→ 每次进来都直接 return，同步代码从没执行过。
+//   这就解释了日志里"bgFrame 一次都没动"：不是策略错，是这句 return 把整段
+//   逻辑短路了。当时我误判成"bounds 策略不对"，才引出 1.4.9 的错误改法。
 //
-// ── 结论 ──
-//   折叠态：卡片不缩放，cellBounds == cellFrame，所以背景"看起来对了"——
-//          那是【碰巧】，不是跟随生效。
-//   展开态：卡片被 transform 缩放，cellBounds 仍是 308.77x66（不含 transform），
-//          背景照抄 cellBounds → 屏幕上背景比卡片大一圈、位置也错 → 不跟随。
+// ── v1.4.11 最终做法 ──
+//   背景是 host 的子视图，父层 transform 会【自动】作用于它，无需干预。
+//   只需保证两件事：
+//     ① 尺寸 = host.bounds.size（真实尺寸，不含 transform）
+//     ② center = host 中心
+//   父层一缩放，背景跟着缩放，屏幕上的视觉尺寸与卡片永远一致。
 //
-//   ✗ 跟 bounds：尺寸是"未缩放的"，卡片一缩放就脱节（1.4.8 的错误）
-//   ✗ 跟 frame ：尺寸是"已缩放的"，但背景是子视图会自动继承 transform，
-//                等于缩放算两遍（1.4.7 的错误）
-//
-// ── 正解：跟 frame 的【视觉尺寸】，同时抵消掉父层 transform ──
-//   背景尺寸取 host.frame.size （= 卡片在屏幕上的视觉尺寸，已含缩放），
-//   再把背景自己的 layer.transform 设成 host.transform 的逆矩阵，
-//   这样父层加在背景上的缩放正好被抵消 → 背景最终视觉尺寸
-//   = frame.size，与卡片严丝合缝。
-//
-//   注意必须用【矩阵求逆】而不是简单地按比例缩 —— 卡片可能同时有
-//   位移/旋转/非等比缩放，只有逆矩阵能 100% 抵消。
+//   【并修掉那句短路 return】：
+//     不再只比尺寸，而是把"我自己的 transform 是否还是恒等"也纳入判断
+//     （因为 1.4.9 残留的逆矩阵必须被清掉），两者都对才 return。
 //
 // 【范围限定】只处理通知卡片（NCNotificationListCell）。
 - (void)syncToHostIfNeeded {
@@ -620,36 +621,31 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
     NSString *hostCls = NSStringFromClass(host.class);
     if (![hostCls isEqualToString:@"NCNotificationListCell"]) return;
 
-    // host.frame.size = 屏幕上视觉尺寸（含 transform）；
-    // host.bounds.size = 真实尺寸（不含 transform）。
-    CGSize visual = host.frame.size;
-    if (visual.width < 1.0 || visual.height < 1.0) visual = host.bounds.size;
-    if (visual.width < 1.0 || visual.height < 1.0) return;
+    // 真实尺寸（不含 transform）—— 父层 transform 会自然作用于它
+    CGSize target = host.bounds.size;
+    if (target.width < 1.0 || target.height < 1.0) target = host.frame.size;
+    if (target.width < 1.0 || target.height < 1.0) return;
 
-    // 父层 transform 的逆 —— 用来抵消背景自动继承的那份缩放/位移
-    CGAffineTransform inv = CGAffineTransformInvert(host.transform);
-
-    BOOL sizeOk   = CGSizeEqualToSize(self.bounds.size, visual);
-    BOOL tfOk     = CGAffineTransformEqualToTransform(self.transform, inv);
-    if (sizeOk && tfOk) return;   // 已经对了，不折腾
+    BOOL sizeOk = CGSizeEqualToSize(self.bounds.size, target);
+    // 【关键】1.4.9 留下的逆矩阵必须清干净。只要不是恒等，就一定要重设。
+    BOOL tfOk   = CGAffineTransformIsIdentity(self.transform);
+    if (sizeOk && tfOk) return;   // 尺寸对、且没有残留 transform，才跳过
 
     self.autoresizingMask = UIViewAutoresizingNone;
     [UIView performWithoutAnimation:^{
-        // ① 尺寸 = 卡片视觉尺寸
+        // ① 真实尺寸
         CGRect b = self.bounds;
-        b.size = visual;
+        b.size = target;
         self.bounds = b;
 
-        // ② 抵消父层 transform（背景继承的那份）
-        self.transform = inv;
+        // ② 清掉任何自我 transform（1.4.9 的逆矩阵残留）
+        if (!CGAffineTransformIsIdentity(self.transform)) {
+            self.transform = CGAffineTransformIdentity;
+        }
 
-        // ③ 中心对齐到 host 可视区中心。
-        //    host.bounds.origin 恒为 (0,0)（日志 844/844 实证），所以取
-        //    bounds 中点即卡片自身坐标系里的中心；再经上面的逆 transform
-        //    映射回 host 坐标系，正好落在卡片正中。
-        CGPoint c = CGPointMake(CGRectGetMidX(host.bounds),
-                                CGRectGetMidY(host.bounds));
-        self.center = c;
+        // ③ 中心对齐到 host 中心（host.bounds.origin 恒为 (0,0)，844/844 实证）
+        self.center = CGPointMake(CGRectGetMidX(host.bounds),
+                                  CGRectGetMidY(host.bounds));
     }];
     [self setNeedsLayout];
 }
@@ -1107,29 +1103,54 @@ static void LNBApplyCardBackground(UIView *cellView) {
     //        ✗ 跟 frame ：尺寸是"已缩放"的，但背景是子视图会自动继承
     //          父层 transform → 缩放算两遍（1.4.7 的错）。
     //
-    // ── 正解 ──
-    //   ① 背景尺寸取 cellView.frame.size（屏幕上的视觉尺寸，含缩放）
-    //   ② 背景自身 transform 设为 cellView.transform 的【逆矩阵】，
-    //      抵消掉它自动继承的那份缩放/位移
-    //   ③ 结果：视觉尺寸 = frame.size = 卡片视觉尺寸，严丝合缝
+    // ── 1.4.9 的错：加逆矩阵抵消 → 引出「主卡片和选项糊成一块」 ──
+    //   1.4.9 写了：bg.bounds.size = cellView.frame.size(视觉尺寸)
+    //               bg.transform   = CGAffineTransformInvert(cellView.transform)
+    //   看似"抵消父层缩放"，实则两头都错：
+    //     ① 尺寸取 frame（已含缩放），父层又会再缩放一次 → 双重缩放；
+    //     ② 逆矩阵让背景【反向放大】，cell 被缩到 0.1 时背景被放大 10 倍，
+    //        直接撑爆到卡片外面，把「选项」按钮整个盖住 ——
+    //        这正是用户说的"主卡片和选项给删除搞一块了"。
     //
-    //   为什么用逆矩阵而不是按比例缩：卡片可能同时带位移/旋转/非等比缩放，
-    //   只有矩阵求逆能 100% 抵消。
+    // ── v1.4.11 正解：什么都不用做，背景天然跟随 ──
+    //   背景是 cell 的子视图，它【本来就自动继承父层的 transform】。
+    //   父层缩放时，子视图跟着缩放，这是 UIKit 的内建行为，不需要也不该插手。
+    //   唯一要做的只有一件事：
+    //        bg.bounds.size = cellView.bounds.size   （真实尺寸，不含 transform）
+    //        bg.center      = cell 中心
+    //   然后父层的 transform 会自然把背景一起缩放 → 屏幕上的视觉尺寸
+    //   恰好等于 cell 的视觉尺寸，位置也严丝合缝。
+    //
+    //   这就是 v1.4.8 的做法。回头看，1.4.6~1.4.8 的 bounds 路线一直是对的，
+    //   1.4.9 那次"发现"（改用 frame + 逆矩阵）纯粹是我把 UIKit 的继承
+    //   语义想复杂了，反而制造了 bug。
+    //
+    //   【为什么本轮日志会误判成"背景一次都没动"】
+    //   因为 1.4.8 的 syncToHostIfNeeded 里有一句提前 return：
+    //       if (CGSizeEqualToSize(self.bounds.size, target)) return;
+    //   而 target 取的是 host.bounds.size，恒为 308.77x66（不含 transform），
+    //   判断恒为"相等" → 每次都 return，自跟踪代码从没执行过。
+    //   所以问题不在"跟 bounds 还是跟 frame"，而在那句 return 写错了。
+    //   本轮一并修掉：改成比较「父层 transform 是否变化」也纳入判断。
     {
-        CGSize visual = cellView.frame.size;
-        if (visual.width < 1.0 || visual.height < 1.0) visual = cellView.bounds.size;
-        CGAffineTransform inv = CGAffineTransformInvert(cellView.transform);
-
-        bg.autoresizingMask = UIViewAutoresizingNone;
-        [UIView performWithoutAnimation:^{
-            CGRect b = bg.bounds;
-            b.size = visual;            // ① 视觉尺寸
-            bg.bounds = b;
-            bg.transform = inv;         // ② 抵消父层 transform
-            // ③ 中心对齐到 cell 中心（cellBounds.origin 恒为 0，日志 844/844 实证）
-            bg.center = CGPointMake(CGRectGetMidX(cellView.bounds),
-                                    CGRectGetMidY(cellView.bounds));
-        }];
+        CGSize target = cellView.bounds.size;
+        if (target.width < 1.0 || target.height < 1.0) target = cellView.frame.size;
+        if (target.width >= 1.0 && target.height >= 1.0) {
+            bg.autoresizingMask = UIViewAutoresizingNone;
+            [UIView performWithoutAnimation:^{
+                // ① 真实尺寸（不含 transform）—— 父层 transform 会自动作用于它
+                CGRect b = bg.bounds;
+                b.size = target;
+                bg.bounds = b;
+                // ② 确保没有残留的自我 transform（1.4.9 留下的逆矩阵必须清掉！）
+                if (!CGAffineTransformIsIdentity(bg.transform)) {
+                    bg.transform = CGAffineTransformIdentity;
+                }
+                // ③ 中心对齐到 cell 中心（cellBounds.origin 恒为 0，日志 844/844 实证）
+                bg.center = CGPointMake(CGRectGetMidX(cellView.bounds),
+                                        CGRectGetMidY(cellView.bounds));
+            }];
+        }
     }
 
     // 【v1.4.10】不再给 cell 强制开 clipsToBounds！
@@ -1175,20 +1196,24 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [cellView addSubview:dim];
     }
     [cellView insertSubview:dim aboveSubview:bg];
-    // 【v1.4.9】与 bg 完全同一套：frame.size + 抵消 transform
+    // 【v1.4.11】与 bg 完全同一套：真实尺寸（bounds）+ 清掉自我 transform。
+    //   dim 同样是 cell 子视图，父层 transform 会自动作用于它，无需干预。
     {
-        CGSize dvis = cellView.frame.size;
-        if (dvis.width < 1.0 || dvis.height < 1.0) dvis = cellView.bounds.size;
-        CGAffineTransform dinv = CGAffineTransformInvert(cellView.transform);
-        dim.autoresizingMask = UIViewAutoresizingNone;
-        [UIView performWithoutAnimation:^{
-            CGRect db = dim.bounds;
-            db.size = dvis;
-            dim.bounds = db;
-            dim.transform = dinv;
-            dim.center = CGPointMake(CGRectGetMidX(cellView.bounds),
-                                     CGRectGetMidY(cellView.bounds));
-        }];
+        CGSize dtarget = cellView.bounds.size;
+        if (dtarget.width < 1.0 || dtarget.height < 1.0) dtarget = cellView.frame.size;
+        if (dtarget.width >= 1.0 && dtarget.height >= 1.0) {
+            dim.autoresizingMask = UIViewAutoresizingNone;
+            [UIView performWithoutAnimation:^{
+                CGRect db = dim.bounds;
+                db.size = dtarget;
+                dim.bounds = db;
+                if (!CGAffineTransformIsIdentity(dim.transform)) {
+                    dim.transform = CGAffineTransformIdentity;   // 清掉 1.4.9 的逆矩阵
+                }
+                dim.center = CGPointMake(CGRectGetMidX(cellView.bounds),
+                                         CGRectGetMidY(cellView.bounds));
+            }];
+        }
     }
     [dim setNeedsLayout];
     [dim layoutIfNeeded];
@@ -1234,17 +1259,24 @@ static void LNBApplyCardBackground(UIView *cellView) {
 - (void)layoutSubviews {
     UIView *host = self.superview;
     if (host) {
-        // 【v1.4.10】回退 1.4.9 的 transform 抵消 —— 按钮图只在按钮自身
-        // 坐标系里贴合即可，按钮不会被缩放，不需要也不应该动 transform。
+        // 【v1.4.11】按钮图只在按钮自身坐标系里贴合：bounds 尺寸 + 居中。
+        // 绝不设置 transform —— 按钮图是按钮的子视图，父层 transform 会
+        // 自动作用于它，自己再叠一层就是 1.4.9 那种"反向放大"的 bug。
         CGSize target = host.bounds.size;
-        if (target.width >= 1.0 && target.height >= 1.0 &&
-            !CGSizeEqualToSize(self.bounds.size, target)) {
-            self.autoresizingMask = UIViewAutoresizingNone;
-            CGRect b = self.bounds;
-            b.size = target;
-            self.bounds = b;
-            self.center = CGPointMake(CGRectGetMidX(host.bounds),
-                                      CGRectGetMidY(host.bounds));
+        if (target.width >= 1.0 && target.height >= 1.0) {
+            BOOL sizeOk = CGSizeEqualToSize(self.bounds.size, target);
+            BOOL tfOk   = CGAffineTransformIsIdentity(self.transform);
+            if (!sizeOk || !tfOk) {
+                self.autoresizingMask = UIViewAutoresizingNone;
+                CGRect b = self.bounds;
+                b.size = target;
+                self.bounds = b;
+                if (!CGAffineTransformIsIdentity(self.transform)) {
+                    self.transform = CGAffineTransformIdentity;
+                }
+                self.center = CGPointMake(CGRectGetMidX(host.bounds),
+                                          CGRectGetMidY(host.bounds));
+            }
         }
     }
     [super layoutSubviews];
