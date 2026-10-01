@@ -979,13 +979,26 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [bg removeFromSuperview];
         [cellView insertSubview:bg atIndex:0];
     }
-    bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    // 【v1.4.0 修「滑动时背景不跟随」】
+    // 根因：NCNotificationListCell 在首次 layout 时 bounds 是 {401,160}（未收敛），
+    // 之后才变成真实卡片几何 {308,123}。旧代码只在挂载那一刻设一次 frame，
+    // 后续不再同步；而 cell 滑动用的是 transform 动画，autoresizingMask 也不会
+    // 在 transform 变化时生效 —— 于是背景尺寸/位置与卡片脱节，滑动时就露馅。
+    //
+    // 修法：① 每次进来都强制对齐 frame 到当前 bounds（本函数在每次
+    //          layoutSubviews / 扫描时都会被调，天然形成同步）；
+    //       ② 把 autoresizingMask 设为 None，避免自动布局与手动 frame 打架；
+    //       ③ 背景直接作为 cell 的直接子视图且 index:0，随 cell 一同做 transform。
+    bg.autoresizingMask = UIViewAutoresizingNone;
     bg.frame = cellView.bounds;
+    [bg setNeedsLayout];
+    [bg layoutIfNeeded];
     [bg applyConfig:prefs];
-    LNBTLog(@"[%@] 背景已挂载 superview=%@ 尺寸=%0.0fx%0.0f 视频=%d 素材=%@",
+    LNBTLog(@"[%@] 背景已挂载 superview=%@ 尺寸=%0.0fx%0.0f cellBounds=%0.0fx%0.0f 视频=%d 素材=%@",
             tagName,
             NSStringFromClass(bg.superview.class),
             bg.frame.size.width, bg.frame.size.height,
+            cellView.bounds.size.width, cellView.bounds.size.height,
             (int)bg.preferVideo,
             bg.preferVideo ? vidName : imgName);
 
@@ -1001,8 +1014,11 @@ static void LNBApplyCardBackground(UIView *cellView) {
         [cellView addSubview:dim];
     }
     [cellView insertSubview:dim aboveSubview:bg];
-    dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    // 【v1.4.0】与 bg 同样处理：不用 autoresizing，每次进来强制对齐，避免滑动脱节
+    dim.autoresizingMask = UIViewAutoresizingNone;
     dim.frame = cellView.bounds;
+    [dim setNeedsLayout];
+    [dim layoutIfNeeded];
 
     if (overlayOn) {
         // alpha 越小 → 遮罩越重。0.9 → 10% 黑；0.2 → 80% 黑
@@ -1063,33 +1079,46 @@ static NSString *LNBGatherText(UIView *v) {
 
 // 判断一个视图是否是「聚焦通知时右侧的选项 / 清除按钮」候选。
 //
-// 【v1.3.9 放宽】1.3.8 要求 isKindOfClass:UIButton —— 设备上没生效，
-// 说明通知按钮多半不是 UIButton（私有类或自定义视图）。现在改为：
-//   1) 尺寸是小方块量级（25 ~ 220pt，卡片/列表远超上限）
-//   2) 祖先链里确实有 NCNotification*（活在通知系统里）
-//   3) 自己的子树里有文字，或类名含 Button
-// 不再要求任何具体类型。另外，只要祖先链命中，无论最终认不认，
-// 诊断模式下都会记一条日志（见 LNBLogButtonCandidates），便于定位。
+// 【v1.4.0 —— 依据设备日志实证，改用精确类名】
+// 1892 条探针日志给出的事实：
+//   ✅ 真按钮 = NCToggleControl      size=45x34   text="清除"   isUIButton=0
+//      （另有 NCToggleControlPair  107x34，是「清除+折叠」并排的容器）
+//   ❌ 误伤 = NCNotificationListCoalescingControlsView 108x34（外层容器，
+//            在里面铺图会把两个子按钮整个盖住 —— 用户反馈"按钮被遮挡"）
+//   ❌ 误伤 = NCNotificationListHeaderTitleView 85x30（「通知中心」标题）
+//   ❌ 误伤 = NCToggleControl {0,0}（未布局态，无意义）
+// 所以：只认 NCToggleControl（及其 Pair 容器，按子按钮分别铺），
+// 明确排除 Coalescing/HeaderTitle 这类容器与标题视图。
 static BOOL LNBIsCandidateActionButton(UIView *v) {
     if (!v) return NO;
 
     CGSize sz = v.bounds.size;
-    if (sz.width < 25.0 || sz.height < 25.0 || sz.width > 220.0 || sz.height > 220.0) return NO;
-
-    BOOL insideNotification = NO;
-    for (UIView *p = v.superview; p; p = p.superview) {
-        if ([NSStringFromClass(p.class) containsString:@"NCNotification"]) {
-            insideNotification = YES;
-            break;
-        }
-    }
-    if (!insideNotification) return NO;
+    // 未布局的 {0,0} 直接排除（日志里 NCToggleControl 有 {0,0} 形态）
+    if (sz.width < 20.0 || sz.height < 20.0) return NO;
+    if (sz.width > 260.0 || sz.height > 120.0) return NO;
 
     NSString *cls = NSStringFromClass(v.class);
-    if ([cls containsString:@"Button"]) return YES;
 
-    NSString *txt = LNBGatherText(v);
-    return txt.length > 0;
+    // ① 真按钮：NCToggleControl。注意 NCToggleControlPair 是并排容器，
+    //    也放行（它的子 NCToggleControl 会各自被单独处理，Pair 本身不铺，
+    //    见下面的 pair 排除）。
+    if ([cls isEqualToString:@"NCToggleControl"]) return YES;
+
+    // ② 明确排除：容器与标题（日志实证的误伤源）
+    if ([cls containsString:@"Coalescing"])      return NO;   // 外层容器，铺了会盖住子按钮
+    if ([cls containsString:@"HeaderTitle"])     return NO;   // 「通知中心」标题
+    if ([cls containsString:@"Pair"])            return NO;   // 并排容器，交给子控件各自铺
+    if ([cls containsString:@"SectionHeader"])   return NO;
+    if ([cls containsString:@"SectionView"])     return NO;
+
+    // ③ 其它自定义按钮（保留兜底，但要求类名含 Button 才认，不做文字兜底，
+    //    否则「通知中心」「没有更早的通知」这种有文字的普通视图会被误伤）
+    if ([cls containsString:@"Button"]) {
+        for (UIView *p = v.superview; p; p = p.superview) {
+            if ([NSStringFromClass(p.class) containsString:@"NCNotification"]) return YES;
+        }
+    }
+    return NO;
 }
 
 // 【v1.3.9 探针】诊断模式下，把一个视图的按钮画像记一条日志。
@@ -1150,7 +1179,9 @@ static void LNBApplyButtonBackground(UIView *view) {
     iv.contentMode = UIViewContentModeScaleAspectFill;
     iv.clipsToBounds = YES;
     iv.userInteractionEnabled = NO;
-    iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    // 【v1.4.0】同卡片：不用 autoresizing，每次进来强制对齐尺寸
+    iv.autoresizingMask = UIViewAutoresizingNone;
+    iv.frame = view.bounds;
     iv.alpha = prefs.suppAlpha;
 
     UIImage *img = [UIImage imageWithContentsOfFile:LNBPathForResource(imgName)];
