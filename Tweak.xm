@@ -23,6 +23,14 @@
 //    · 毛玻璃白底隐藏与恢复（关联对象记账）
 //    · 列表扫描兜底（iOS 16.5 上 NCNotificationListCell hook 可能不触发）
 //
+//  v2.0.2 左滑跟随（本轮核心修复）：
+//    iOS 16.5 通知卡片左滑时，滑的是 cell 内部的横向滚动容器
+//    （NCNotificationListCellScrollView， UIScrollView 子类），cell 本体不动。
+//    之前背景挂在 cell 上 → 不在滑动层里 → 左滑时背景钉在原地。
+//    修法：把背景插进滚动容器里的"卡片层"，滑动时背景随内容原生跟随，
+//    无需任何逐帧同步 —— 跟随是结构保证（与共享播放器同一设计哲学）。
+//    滑开后的空隙透出底层全屏背景（global.mp4），与参考视频一致。
+//
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
@@ -187,7 +195,6 @@ static void LNBSharedPlayerDetach(void) {
 @property (nonatomic, strong) AVPlayerLayer *playerLayer;
 @property (nonatomic, assign) BOOL attachedShared;     // 当前持有一个共享引用
 @property (nonatomic, assign) BOOL useSharedPlayer;    // 卡片 YES / 全局 NO
-@property (nonatomic, assign) BOOL windowMode;         // 【v2.0.1】取景窗模式：卡片=列表画面的窗口
 - (void)applyMediaWithVideo:(NSString *)vidName image:(NSString *)imgName;
 - (void)teardownMedia;
 - (void)syncToHostIfNeeded;
@@ -306,7 +313,7 @@ static void LNBSharedPlayerDetach(void) {
     }];
 }
 
-// 列表宿主缓存（取景窗模式用它算卡片在全幅画面里的位置）。
+// 列表宿主缓存（全屏背景层的挂载点，弱引用）。
 // 弱引用：列表销毁后自动失效，下次 layout 重新查找。
 static __weak UIView *lnbListHostCache = nil;
 static UIView *LNBGlobalBackgroundHost(void);   // 前向声明（定义在下方）
@@ -322,31 +329,9 @@ static UIView *LNBGlobalBackgroundHost(void);   // 前向声明（定义在下�
     if (!CGRectEqualToRect(_imageView.frame, self.bounds)) _imageView.frame = self.bounds;
 
     if (self.playerLayer) {
-        if (self.windowMode) {
-            // ──【v2.0.1 取景窗模式】──
-            // 用户需求：滑动通知列表时，卡片里的背景内容要跟着变化
-            // （卡片=窗户，窗外=一整幅 video 画面；滚动=移动窗户）。
-            // 做法：把播放层撑成【整个列表大小】，并按卡片在列表里的
-            // 位置负偏移 —— 卡片露出的是全幅画面中它所在的那块区域。
-            // 滚动 → 卡片位置变 → 露出区域变 → 内容跟着滑 ✓
-            // 多卡仍是同一 player，各自取景不同区域，天然同步 ✓
-            UIView *list = lnbListHostCache;
-            if (!list || !list.superview) {
-                list = LNBGlobalBackgroundHost();
-                lnbListHostCache = list;
-            }
-            if (list && self.window) {
-                CGRect r = [self convertRect:self.bounds toView:list];
-                // 播放层 = 全幅画面，负偏移到卡片当前位置
-                self.playerLayer.frame = CGRectMake(-r.origin.x, -r.origin.y,
-                                                    list.bounds.size.width,
-                                                    list.bounds.size.height);
-            } else {
-                self.playerLayer.frame = self.bounds;
-            }
-        } else {
-            self.playerLayer.frame = self.bounds;   // 无条件赋值，不做读回比较
-        }
+        // 背景铺满自身 bounds（自身=滑动容器里的卡片层）。
+        // 左滑时随宿主内容一起平移，裁切交给滚动容器/屏幕边缘。
+        self.playerLayer.frame = self.bounds;   // 无条件赋值，不做读回比较
     }
 }
 
@@ -361,7 +346,74 @@ static UIView *LNBGlobalBackgroundHost(void);   // 前向声明（定义在下�
 
 #pragma mark - 卡片背景
 
-// 给一条通知卡片挂背景。cell 即卡片宿主（frame=卡片几何，v1.4.x 实证）。
+// ── v2.0.2 左滑跟随的核心 ──
+// iOS 16.5 通知卡片左滑，滑的是 cell 内部的横向滚动容器
+// （NCNotificationListCellScrollView），cell 本体纹丝不动。
+// 背景必须放进"真正会滑动的那一层"，否则左滑时背景钉在原地（v2.0.0/2.0.1 的病灶）。
+//
+// 定位策略（两级）：
+//   ① 在 cell 子树里按类名找 NCNotificationListCellScrollView（精确匹配）；
+//   ② 在滚动容器里找"卡片层"：宽度≈卡片（0.7~1.05 倍 cell 宽）、高度≥0.7 倍 cell 高，
+//      深度优先取最深、同深度取面积最大 —— 排除毛玻璃/隐藏视图/背景自身，
+//      防止挂进被我们藏掉的 MTMaterialView 里（那样背景会跟着隐身）。
+//   兜底：找不到滚动容器 → 返回 cell（退回 v2.0.0 行为，至少不崩）。
+//   即使只挂到滚动容器本身（没找到更深的卡片层），UIScrollView 的所有子视图
+//   都随 contentOffset 平移 —— 照样跟随滑动。
+static UIView *LNBFindSlideHost(UIView *cell) {
+    CGSize cs = cell.bounds.size;
+    if (cs.width < 1.0 || cs.height < 1.0) return nil;
+
+    // ① 找横向滚动容器（BFS）
+    UIView *scrollView = nil;
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:cell];
+    NSInteger steps = 0;
+    while (queue.count > 0 && steps < 512) {
+        UIView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        steps++;
+        if (v != cell &&
+            [NSStringFromClass(v.class) isEqualToString:@"NCNotificationListCellScrollView"]) {
+            scrollView = v;
+            break;
+        }
+        for (UIView *sub in v.subviews) [queue addObject:sub];
+    }
+    if (!scrollView) return nil;
+
+    // ② 滚动容器里找卡片层（DFS，取最深且面积最大）
+    UIView *best = nil;
+    CGFloat bestArea = 0;
+    NSInteger bestDepth = -1;
+    NSMutableArray *stack  = [NSMutableArray arrayWithObject:scrollView];
+    NSMutableArray *depths = [NSMutableArray arrayWithObject:@0];
+    while (stack.count > 0) {
+        UIView *v = stack.lastObject;
+        NSInteger d = [depths.lastObject integerValue];
+        [stack removeLastObject];
+        [depths removeLastObject];
+        if (v != scrollView && !v.hidden && v.alpha > 0.05 &&
+            ![v isKindOfClass:[LNBBGView class]] && !LNBIsBlurMaterial(v)) {
+            CGFloat w = v.frame.size.width, h = v.frame.size.height;
+            if (w >= cs.width * 0.7 && w <= cs.width * 1.05 && h >= cs.height * 0.7) {
+                CGFloat area = w * h;
+                if (d > bestDepth || (d == bestDepth && area > bestArea)) {
+                    best = v;
+                    bestArea = area;
+                    bestDepth = d;
+                }
+            }
+        }
+        for (UIView *sub in v.subviews) {
+            [stack addObject:sub];
+            [depths addObject:@(d + 1)];
+        }
+    }
+    return best ?: scrollView;
+}
+
+// 给一条通知卡片挂背景。
+// 【v2.0.2】宿主不再是 cell 本体，而是滑动容器里的卡片层（LNBFindSlideHost）
+// —— 左滑时背景随卡片原生跟随，滑开后的空隙透出 global.mp4 全屏背景。
 static void LNBApplyCardBackground(UIView *cell) {
     if (!cell) return;
     NSString *cls = NSStringFromClass(cell.class);
@@ -377,28 +429,42 @@ static void LNBApplyCardBackground(UIView *cell) {
         return;
     }
 
-    cell.layer.cornerRadius = cell.layer.cornerRadius > 0 ? cell.layer.cornerRadius : 18.0;
-    cell.layer.masksToBounds = YES;
+    // 归一化圆角值，供背景自补圆角用（宿主不带圆角裁切时的兜底）
+    if (cell.layer.cornerRadius < 1.0) cell.layer.cornerRadius = 18.0;
     LNBSetCardMaterialsHidden(cell, YES);
+
+    UIView *host = LNBFindSlideHost(cell);
+    if (!host) host = cell;   // 极端情况（布局未就绪）：先挂 cell，下轮 layout 再挪
+
+    // cell 本体绝不裁切：若 cell 恰好是卡片宽度，裁切会把滑动中的背景
+    // 挡在"看不见的墙"上（卡片滑不出原位的视觉 bug）
+    cell.layer.masksToBounds = NO;
 
     LNBBGView *bg = (LNBBGView *)[cell viewWithTag:kCardBGViewTag];
     if (!bg) {
-        bg = [[LNBBGView alloc] initWithFrame:cell.bounds];
+        bg = [[LNBBGView alloc] initWithFrame:host.bounds];
         bg.tag = kCardBGViewTag;
         bg.useSharedPlayer = YES;
-        bg.windowMode = YES;   // 【v2.0.1】卡片=取景窗：滚动时露出画面的不同区域
     }
-    if (bg.superview != cell) {
+    if (bg.superview != host) {
         [bg removeFromSuperview];
-        [cell insertSubview:bg atIndex:0];
+        [host insertSubview:bg atIndex:0];
+        if (host != cell) {
+            LNBTLog(@"背景挂入滑动层: %@ (于 %@ 内)", NSStringFromClass(host.class), NSStringFromClass(host.superview.class));
+        }
     }
+    // 圆角：宿主自带圆角就用宿主的（与原生卡片完全一致）；否则自补 18pt。
+    // 双重圆角半径相同时视觉等价，不会有缝隙。
+    CGFloat radius = host.layer.cornerRadius > 0 ? host.layer.cornerRadius : 18.0;
+    if (fabs(bg.layer.cornerRadius - radius) > 0.5) bg.layer.cornerRadius = radius;
     [bg applyMediaWithVideo:(hasVideo ? kCardVideo : nil)
                       image:(hasVideo ? nil : kCardImage)];
 }
 
 // 几何同步（cell setter 调用；时间闸门：每帧最多放行一次）。
-// 【v2.0.1】滚动时 cell 位置变化也要触发卡片取景窗重算 ——
-// 这里除了 setNeedsLayout，直接让背景 layout（含取景窗计算）立即执行。
+// 【v2.0.2】背景挂在滑动容器里的卡片层后，左滑不再需要任何逐帧同步
+// （背景随内容原生移动）。这里只负责 cell 尺寸/位置变化（展开动画、
+// 重新布局）时让背景重新对齐宿主 —— syncToHostIfNeeded 自己会收敛。
 static void LNBSyncCardGeometry(UIView *cell) {
     static CFTimeInterval sLast = 0;
     CFTimeInterval now = CACurrentMediaTime();
@@ -537,6 +603,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    LNBTLog(@"v2.0 loaded — 素材目录 %@（card.mp4/global.mp4 即生效）", kBGDirectory);
+    LNBTLog(@"v2.0.2 loaded — 素材目录 %@（card.mp4/global.mp4 即生效；左滑跟随已启用）", kBGDirectory);
 }
 %end
