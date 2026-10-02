@@ -31,6 +31,15 @@ static NSString *const kBGGlobalImage    = @"global.jpg";
 static NSString *const kBGGlobalVideo    = @"global.mp4";
 static NSString *const kBGCardImage      = @"card.jpg";
 static NSString *const kBGCardVideo      = @"card.mp4";
+// 【v1.4.15】共享卡片渲染窗口高度（pt）。
+//   所有引用共享播放器的卡片，显示层一律用这个统一尺寸的虚拟窗口
+//   （水平铺卡宽、垂直居中、超出卡片的部分被裁掉）。
+//   为什么必须统一：AspectFill 的缩放取决于 layer 尺寸，而通知卡高度
+//   随内容行数不同（实测同一锁屏 41/52/63pt）。竖屏视频按高度铺满时，
+//   同一帧在矮卡里被放得更大 —— 三卡虽然同一解码帧，构图大小却不一致。
+//   统一窗口后缩放基准一致，同一帧在每张卡里的内容完全相同，
+//   唯一差异是矮卡看到的上下范围窄一些（物理必然，无法消除）。
+static CGFloat const kLNBSharedWindowH   = 100.0;
 // v1.3.6：附属按钮模块（删除 / 选项）独立素材。
 // 逻辑与卡片完全一致，只是换一套文件名，便于用户给按钮配不同的图/视频。
 static NSString *const kBGSuppImage      = @"supp.jpg";
@@ -635,7 +644,9 @@ static void LNBSharedPlayerDetach(void) {
         self.player = nil;   // 共享模式绝不持有 player，防止旧逻辑误停共享实例
         self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:shared];
         self.playerLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
-        self.playerLayer.frame = self.bounds;
+        // 【v1.4.15】统一渲染窗口（详见 kLNBSharedWindowH 注释）
+        self.playerLayer.frame = CGRectMake(0, (self.bounds.size.height - kLNBSharedWindowH) / 2.0,
+                                            self.bounds.size.width, kLNBSharedWindowH);
         [self.layer insertSublayer:self.playerLayer atIndex:0];
         self.imageView.hidden = YES;
         [self lnbArmReadyTimerIfNeeded];
@@ -788,9 +799,24 @@ static void LNBSharedPlayerDetach(void) {
     if (!CGRectEqualToRect(_dimView.frame, self.bounds)) {
         _dimView.frame = self.bounds;
     }
-    // 播放层始终与容器同尺寸（视频层不参与图案定位，直接跟 bounds 走）
+    // 播放层几何：
+    //   卡片（sharedPlayback）【v1.4.15】统一渲染窗口 —— 所有卡同一虚拟尺寸，
+    //     AspectFill 缩放基准一致，同一帧在每张卡里构图大小完全相同；
+    //     窗口垂直居中，超出卡片的部分被 clipsToBounds 裁掉。
+    //   全局列表背景：铺满自身 bounds（老行为）。
+    //   【v1.4.12 教训自查】这里是我们完全拥有的子层的直接赋值，判据不涉及
+    //   "设进去再读回来比"，无收敛风险。
     if (self.playerLayer) {
-        self.playerLayer.frame = self.bounds;
+        if (self.sharedPlayback) {
+            CGFloat wh = kLNBSharedWindowH;
+            // 无条件赋值，不做"读回比较"—— v1.4.12 的教训：任何往返比较
+            // 判据都可能因浮点/语义差异永不收敛。重复设置相同 frame 的
+            // 开销可忽略（CoreAnimation 内部会去重）。
+            self.playerLayer.frame = CGRectMake(0, (self.bounds.size.height - wh) / 2.0,
+                                                self.bounds.size.width, wh);
+        } else {
+            self.playerLayer.frame = self.bounds;
+        }
     }
 }
 
