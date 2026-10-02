@@ -414,12 +414,126 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 //   防止「设置几何 → 触发 layoutSubviews → 又调 sync」的无限递归。
 //   这类保护是 v1.4.12 卡死事故的直接补救，必须保留。
 @property (nonatomic, assign) BOOL lnbSyncing;
+// 【v1.4.14】共享播放器三件套：
+//   sharedPlayback —— YES=引用进程级共享 AVPlayer（所有卡片逐帧一致）；
+//   attachedShared —— 当前确实持有共享引用（对应一次 Acquire/Detach 配对）；
+//   ownsPlayer 由 player!=nil 隐含（共享模式下 self.player 恒为 nil，
+//   这样 teardown/videoDidReachEnd 的旧防护逻辑天然不会误停共享播放器）。
+@property (nonatomic, assign) BOOL sharedPlayback;
+@property (nonatomic, assign) BOOL attachedShared;
+@property (nonatomic, strong) NSTimer *lnbReadyTimer;  // 共享层 readyForDisplay 兜底检查
 - (void)applyConfig:(LNBPrefs *)prefs;
 - (void)applyAudioConfig:(LNBPrefs *)prefs;
 - (void)teardownPlayerIfNeeded;
 - (void)syncToHostIfNeeded;   // 【v1.4.12】自跟踪宿主【视觉】尺寸（frame），逐帧贴合卡片
 - (void)notifyHostGeometryChanged;  // 【v1.4.12】宿主尺寸/形变一变就被叫醒，立刻重贴
+- (void)lnbArmReadyTimerIfNeeded;    // 【v1.4.14】共享层 2 秒未 ready 则兜底切私有
+- (void)lnbStopReadyTimer;           // 【v1.4.14】
+- (void)lnbCheckSharedLayerReady;    // 【v1.4.14】
+- (void)lnbSetupPrivatePlayer:(NSString *)videoPath;  // 【v1.4.14】私有播放器装配（全局背景/兜底共用）
 @end
+
+#pragma mark - 共享卡片播放器（v1.4.14 核心）
+
+// ── 为什么要共享播放器 ──
+//   用户用两个视频对比给出了决定性证据：
+//     · 目标效果（朋友的鸭子视频）：所有卡片同一时刻显示同一帧（卡间像素差异 15~24，
+//       基本就是视频画面本身的差异）；
+//     · 我们的 v1.4.13：各卡显示不同帧（差异 48~73）。
+//   根因：v1.4.13 及之前每张卡片各建一个 AVPlayer，起始时间与循环时机独立，
+//   永远不可能对齐。
+//   方案：一个进程级共享 AVPlayer + 每卡一个 AVPlayerLayer 引用它。
+//   同一 player 的所有 layer 渲染同一解码帧 —— 「逐帧一致」是结构保证的
+//   （by construction），不靠任何同步引擎去追。内存反而更省：N 张卡只有
+//   1 个解码器实例。
+//
+//   【v1.4.12 的血泪教训同样适用这里】所有判据必须用直接比较（指针相等、
+//   路径字符串相等），绝不搞"设进去再读回来比"的往返计算。
+
+static AVPlayer     *lnbSharedPlayer  = nil;  // 共享播放器（卡片专用，恒静音）
+static NSString     *lnbSharedPath    = nil;  // 建它时用的视频完整路径
+static uint64_t      lnbSharedSize    = 0;    // 建它时视频文件大小（换素材检测）
+static NSTimeInterval lnbSharedMTime = 0;    // 建它时视频 mtime（覆盖同名文件检测）
+static id            lnbSharedEndObs  = nil;  // 循环播放通知观察者（全局仅一个）
+static NSInteger     lnbSharedAttachN = 0;    // 当前引用它的活跃卡片数
+
+// 共享播放器是否仍与给定视频匹配（路径 + 文件指纹：大小 + mtime）
+static BOOL LNBSharedPlayerMatches(NSString *videoPath) {
+    if (!lnbSharedPlayer || !lnbSharedPath) return NO;
+    if (![lnbSharedPath isEqualToString:videoPath]) return NO;
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:videoPath error:nil];
+    if (!attrs) return NO;
+    uint64_t sz = [attrs fileSize];
+    NSTimeInterval mt = [[attrs fileModificationDate] timeIntervalSince1970];
+    return (sz == lnbSharedSize && fabs(mt - lnbSharedMTime) < 0.5);
+}
+
+// 彻底拆掉共享播放器（换素材时）。还挂着旧 player 的卡片不受影响
+// （AVPlayerLayer 持有 player，player 只是被 pause，不会崩），它们下一次
+// setupPlayerIfNeeded 时会检测到 layer.player != lnbSharedPlayer 并重挂。
+static void LNBSharedPlayerTearDown(void) {
+    if (lnbSharedEndObs) {
+        [[NSNotificationCenter defaultCenter] removeObserver:lnbSharedEndObs];
+        lnbSharedEndObs = nil;
+    }
+    [lnbSharedPlayer pause];
+    lnbSharedPlayer = nil;
+    lnbSharedPath = nil;
+    lnbSharedSize = 0;
+    lnbSharedMTime = 0;
+}
+
+// 卡片来领共享播放器。视频路径或文件内容变了就重建；从「屏幕上一张卡都没有」
+// 恢复时回到片头从头播。返回前引用计数 +1，
+// 调用方必须在 teardown/dealloc 时配对调用 LNBSharedPlayerDetach()。
+static AVPlayer *LNBSharedPlayerAcquire(NSString *videoPath) {
+    if (!LNBSharedPlayerMatches(videoPath)) {
+        LNBSharedPlayerTearDown();
+        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:videoPath]];
+        lnbSharedPlayer = [AVPlayer playerWithPlayerItem:item];
+        lnbSharedPlayer.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+        // 卡片恒静音：锁屏上多条通知同播一个视频，出声会叠成噪声（沿用旧约定）
+        lnbSharedPlayer.muted = YES;
+        lnbSharedPlayer.volume = 0.0;
+        lnbSharedPath = [videoPath copy];
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:videoPath error:nil];
+        lnbSharedSize = [attrs fileSize];
+        lnbSharedMTime = [[attrs fileModificationDate] timeIntervalSince1970];
+        lnbSharedEndObs = [[NSNotificationCenter defaultCenter]
+            addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
+                        object:item
+                         queue:nil
+                    usingBlock:^(NSNotification *note) {
+            // 循环：只有一个 player，seek 回片头后所有卡一起跳 —— 天然同步
+            [lnbSharedPlayer seekToTime:kCMTimeZero
+                      completionHandler:^(BOOL done) {
+                if (done && lnbSharedPlayer) [lnbSharedPlayer play];
+            }];
+        }];
+    }
+
+    BOOL wasIdle = (lnbSharedAttachN == 0);
+    lnbSharedAttachN++;
+    if (wasIdle) {
+        // 从「一张卡都没有」恢复：回到片头从头播。
+        // 若已有多张卡在播，绝不 seek（会让屏幕上所有卡齐闪一下）。
+        [lnbSharedPlayer seekToTime:kCMTimeZero];
+        [lnbSharedPlayer play];
+    } else if (lnbSharedPlayer.rate == 0.0) {
+        // 保险：仍有人引用却停着（异常态），拉起来即可，不动时间轴
+        [lnbSharedPlayer play];
+    }
+    return lnbSharedPlayer;
+}
+
+// 卡片归还（teardown / dealloc 时）。归零即暂停并回片头，省电且下次从头播。
+static void LNBSharedPlayerDetach(void) {
+    if (lnbSharedAttachN > 0) lnbSharedAttachN--;
+    if (lnbSharedAttachN == 0 && lnbSharedPlayer) {
+        [lnbSharedPlayer pause];
+        [lnbSharedPlayer seekToTime:kCMTimeZero];
+    }
+}
 
 @implementation LNBGlobalBackgroundView
 
@@ -483,16 +597,64 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
     NSString *videoPath = LNBPathForResource(vidName);
     if (!LNBFileExists(videoPath)) {
         // 视频文件缺失，直接退回静态模式，避免黑屏
+        [self lnbStopReadyTimer];
+        [self teardownPlayerIfNeeded];   // 【v1.4.14】含共享引用归还
         self.imageView.image = [UIImage imageWithContentsOfFile:LNBPathForResource(imgName)];
         self.imageView.hidden = (self.imageView.image == nil);
         return;
     }
 
-    // 已在播放同一个视频则跳过（但仍需刷新音频配置）
+    // ── 【v1.4.14 核心分流】 ──
+    //   卡片背景（sharedPlayback=YES）：引用进程级共享 AVPlayer，
+    //     所有卡片同一时刻渲染同一帧 —— 结构保证，无同步引擎。
+    //   全局列表背景（sharedPlayback=NO）：保持私有播放器老行为（可出声）。
+    if (self.sharedPlayback) {
+        // 已挂着正确的共享 layer 且视频文件没变 → 无事可做（兜底检查器继续在岗）。
+        // 【文件指纹必须查】用户覆盖同名素材时路径不变但 mtime/大小变了，
+        //   不查的话旧卡永远停在旧视频上（换素材不生效的隐形 bug）。
+        if (self.playerLayer && self.attachedShared && self.playerLayer.player &&
+            self.playerLayer.player == lnbSharedPlayer &&
+            LNBSharedPlayerMatches(videoPath)) {
+            [self lnbArmReadyTimerIfNeeded];
+            return;
+        }
+        // 走到这里 = 首次装配，或共享播放器被重建过（换素材）需要重挂
+        [self lnbStopReadyTimer];
+        if (self.playerLayer) {
+            [self.playerLayer removeFromSuperlayer];
+            self.playerLayer = nil;
+        }
+        if (self.attachedShared) {
+            self.attachedShared = NO;
+            LNBSharedPlayerDetach();
+        }
+        [self teardownPlayerIfNeeded];   // 清掉可能残留的私有 player
+
+        AVPlayer *shared = LNBSharedPlayerAcquire(videoPath);
+        self.attachedShared = YES;
+        self.player = nil;   // 共享模式绝不持有 player，防止旧逻辑误停共享实例
+        self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:shared];
+        self.playerLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
+        self.playerLayer.frame = self.bounds;
+        [self.layer insertSublayer:self.playerLayer atIndex:0];
+        self.imageView.hidden = YES;
+        [self lnbArmReadyTimerIfNeeded];
+        return;
+    }
+
+    // ── 私有播放器路径（全局列表背景）──
     if (self.player && self.playerLayer) {
         [self applyAudioConfig:[LNBPrefs sharedInstance]];
         return;
     }
+    [self lnbSetupPrivatePlayer:videoPath];
+}
+
+// 【v1.4.14】私有播放器装配：全局列表背景 + 共享层 ready 兜底共用
+- (void)lnbSetupPrivatePlayer:(NSString *)videoPath {
+    // 防御：先清掉任何残留（player 在但 layer 不在的异常半拆态），
+    // 否则会装配出第二个 player 覆盖 self.player，旧实例泄漏且不停播
+    if (self.player || self.playerLayer) [self teardownPlayerIfNeeded];
 
     NSURL *url = [NSURL fileURLWithPath:videoPath];
     AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
@@ -516,6 +678,44 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
                                                object:item];
 
     [self.player play];
+}
+
+// 【v1.4.14】共享层兜底：attach 后 2 秒仍未 readyForDisplay 则该卡切私有播放器。
+//   宁可这一张卡与其他卡不同帧，也不能黑屏。
+- (void)lnbArmReadyTimerIfNeeded {
+    if (!self.sharedPlayback || !self.playerLayer || self.lnbReadyTimer) return;
+    __weak typeof(self) wself = self;
+    NSTimer *t = [NSTimer timerWithTimeInterval:2.0 repeats:NO block:^(NSTimer *timer) {
+        __strong typeof(wself) sself = wself;
+        [sself lnbCheckSharedLayerReady];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+    self.lnbReadyTimer = t;
+}
+
+- (void)lnbStopReadyTimer {
+    if (_lnbReadyTimer) {
+        [_lnbReadyTimer invalidate];
+        _lnbReadyTimer = nil;
+    }
+}
+
+- (void)lnbCheckSharedLayerReady {
+    [self lnbStopReadyTimer];
+    if (!self.sharedPlayback || !self.playerLayer || self.player) return; // 已切私有/已拆
+    if (self.playerLayer.isReadyForDisplay) return;                        // 正常渲染中
+    LNBTLog(@"[共享播放器] 卡片共享层 2 秒未 ready，兜底切私有播放器");
+    if (self.attachedShared) {
+        self.attachedShared = NO;
+        LNBSharedPlayerDetach();
+    }
+    [self.playerLayer removeFromSuperlayer];
+    self.playerLayer = nil;
+    NSString *vidName = self.videoName ?: kBGGlobalVideo;
+    NSString *videoPath = LNBPathForResource(vidName);
+    if (LNBFileExists(videoPath)) {
+        [self lnbSetupPrivatePlayer:videoPath];
+    }
 }
 
 // 按当前配置设置音量与音频会话
@@ -558,9 +758,16 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 }
 
 - (void)teardownPlayerIfNeeded {
+    [self lnbStopReadyTimer];
     if (self.playerLayer) {
         [self.playerLayer removeFromSuperlayer];
         self.playerLayer = nil;
+    }
+    // 【v1.4.14】共享引用归还：必须在移除 layer 的同时归还计数，
+    //   否则计数泄漏 → 共享播放器永不暂停 → 白白耗电。
+    if (self.attachedShared) {
+        self.attachedShared = NO;
+        LNBSharedPlayerDetach();
     }
     if (self.player) {
         [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemDidPlayToEndTimeNotification object:self.player.currentItem];
@@ -726,6 +933,14 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    // 【v1.4.14】兜底归还共享引用与 ready 检查器。
+    //   正常路径 teardownPlayerIfNeeded 已经归还过（attachedShared==NO），
+    //   这里只补「没走 teardown 就直接释放」的路径（通知中心直接关闭）。
+    [_lnbReadyTimer invalidate];
+    if (_attachedShared) {
+        _attachedShared = NO;
+        LNBSharedPlayerDetach();
+    }
 }
 
 @end
@@ -1137,6 +1352,9 @@ static void LNBApplyCardBackground(UIView *cellView) {
     bg.preferVideo = useVideo && hasVideo;
     // 卡片视频始终静音（锁屏上多条通知同时播，出声会叠成噪声）
     bg.muteAudio = YES;
+    // 【v1.4.14】卡片引用共享播放器：所有卡片同一时刻同一帧（用户核心诉求，
+    //   对标朋友视频里「多张卡同帧播放」的效果）
+    bg.sharedPlayback = YES;
     if (bg.superview != cellView) {
         [bg removeFromSuperview];
         [cellView insertSubview:bg atIndex:0];
