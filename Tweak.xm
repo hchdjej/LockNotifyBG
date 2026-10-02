@@ -31,15 +31,9 @@ static NSString *const kBGGlobalImage    = @"global.jpg";
 static NSString *const kBGGlobalVideo    = @"global.mp4";
 static NSString *const kBGCardImage      = @"card.jpg";
 static NSString *const kBGCardVideo      = @"card.mp4";
-// 【v1.4.15】共享卡片渲染窗口高度（pt）。
-//   所有引用共享播放器的卡片，显示层一律用这个统一尺寸的虚拟窗口
-//   （水平铺卡宽、垂直居中、超出卡片的部分被裁掉）。
-//   为什么必须统一：AspectFill 的缩放取决于 layer 尺寸，而通知卡高度
-//   随内容行数不同（实测同一锁屏 41/52/63pt）。竖屏视频按高度铺满时，
-//   同一帧在矮卡里被放得更大 —— 三卡虽然同一解码帧，构图大小却不一致。
-//   统一窗口后缩放基准一致，同一帧在每张卡里的内容完全相同，
-//   唯一差异是矮卡看到的上下范围窄一些（物理必然，无法消除）。
-static CGFloat const kLNBSharedWindowH   = 100.0;
+// 【v1.4.15 → v1.4.16 已废弃】曾用固定 100pt"统一渲染窗口"来对齐各卡构图，
+//   实测不可行：层高超过卡片实际高度被裁掉，滚动/展开时背景与卡片脱节。
+//   播放层统一改为铺满自身 bounds。
 // v1.3.6：附属按钮模块（删除 / 选项）独立素材。
 // 逻辑与卡片完全一致，只是换一套文件名，便于用户给按钮配不同的图/视频。
 static NSString *const kBGSuppImage      = @"supp.jpg";
@@ -414,7 +408,7 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 @property (nonatomic, copy) NSString *videoName;    // 背景视频文件名
 @property (nonatomic, assign) BOOL preferVideo;     // YES=视频模式
 @property (nonatomic, assign) CGFloat alphaOverride;// >=0 时覆盖全局 globalAlpha（卡片用 1.0）
-@property (nonatomic, assign) BOOL muteAudio;       // YES=强制静音（卡片视频多路叠加必须静音）
+@property (nonatomic, assign) BOOL muteAudio;       // YES=强制静音；NO=跟随用户在设置里的音量/静音
 @property (nonatomic, strong) UIImageView *imageView;
 @property (nonatomic, strong) UIView *dimView;
 @property (nonatomic, strong) AVPlayer *player;
@@ -459,7 +453,7 @@ static UIImage *LNBThumbnailForVideo(NSString *videoPath) {
 //   【v1.4.12 的血泪教训同样适用这里】所有判据必须用直接比较（指针相等、
 //   路径字符串相等），绝不搞"设进去再读回来比"的往返计算。
 
-static AVPlayer     *lnbSharedPlayer  = nil;  // 共享播放器（卡片专用，恒静音）
+static AVPlayer     *lnbSharedPlayer  = nil;  // 共享播放器（卡片专用；音量跟随用户设置）
 static NSString     *lnbSharedPath    = nil;  // 建它时用的视频完整路径
 static uint64_t      lnbSharedSize    = 0;    // 建它时视频文件大小（换素材检测）
 static NSTimeInterval lnbSharedMTime = 0;    // 建它时视频 mtime（覆盖同名文件检测）
@@ -624,6 +618,8 @@ static void LNBSharedPlayerDetach(void) {
         if (self.playerLayer && self.attachedShared && self.playerLayer.player &&
             self.playerLayer.player == lnbSharedPlayer &&
             LNBSharedPlayerMatches(videoPath)) {
+            // 视频没变也要重刷音频：用户在设置里改音量/静音必须立即生效
+            [self applyAudioConfig:[LNBPrefs sharedInstance]];
             [self lnbArmReadyTimerIfNeeded];
             return;
         }
@@ -644,11 +640,17 @@ static void LNBSharedPlayerDetach(void) {
         self.player = nil;   // 共享模式绝不持有 player，防止旧逻辑误停共享实例
         self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:shared];
         self.playerLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
-        // 【v1.4.15】统一渲染窗口（详见 kLNBSharedWindowH 注释）
-        self.playerLayer.frame = CGRectMake(0, (self.bounds.size.height - kLNBSharedWindowH) / 2.0,
-                                            self.bounds.size.width, kLNBSharedWindowH);
+        // 【v1.4.16 回退 v1.4.15 的统一窗口】播放层必须铺满卡片自身 bounds。
+        //   v1.4.15 曾把层固定成 100pt 高的"虚拟窗口"，结果：
+        //     · 层高 100pt 超过卡片实际高度（41~63pt），超出部分被 clipsToBounds
+        //       裁掉，滚动/展开时视觉上背景与卡片脱节，用户反馈"原地不动"；
+        //     · 卡片高度本就不同，统一窗口既没解决构图问题又引入新毛病。
+        //   铺满 bounds 才是与真实卡片几何一致的做法。
+        self.playerLayer.frame = self.bounds;
         [self.layer insertSublayer:self.playerLayer atIndex:0];
         self.imageView.hidden = YES;
+        // 【v1.4.16】装配后立刻套用音频配置（音量/静音）
+        [self applyAudioConfig:[LNBPrefs sharedInstance]];
         [self lnbArmReadyTimerIfNeeded];
         return;
     }
@@ -734,13 +736,18 @@ static void LNBSharedPlayerDetach(void) {
 // 因此这里显式配置 AVAudioSession 为 Ambient + MixWithOthers，
 // 保证播放背景视频时不会把用户正在听的音乐掐断。
 - (void)applyAudioConfig:(LNBPrefs *)prefs {
-    if (!self.player) return;
+    // 【v1.4.16 修复音频回归】原来第一行是 `if (!self.player) return;`，
+    //   而共享模式下 self.player 恒为 nil → 音频配置从未执行，
+    //   用户在设置里改音量/静音完全不生效。
+    //   现在：私有 player 与共享 player 都按各自路径配置。
+    AVPlayer *target = self.player ?: (self.attachedShared ? lnbSharedPlayer : nil);
+    if (!target) return;
 
     // 卡片视频多路叠加必须静音；整块背景视频跟随用户设置
-    self.player.muted = self.muteAudio ? YES : prefs.videoMuted;
-    self.player.volume = self.muteAudio ? 0.0 : prefs.videoVolume;
+    target.muted = self.muteAudio ? YES : prefs.videoMuted;
+    target.volume = self.muteAudio ? 0.0 : prefs.videoVolume;
 
-    if (self.player.muted) return;
+    if (target.muted) return;
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -806,17 +813,13 @@ static void LNBSharedPlayerDetach(void) {
     //   全局列表背景：铺满自身 bounds（老行为）。
     //   【v1.4.12 教训自查】这里是我们完全拥有的子层的直接赋值，判据不涉及
     //   "设进去再读回来比"，无收敛风险。
+    // 播放层几何：始终铺满自身 bounds（随卡片尺寸逐帧跟随）。
+    //   【v1.4.16 回退】v1.4.15 曾对卡片用固定 100pt"统一窗口"，导致层高溢出
+    //   卡片被裁、滚动展开时背景与卡片脱节（用户反馈"原地不动"）。
+    //   铺满 bounds 是唯一与真实卡片几何一致的做法。
+    //   【v1.4.12 教训自查】这里是直接赋值，不做"读回比较"判据。
     if (self.playerLayer) {
-        if (self.sharedPlayback) {
-            CGFloat wh = kLNBSharedWindowH;
-            // 无条件赋值，不做"读回比较"—— v1.4.12 的教训：任何往返比较
-            // 判据都可能因浮点/语义差异永不收敛。重复设置相同 frame 的
-            // 开销可忽略（CoreAnimation 内部会去重）。
-            self.playerLayer.frame = CGRectMake(0, (self.bounds.size.height - wh) / 2.0,
-                                                self.bounds.size.width, wh);
-        } else {
-            self.playerLayer.frame = self.bounds;
-        }
+        self.playerLayer.frame = self.bounds;
     }
 }
 
@@ -1371,13 +1374,13 @@ static void LNBApplyCardBackground(UIView *cellView) {
         bg = [[LNBGlobalBackgroundView alloc] initWithFrame:cellView.bounds];
         bg.tag = bgTag;
         bg.alphaOverride = 1.0;
-        bg.muteAudio = YES;
     }
     bg.imageName = imgName;
     bg.videoName = vidName;
     bg.preferVideo = useVideo && hasVideo;
-    // 卡片视频始终静音（锁屏上多条通知同时播，出声会叠成噪声）
-    bg.muteAudio = YES;
+    // 【v1.4.16】卡片视频的声音跟随用户设置（原来硬编码 YES 导致"改声音没反应"）。
+    //   多卡同播同一共享播放器只有一路声音，不会叠加成噪声。
+    bg.muteAudio = NO;
     // 【v1.4.14】卡片引用共享播放器：所有卡片同一时刻同一帧（用户核心诉求，
     //   对标朋友视频里「多张卡同帧播放」的效果）
     bg.sharedPlayback = YES;
