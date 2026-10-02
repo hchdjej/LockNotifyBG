@@ -28,13 +28,23 @@
 //    比可视卡片大 → 背景铺出卡片外（素材画面下缘的小人溢出到卡片外）
 //    且亮屏瞬间卡片错位贴边。
 //
-//  v2.0.3 左滑跟随（第二版，当前）：
-//    · 挂载点回到 cell 本体（v2.0.0 已验证：尺寸=卡片、圆角、铺满）
-//    · 跟随改用 %hook NCNotificationListCellScrollView（setBounds/
-//      setContentOffset）—— iOS 16.5 左滑就是滚动它，cell 本体不动。
-//      偏移变化时把背景中心平移 -offset.x（LNBMirrorSwipe）。
-//    · 偏移存关联对象，syncToHostIfNeeded 读取同一份，两机制不打架
-//    · 滑开后的空隙透出底层全屏背景（global.mp4），与参考视频一致
+//  v2.1.0 架构修正（关键认知更新）：
+//    用户澄清：参考视频里"整个屏幕的画面是朋友的视频壁纸"。
+//    定量分析实锤：朋友卡片内亮度 = 卡片外 × 0.84、卡片边界上下
+//    画面连续（差 28 远小于随机 44）—— 朋友的效果是
+//    【视频壁纸 + 卡片半透明暗化（壁纸透过卡片连续显示）】，
+//    卡片根本没有独立视频层！
+//    因此本版改为两种模式：
+//    A. 有 global.mp4（透明卡片模式，默认对齐朋友）：
+//       全屏视频层铺列表底部（唯一视频源）+ 卡片只放 16% 暗化板。
+//       卡片内外画面连续、多卡跨卡拼接连续 —— 物理保证，无需取景计算。
+//    B. 无 global 有 card.mp4（旧模式）：卡片独立铺 card.mp4。
+//
+//  v2.0.3 左滑跟随：hook NCNotificationListCellScrollView（setBounds/
+//      setContentOffset），偏移变化时把卡片背景层中心平移 -offset.x
+//      （LNBMirrorSwipe）—— 透明模式的暗化板与旧模式的视频层都适用。
+//  v2.0.4 全屏背景挂载修复：调用点加进 cell hook（实机证明只有它稳定
+//      触发），宿主查找加"从 cell 向上爬最近的大容器"兜底。
 //
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -204,6 +214,7 @@ static void LNBSharedPlayerDetach(void) {
 @property (nonatomic, assign) BOOL attachedShared;     // 当前持有一个共享引用
 @property (nonatomic, assign) BOOL useSharedPlayer;    // 卡片 YES / 全局 NO
 - (void)applyMediaWithVideo:(NSString *)vidName image:(NSString *)imgName;
+- (void)applyDimOnlyWithAlpha:(CGFloat)alpha;
 - (void)teardownMedia;
 - (void)syncToHostIfNeeded;
 @end
@@ -225,7 +236,18 @@ static void LNBSharedPlayerDetach(void) {
     return self;
 }
 
+// 【v2.1.0 透明卡片模式】不放任何媒体，只做半透明暗化板。
+// 全屏视频层（global.mp4）透过它显示 —— 卡片内外画面连续，
+// 与参考视频一致（卡片内亮度 ≈ 卡片外 × 0.84，即压暗 ~16%）。
+- (void)applyDimOnlyWithAlpha:(CGFloat)alpha {
+    [self teardownMedia];
+    self.imageView.hidden = YES;
+    self.backgroundColor = [UIColor colorWithWhite:0.0 alpha:alpha];
+    [self setNeedsLayout];
+}
+
 - (void)applyMediaWithVideo:(NSString *)vidName image:(NSString *)imgName {
+    self.backgroundColor = [UIColor clearColor];   // 从暗化模式切回时恢复透明底
     NSString *videoPath = vidName ? LNBPathForResource(vidName) : nil;
     if (videoPath && LNBFileExists(videoPath)) {
         self.imageView.hidden = YES;
@@ -329,7 +351,7 @@ static void LNBSharedPlayerDetach(void) {
 // 列表宿主缓存（全屏背景层的挂载点，弱引用）。
 // 弱引用：列表销毁后自动失效，下次 layout 重新查找。
 static __weak UIView *lnbListHostCache = nil;
-static UIView *LNBGlobalBackgroundHost(void);   // 前向声明（定义在下方）
+static UIView *LNBGlobalBackgroundHost(UIView *anchor);   // 前向声明（定义在下方）
 
 - (void)layoutSubviews {
     NSNumber *syncing = objc_getAssociatedObject(self, kLNBSyncingKey);
@@ -383,18 +405,24 @@ static void LNBMirrorSwipe(UIView *scrollView, CGFloat offsetX) {
 }
 
 // 给一条通知卡片挂背景。
-// 【v2.0.3】宿主回到 cell 本体（v2.0.0 已验证的渲染正确性：尺寸=卡片、
-// 圆角正确、铺满不溢出）。v2.0.2 挂进滚动容器内找到的"卡片层"，
-// 实机证明该容器比可视卡片大 → 背景铺出卡片外（小人溢出）+ 亮屏瞬间错位。
-// 左滑跟随不再靠挂载点，改由 LNBMirrorSwipe 镜像滚动偏移实现。
+// 【v2.1.0】两种模式：
+//   A. 有 global 素材（透明卡片模式，对齐参考视频）——
+//      卡片不放独立视频！只放半透明暗化层，让列表底部的全屏视频层
+//      透过卡片显示。卡片内外画面连续（朋友效果的鸭嘴跨卡片边界
+//      连续就是这个原理），多卡显示各自位置的同一画面，跨卡拼接连续。
+//      定量依据：朋友卡片内亮度 = 卡片外 × 0.84（压暗 16%）。
+//   B. 无 global 但有 card（旧模式）—— 卡片铺 card.mp4 独立视频。
 static void LNBApplyCardBackground(UIView *cell) {
     if (!cell) return;
     NSString *cls = NSStringFromClass(cell.class);
     if (![cls isEqualToString:@"NCNotificationListCell"]) return;
 
-    BOOL hasVideo = LNBFileExists(LNBPathForResource(kCardVideo));
-    BOOL hasImage = LNBFileExists(LNBPathForResource(kCardImage));
-    if (!hasVideo && !hasImage) {
+    BOOL hasGlobalVideo = LNBFileExists(LNBPathForResource(kGlobalVideo));
+    BOOL hasGlobalImage = LNBFileExists(LNBPathForResource(kGlobalImage));
+    BOOL hasGlobal      = hasGlobalVideo || hasGlobalImage;
+    BOOL hasCardVideo   = LNBFileExists(LNBPathForResource(kCardVideo));
+    BOOL hasCardImage   = LNBFileExists(LNBPathForResource(kCardImage));
+    if (!hasGlobal && !hasCardVideo && !hasCardImage) {
         // 没素材：还原并退出（原生样式）
         LNBSetCardMaterialsHidden(cell, NO);
         UIView *old = [cell viewWithTag:kCardBGViewTag];
@@ -421,8 +449,15 @@ static void LNBApplyCardBackground(UIView *cell) {
     // 圆角自补（宿主不带圆角裁切时由背景自身保持原生卡片圆角观感）
     CGFloat radius = cell.layer.cornerRadius > 0 ? cell.layer.cornerRadius : 18.0;
     if (fabs(bg.layer.cornerRadius - radius) > 0.5) bg.layer.cornerRadius = radius;
-    [bg applyMediaWithVideo:(hasVideo ? kCardVideo : nil)
-                      image:(hasVideo ? nil : kCardImage)];
+
+    if (hasGlobal) {
+        // 透明卡片模式：半透明暗化板，透出列表底部的全屏视频层
+        [bg applyDimOnlyWithAlpha:0.16];
+    } else {
+        // 旧模式：卡片独立铺 card.mp4
+        [bg applyMediaWithVideo:(hasCardVideo ? kCardVideo : nil)
+                          image:(hasCardVideo ? nil : kCardImage)];
+    }
 }
 
 // 几何同步（cell setter 调用；时间闸门：每帧最多放行一次）。
@@ -440,8 +475,15 @@ static void LNBSyncCardGeometry(UIView *cell) {
 
 #pragma mark - 全屏背景图层
 
-// 找通知体系最外层祖先作为宿主（覆盖整个列表区域，卡片间隙透出）
-static UIView *LNBGlobalBackgroundHost(void) {
+// 找全屏背景宿主。
+// 【v2.0.4】两路查找：
+//   ① BFS 全窗口找 NC 前缀列表视图并爬祖先（原逻辑，iOS 16.5 锁屏上可能落空）；
+//   ② 兜底：从 anchor（触发 hook 的 cell/列表视图）向上爬，取第一个
+//      "足够大"（≥0.85×屏宽 且 ≥0.5×屏高）的祖先 —— 即装着所有卡片的
+//      列表容器。取"最近"不取"最大"：避免爬到含壁纸子视图的锁屏根
+//      （插 index 0 会掉到壁纸下面）。列表容器的子视图全是通知内容，
+//      index 0 必在所有卡片之下、背景之上 —— 安全。
+static UIView *LNBGlobalBackgroundHost(UIView *anchor) {
     for (UIWindow *window in [UIApplication sharedApplication].windows) {
         if (window.isHidden || window.alpha < 0.01) continue;
         NSMutableArray *queue = [NSMutableArray arrayWithObject:window];
@@ -461,13 +503,35 @@ static UIView *LNBGlobalBackgroundHost(void) {
             for (UIView *sub in view.subviews) [queue addObject:sub];
         }
     }
+    // ② 兜底：anchor 向上爬
+    if (anchor) {
+        CGSize screen = [UIScreen mainScreen].bounds.size;
+        UIView *p = anchor;
+        NSInteger guard = 0;
+        while (p && guard++ < 12) {
+            CGSize bs = p.bounds.size;
+            if (bs.width >= screen.width * 0.85 && bs.height >= screen.height * 0.5) {
+                return p;
+            }
+            if ([p isKindOfClass:[UIWindow class]]) break;
+            p = p.superview;
+        }
+    }
     return nil;
 }
 
-static void LNBEnsureListBackground(void) {
+// 全屏背景就绪节流：cell hook 每帧都会进来，宿主+bg 已就绪时 0.5s 才
+// 复查一次（素材更换/宿主重建最迟半秒生效），避免高频 BFS 拖累滑动帧率。
+static CFTimeInterval lnbGlobalBGLastCheck = 0;
+
+static void LNBEnsureListBackground(UIView *anchor) {
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lnbGlobalBGLastCheck < 0.5) return;
+    lnbGlobalBGLastCheck = now;
+
     BOOL hasVideo = LNBFileExists(LNBPathForResource(kGlobalVideo));
     BOOL hasImage = LNBFileExists(LNBPathForResource(kGlobalImage));
-    UIView *host = LNBGlobalBackgroundHost();
+    UIView *host = LNBGlobalBackgroundHost(anchor);
     if ((!hasVideo && !hasImage) || !host) {
         // 无素材：清理所有历史挂载
         for (UIWindow *window in [UIApplication sharedApplication].windows) {
@@ -524,12 +588,12 @@ static void LNBScanAndApplyCards(UIView *root) {
     }
 }
 
-#pragma mark - Hooks
+# pragma mark - Hooks
 
 %hook NCNotificationListView
 - (void)layoutSubviews {
     %orig;
-    LNBEnsureListBackground();
+    LNBEnsureListBackground((UIView *)self);
     LNBScanAndApplyCards((UIView *)self);
 }
 %end
@@ -537,7 +601,7 @@ static void LNBScanAndApplyCards(UIView *root) {
 %hook NCNotificationListSectionView
 - (void)layoutSubviews {
     %orig;
-    LNBEnsureListBackground();
+    LNBEnsureListBackground((UIView *)self);
 }
 %end
 
@@ -561,6 +625,10 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)layoutSubviews {
     %orig;
     LNBApplyCardBackground((UIView *)self);
+    // 【v2.0.4】全屏背景的调用点加到 cell hook —— 实机证明 iOS 16.5 锁屏上
+    // 只有 cell 的 layout 稳定触发（ListView/SectionView 未必），
+    // v2.0.0~v2.0.3 的全屏背景层因此一直没挂上（卡片后面是静态壁纸）。
+    LNBEnsureListBackground((UIView *)self);
 }
 - (void)setFrame:(CGRect)frame {
     %orig(frame);
@@ -583,6 +651,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    LNBTLog(@"v2.0.3 loaded — 素材目录 %@（card.mp4/global.mp4 即生效；左滑跟随 v2）", kBGDirectory);
+    LNBTLog(@"v2.1.0 loaded — 素材目录 %@（有 global.mp4 走透明卡片模式，否则卡片铺 card.mp4）", kBGDirectory);
 }
 %end
