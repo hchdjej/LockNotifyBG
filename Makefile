@@ -16,7 +16,6 @@ LockNotifyBG_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variab
 LockNotifyBG_FRAMEWORKS = UIKit Foundation AVFoundation CoreMedia QuartzCore
 LockNotifyBG_PRIVATE_FRAMEWORKS = BulletinBoard
 
-SUBPROJECTS += prefs
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 include $(THEOS_MAKE_PATH)/aggregate.mk
