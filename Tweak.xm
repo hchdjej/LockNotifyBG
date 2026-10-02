@@ -38,6 +38,21 @@
 //   （v2.0.2 的溢出问题由此彻底修正）。折叠/展开两种状态均结构保证跟随。
 //    镜像机制（LNBMirrorSwipe / scrollview hook）随之移除。
 //
+//  v2.1.2 全屏视频层重构（最新实测对比驱动）：
+//    用户两个视频对比结论：插件折叠滑动跟随已 ✓，但卡片外是静态壁纸、
+//    滑开后露出白色「清除」按钮；参考效果是【整屏连续视频 + 卡片挖洞
+//    透出对应位置画面 + 清除按钮浮在视频上】。
+//    差距根源 = 缺一层可靠铺满全屏的视频背景。三处修正：
+//    ① 素材自动全屏化：global.mp4 优先，缺失时 card.mp4 兜底 ——
+//       只装一个素材也能得到参考效果（v2.1.1 必须装 global 才走透明模式）；
+//    ② 全屏层挂"锁屏根"（anchor 的 window 直接子视图中包含 anchor 的
+//       ≥0.9 屏大视图），插入位置 = 类名含 wallpaper 的直接子视图之上，
+//       没有则 index 0 —— 视频位于壁纸之上、时钟/通知列表/清除按钮之下，
+//       滑开空隙透视频、按钮浮视频上，全是结构保证；
+//    ③ 卡片统一透明暗化模式（16% 暗化板），删除"卡片独立铺 card.mp4"
+//       旧模式 —— 参考视频卡片根本没有独立视频层。
+//    全屏层也改走共享播放器（进程内唯一解码器，卡片暗化板零解码）。
+//
 //  v2.1.0 架构修正（关键认知更新）：
 //    用户澄清：参考视频里"整个屏幕的画面是朋友的视频壁纸"。
 //    定量分析实锤：朋友卡片内亮度 = 卡片外 × 0.84、卡片边界上下
@@ -100,6 +115,20 @@ static NSString *LNBPathForResource(NSString *name) {
 
 static BOOL LNBFileExists(NSString *path) {
     return [[NSFileManager defaultManager] fileExistsAtPath:path];
+}
+
+// 【v2.1.2】解析全屏素材：global 优先，card 兜底 —— 只装一个素材也能全屏。
+static void LNBResolveFullMedia(NSString **outVid, NSString **outImg) {
+    BOOL gv = LNBFileExists(LNBPathForResource(kGlobalVideo));
+    BOOL gi = LNBFileExists(LNBPathForResource(kGlobalImage));
+    BOOL cv = LNBFileExists(LNBPathForResource(kCardVideo));
+    BOOL ci = LNBFileExists(LNBPathForResource(kCardImage));
+    *outVid = nil;
+    *outImg = nil;
+    if      (gv) *outVid = kGlobalVideo;
+    else if (cv) *outVid = kCardVideo;
+    else if (gi) *outImg = kGlobalImage;
+    else if (ci) *outImg = kCardImage;
 }
 
 #pragma mark - 毛玻璃白底隐藏
@@ -252,6 +281,13 @@ static void LNBSharedPlayerDetach(void) {
 // 全屏视频层（global.mp4）透过它显示 —— 卡片内外画面连续，
 // 与参考视频一致（卡片内亮度 ≈ 卡片外 × 0.84，即压暗 ~16%）。
 - (void)applyDimOnlyWithAlpha:(CGFloat)alpha {
+    // 幂等早退：已是相同暗化状态就不再动（layout 每帧都会调）
+    if (self.imageView.hidden && !self.playerLayer && !self.attachedShared && !self.player &&
+        self.backgroundColor) {
+        CGFloat r, g, b, a;
+        if ([self.backgroundColor getRed:&r green:&g blue:&b alpha:&a] &&
+            fabs(a - alpha) < 0.005) return;
+    }
     [self teardownMedia];
     self.imageView.hidden = YES;
     self.backgroundColor = [UIColor colorWithWhite:0.0 alpha:alpha];
@@ -471,12 +507,12 @@ static void LNBApplyCardBackground(UIView *cell) {
     NSString *cls = NSStringFromClass(cell.class);
     if (![cls isEqualToString:@"NCNotificationListCell"]) return;
 
-    BOOL hasGlobalVideo = LNBFileExists(LNBPathForResource(kGlobalVideo));
-    BOOL hasGlobalImage = LNBFileExists(LNBPathForResource(kGlobalImage));
-    BOOL hasGlobal      = hasGlobalVideo || hasGlobalImage;
-    BOOL hasCardVideo   = LNBFileExists(LNBPathForResource(kCardVideo));
-    BOOL hasCardImage   = LNBFileExists(LNBPathForResource(kCardImage));
-    if (!hasGlobal && !hasCardVideo && !hasCardImage) {
+    // 【v2.1.2】统一透明卡片模式：全屏素材（global 优先 card 兜底）存在时，
+    // 卡片只是一块 16% 暗化板，透出锁屏根上的全屏视频层 ——
+    // 卡片内外画面连续、滑开空隙透视频，与参考视频一致。
+    NSString *fullVid = nil, *fullImg = nil;
+    LNBResolveFullMedia(&fullVid, &fullImg);
+    if (!fullVid && !fullImg) {
         // 没素材：还原并退出（原生样式）
         LNBSetCardMaterialsHidden(cell, NO);
         UIView *old = [cell viewWithTag:kCardBGViewTag];
@@ -516,13 +552,9 @@ static void LNBApplyCardBackground(UIView *cell) {
     CGFloat radius = cell.layer.cornerRadius > 0 ? cell.layer.cornerRadius : 18.0;
     if (fabs(bg.layer.cornerRadius - radius) > 0.5) bg.layer.cornerRadius = radius;
 
-    if (hasGlobal) {
-        // 透明卡片模式：半透明暗化板，透出列表底部的全屏视频层
+    if (fullVid || fullImg) {
+        // 透明卡片模式：半透明暗化板，透出锁屏根上的全屏视频层
         [bg applyDimOnlyWithAlpha:0.16];
-    } else {
-        // 旧模式：卡片独立铺 card.mp4
-        [bg applyMediaWithVideo:(hasCardVideo ? kCardVideo : nil)
-                          image:(hasCardVideo ? nil : kCardImage)];
     }
 }
 
@@ -586,6 +618,35 @@ static UIView *LNBGlobalBackgroundHost(UIView *anchor) {
     return nil;
 }
 
+// 【v2.1.2】anchor 所在的"锁屏根"：window 的直接子视图中、包含 anchor 的
+// 那个 ≥0.9 屏大视图。全屏视频层挂它 → 不在任何滚动/裁剪容器内，
+// 折叠、展开、左滑全部天然不动；时钟/通知/清除按钮都是它的后代，
+// 全部浮在视频上（z 顺序结构保证）。
+static UIView *LNBAnchorToLockRoot(UIView *anchor) {
+    if (!anchor) return nil;
+    UIWindow *w = anchor.window;
+    if (!w) return nil;
+    CGSize screen = w.bounds.size;
+    for (UIView *v in w.subviews) {
+        if (v == anchor) continue;   // anchor 本身就是 window 直接子视图（罕见），跳过
+        if ([anchor isDescendantOfView:v]) {
+            CGSize bs = v.bounds.size;
+            if (bs.width >= screen.width * 0.9 && bs.height >= screen.height * 0.9) return v;
+        }
+    }
+    return nil;
+}
+
+// 【v2.1.2】host 的直接子视图中的壁纸视图（类名含 wallpaper，不区分大小写）。
+// 找到 → 视频插它上面；找不到 → index 0（锁屏根的 index 0 通常是内容容器）。
+static UIView *LNBFindWallpaperSubview(UIView *host) {
+    for (UIView *v in host.subviews) {
+        NSString *low = NSStringFromClass(v.class).lowercaseString;
+        if ([low containsString:@"wallpaper"]) return v;
+    }
+    return nil;
+}
+
 // 全屏背景就绪节流：cell hook 每帧都会进来，宿主+bg 已就绪时 0.5s 才
 // 复查一次（素材更换/宿主重建最迟半秒生效），避免高频 BFS 拖累滑动帧率。
 static CFTimeInterval lnbGlobalBGLastCheck = 0;
@@ -595,10 +656,10 @@ static void LNBEnsureListBackground(UIView *anchor) {
     if (now - lnbGlobalBGLastCheck < 0.5) return;
     lnbGlobalBGLastCheck = now;
 
-    BOOL hasVideo = LNBFileExists(LNBPathForResource(kGlobalVideo));
-    BOOL hasImage = LNBFileExists(LNBPathForResource(kGlobalImage));
-    UIView *host = LNBGlobalBackgroundHost(anchor);
-    if ((!hasVideo && !hasImage) || !host) {
+    // 【v2.1.2】素材自动全屏化：global 优先，card 兜底
+    NSString *fullVid = nil, *fullImg = nil;
+    LNBResolveFullMedia(&fullVid, &fullImg);
+    if (!fullVid && !fullImg) {
         // 无素材：清理所有历史挂载
         for (UIWindow *window in [UIApplication sharedApplication].windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
@@ -611,6 +672,12 @@ static void LNBEnsureListBackground(UIView *anchor) {
         }
         return;
     }
+
+    // 宿主：优先"锁屏根"（不在任何滚动/裁剪容器内，折叠/展开/滑动天然不动）；
+    // 找不到时回退旧查找（NC 宿主 / 大祖先）。
+    UIView *host = LNBAnchorToLockRoot(anchor);
+    if (!host) host = LNBGlobalBackgroundHost(anchor);
+    if (!host) return;
 
     // 清理重复挂载（只保留宿主上这一份）
     for (UIWindow *window in [UIApplication sharedApplication].windows) {
@@ -628,17 +695,25 @@ static void LNBEnsureListBackground(UIView *anchor) {
         bg = [[LNBBGView alloc] initWithFrame:host.bounds];
         bg.tag = kGlobalBGViewTag;
         bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        bg.useSharedPlayer = NO;
-        [host insertSubview:bg atIndex:0];
-    } else if (bg.superview != host) {
-        [host insertSubview:bg atIndex:0];
+        bg.useSharedPlayer = YES;   // 全屏层也走共享播放器：进程内唯一解码器
     }
-    CGRect gb = bg.bounds;
-    gb.size = host.bounds.size;
-    bg.bounds = gb;
-    bg.center = CGPointMake(CGRectGetMidX(host.bounds), CGRectGetMidY(host.bounds));
-    [bg applyMediaWithVideo:(hasVideo ? kGlobalVideo : nil)
-                      image:(hasVideo ? nil : kGlobalImage)];
+
+    // 每次复查都走一遍素材匹配（setupVideoWith 内部幂等：已挂对直接返回；
+    // 文件被更换时 size/mtime 变化 → 自动重建播放器）
+    [bg applyMediaWithVideo:fullVid image:fullImg];
+
+    // 插入位置：壁纸之上、锁屏内容之下
+    if (bg.superview != host) {
+        [bg removeFromSuperview];
+        UIView *wp = LNBFindWallpaperSubview(host);
+        if (wp) [host insertSubview:bg aboveSubview:wp];
+        else    [host insertSubview:bg atIndex:0];
+    }
+
+    // 铺满宿主（bounds+center 赋值，判据纪律）
+    CGRect hb = host.bounds;
+    bg.bounds = CGRectMake(0.0, 0.0, hb.size.width, hb.size.height);
+    bg.center = CGPointMake(CGRectGetMidX(hb), CGRectGetMidY(hb));
 }
 
 // 列表全树扫描：给每张卡片挂背景（iOS 16.5 cell hook 可能不触发的兜底）
@@ -701,6 +776,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    LNBTLog(@"v2.1.1 loaded — 素材目录 %@（透明卡片模式；背景已挂入卡片滑动容器）", kBGDirectory);
+    LNBTLog(@"v2.1.2 loaded — 素材目录 %@（全屏视频挂锁屏根 + 卡片透明暗化；global 优先 card 兜底）", kBGDirectory);
 }
 %end
