@@ -23,13 +23,18 @@
 //    · 毛玻璃白底隐藏与恢复（关联对象记账）
 //    · 列表扫描兜底（iOS 16.5 上 NCNotificationListCell hook 可能不触发）
 //
-//  v2.0.2 左滑跟随（本轮核心修复）：
-//    iOS 16.5 通知卡片左滑时，滑的是 cell 内部的横向滚动容器
-//    （NCNotificationListCellScrollView， UIScrollView 子类），cell 本体不动。
-//    之前背景挂在 cell 上 → 不在滑动层里 → 左滑时背景钉在原地。
-//    修法：把背景插进滚动容器里的"卡片层"，滑动时背景随内容原生跟随，
-//    无需任何逐帧同步 —— 跟随是结构保证（与共享播放器同一设计哲学）。
-//    滑开后的空隙透出底层全屏背景（global.mp4），与参考视频一致。
+//  v2.0.2 左滑跟随（第一版，实机证伪）：
+//    把背景挂进滚动容器内的"卡片层"想让它原生跟随 —— 实机发现该容器
+//    比可视卡片大 → 背景铺出卡片外（素材画面下缘的小人溢出到卡片外）
+//    且亮屏瞬间卡片错位贴边。
+//
+//  v2.0.3 左滑跟随（第二版，当前）：
+//    · 挂载点回到 cell 本体（v2.0.0 已验证：尺寸=卡片、圆角、铺满）
+//    · 跟随改用 %hook NCNotificationListCellScrollView（setBounds/
+//      setContentOffset）—— iOS 16.5 左滑就是滚动它，cell 本体不动。
+//      偏移变化时把背景中心平移 -offset.x（LNBMirrorSwipe）。
+//    · 偏移存关联对象，syncToHostIfNeeded 读取同一份，两机制不打架
+//    · 滑开后的空隙透出底层全屏背景（global.mp4），与参考视频一致
 //
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -54,6 +59,9 @@ static const void *kLNBHiddenByTweak = &kLNBHiddenByTweak;
 
 // 背景视图自身的同步重入保护（关联对象，避免给 UIView 加类别属性）
 static const void *kLNBSyncingKey = &kLNBSyncingKey;
+
+// 当前镜像的滑动偏移（关联对象挂在背景视图上；scrollview hook 写入，sync 读取）
+static const void *kLNBSlideOffsetKey = &kLNBSlideOffsetKey;
 
 static void LNBTLog(NSString *fmt, ...) {
     // 轻量日志：直接进 syslog，随时可用 Console 看；量很小，无性能负担
@@ -290,12 +298,17 @@ static void LNBSharedPlayerDetach(void) {
 
 // 自跟踪宿主：bounds 尺寸 + 宿主中心 + transform 恒等。
 // 判据全部直接比较，必然收敛（v1.4.11 定论 / v1.4.12 血泪）。
+// 【v2.0.3】宿主是 cell 本体；镜像的滑动偏移计入 wantCenter ——
+// 左滑时 scrollview hook 把 bg 中心平移 -dx，这里的判据与它协同，
+// 不会把跟随时机的偏移"拉回原位"。
 - (void)syncToHostIfNeeded {
     UIView *host = self.superview;
     if (!host) return;
     CGSize target = host.bounds.size;
     if (target.width < 1.0 || target.height < 1.0) return;
-    CGPoint wantCenter = CGPointMake(CGRectGetMidX(host.bounds), CGRectGetMidY(host.bounds));
+    NSNumber *slide = objc_getAssociatedObject(self, kLNBSlideOffsetKey);
+    CGFloat dx = slide ? slide.doubleValue : 0.0;
+    CGPoint wantCenter = CGPointMake(CGRectGetMidX(host.bounds) - dx, CGRectGetMidY(host.bounds));
 
     BOOL sizeOk = CGSizeEqualToSize(self.bounds.size, target);
     BOOL tfOk = CGAffineTransformIsIdentity(self.transform);
@@ -346,74 +359,34 @@ static UIView *LNBGlobalBackgroundHost(void);   // 前向声明（定义在下�
 
 #pragma mark - 卡片背景
 
-// ── v2.0.2 左滑跟随的核心 ──
-// iOS 16.5 通知卡片左滑，滑的是 cell 内部的横向滚动容器
-// （NCNotificationListCellScrollView），cell 本体纹丝不动。
-// 背景必须放进"真正会滑动的那一层"，否则左滑时背景钉在原地（v2.0.0/2.0.1 的病灶）。
-//
-// 定位策略（两级）：
-//   ① 在 cell 子树里按类名找 NCNotificationListCellScrollView（精确匹配）；
-//   ② 在滚动容器里找"卡片层"：宽度≈卡片（0.7~1.05 倍 cell 宽）、高度≥0.7 倍 cell 高，
-//      深度优先取最深、同深度取面积最大 —— 排除毛玻璃/隐藏视图/背景自身，
-//      防止挂进被我们藏掉的 MTMaterialView 里（那样背景会跟着隐身）。
-//   兜底：找不到滚动容器 → 返回 cell（退回 v2.0.0 行为，至少不崩）。
-//   即使只挂到滚动容器本身（没找到更深的卡片层），UIScrollView 的所有子视图
-//   都随 contentOffset 平移 —— 照样跟随滑动。
-static UIView *LNBFindSlideHost(UIView *cell) {
-    CGSize cs = cell.bounds.size;
-    if (cs.width < 1.0 || cs.height < 1.0) return nil;
-
-    // ① 找横向滚动容器（BFS）
-    UIView *scrollView = nil;
-    NSMutableArray *queue = [NSMutableArray arrayWithObject:cell];
-    NSInteger steps = 0;
-    while (queue.count > 0 && steps < 512) {
-        UIView *v = queue.firstObject;
-        [queue removeObjectAtIndex:0];
-        steps++;
-        if (v != cell &&
-            [NSStringFromClass(v.class) isEqualToString:@"NCNotificationListCellScrollView"]) {
-            scrollView = v;
-            break;
-        }
-        for (UIView *sub in v.subviews) [queue addObject:sub];
+// 【v2.0.3】左滑跟随：镜像滚动容器的 contentOffset。
+// 背景（挂 cell）中心 = 卡片中心 - offset.x —— 内容左滑多少，背景跟着左滑多少。
+// 偏移记入关联对象，syncToHostIfNeeded 读取同一份，两边不打架。
+// 判据直接比较读入值（非"设进去读回"），必然收敛。
+static void LNBMirrorSwipe(UIView *scrollView, CGFloat offsetX) {
+    UIView *p = scrollView.superview;
+    NSInteger guard = 0;
+    while (p && guard++ < 8) {
+        if ([NSStringFromClass(p.class) isEqualToString:@"NCNotificationListCell"]) break;
+        p = p.superview;
     }
-    if (!scrollView) return nil;
-
-    // ② 滚动容器里找卡片层（DFS，取最深且面积最大）
-    UIView *best = nil;
-    CGFloat bestArea = 0;
-    NSInteger bestDepth = -1;
-    NSMutableArray *stack  = [NSMutableArray arrayWithObject:scrollView];
-    NSMutableArray *depths = [NSMutableArray arrayWithObject:@0];
-    while (stack.count > 0) {
-        UIView *v = stack.lastObject;
-        NSInteger d = [depths.lastObject integerValue];
-        [stack removeLastObject];
-        [depths removeLastObject];
-        if (v != scrollView && !v.hidden && v.alpha > 0.05 &&
-            ![v isKindOfClass:[LNBBGView class]] && !LNBIsBlurMaterial(v)) {
-            CGFloat w = v.frame.size.width, h = v.frame.size.height;
-            if (w >= cs.width * 0.7 && w <= cs.width * 1.05 && h >= cs.height * 0.7) {
-                CGFloat area = w * h;
-                if (d > bestDepth || (d == bestDepth && area > bestArea)) {
-                    best = v;
-                    bestArea = area;
-                    bestDepth = d;
-                }
-            }
-        }
-        for (UIView *sub in v.subviews) {
-            [stack addObject:sub];
-            [depths addObject:@(d + 1)];
-        }
+    if (!p || guard > 8) return;
+    LNBBGView *bg = (LNBBGView *)[p viewWithTag:kCardBGViewTag];
+    if (![bg isKindOfClass:[LNBBGView class]]) return;
+    objc_setAssociatedObject(bg, kLNBSlideOffsetKey, @(offsetX), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    CGFloat wantX = p.bounds.size.width / 2.0 - offsetX;
+    if (fabs(bg.center.x - wantX) > 0.5 || fabs(bg.center.y - p.bounds.size.height / 2.0) > 0.5) {
+        [UIView performWithoutAnimation:^{
+            bg.center = CGPointMake(wantX, p.bounds.size.height / 2.0);
+        }];
     }
-    return best ?: scrollView;
 }
 
 // 给一条通知卡片挂背景。
-// 【v2.0.2】宿主不再是 cell 本体，而是滑动容器里的卡片层（LNBFindSlideHost）
-// —— 左滑时背景随卡片原生跟随，滑开后的空隙透出 global.mp4 全屏背景。
+// 【v2.0.3】宿主回到 cell 本体（v2.0.0 已验证的渲染正确性：尺寸=卡片、
+// 圆角正确、铺满不溢出）。v2.0.2 挂进滚动容器内找到的"卡片层"，
+// 实机证明该容器比可视卡片大 → 背景铺出卡片外（小人溢出）+ 亮屏瞬间错位。
+// 左滑跟随不再靠挂载点，改由 LNBMirrorSwipe 镜像滚动偏移实现。
 static void LNBApplyCardBackground(UIView *cell) {
     if (!cell) return;
     NSString *cls = NSStringFromClass(cell.class);
@@ -429,33 +402,24 @@ static void LNBApplyCardBackground(UIView *cell) {
         return;
     }
 
-    // 归一化圆角值，供背景自补圆角用（宿主不带圆角裁切时的兜底）
-    if (cell.layer.cornerRadius < 1.0) cell.layer.cornerRadius = 18.0;
     LNBSetCardMaterialsHidden(cell, YES);
 
-    UIView *host = LNBFindSlideHost(cell);
-    if (!host) host = cell;   // 极端情况（布局未就绪）：先挂 cell，下轮 layout 再挪
-
-    // cell 本体绝不裁切：若 cell 恰好是卡片宽度，裁切会把滑动中的背景
-    // 挡在"看不见的墙"上（卡片滑不出原位的视觉 bug）
+    // cell 本体不裁切：左滑镜像时背景要能滑出 cell 边界，
+    // 由屏幕边缘完成裁切（若 cell=卡片宽度，裁在 cell 上会形成"看不见的墙"）
     cell.layer.masksToBounds = NO;
 
     LNBBGView *bg = (LNBBGView *)[cell viewWithTag:kCardBGViewTag];
     if (!bg) {
-        bg = [[LNBBGView alloc] initWithFrame:host.bounds];
+        bg = [[LNBBGView alloc] initWithFrame:cell.bounds];
         bg.tag = kCardBGViewTag;
         bg.useSharedPlayer = YES;
     }
-    if (bg.superview != host) {
+    if (bg.superview != cell) {
         [bg removeFromSuperview];
-        [host insertSubview:bg atIndex:0];
-        if (host != cell) {
-            LNBTLog(@"背景挂入滑动层: %@ (于 %@ 内)", NSStringFromClass(host.class), NSStringFromClass(host.superview.class));
-        }
+        [cell insertSubview:bg atIndex:0];
     }
-    // 圆角：宿主自带圆角就用宿主的（与原生卡片完全一致）；否则自补 18pt。
-    // 双重圆角半径相同时视觉等价，不会有缝隙。
-    CGFloat radius = host.layer.cornerRadius > 0 ? host.layer.cornerRadius : 18.0;
+    // 圆角自补（宿主不带圆角裁切时由背景自身保持原生卡片圆角观感）
+    CGFloat radius = cell.layer.cornerRadius > 0 ? cell.layer.cornerRadius : 18.0;
     if (fabs(bg.layer.cornerRadius - radius) > 0.5) bg.layer.cornerRadius = radius;
     [bg applyMediaWithVideo:(hasVideo ? kCardVideo : nil)
                       image:(hasVideo ? nil : kCardImage)];
@@ -577,6 +541,22 @@ static void LNBScanAndApplyCards(UIView *root) {
 }
 %end
 
+// 【v2.0.3】左滑跟随的关键 hook：卡片内横向滚动容器（iOS 16.5 通知左滑
+// 就是滚动它，cell 本体不动）。contentOffset 变化有两种入口，
+// setBounds（bounds.origin == contentOffset）和 setContentOffset，都拦。
+// 每次偏移变化把背景中心平移 -offset.x —— 内容滑多少背景跟多少。
+// 类名若在某系统版本不存在，hook 自然不触发，退化为 v2.0.0 行为（无害）。
+%hook NCNotificationListCellScrollView
+- (void)setBounds:(CGRect)bounds {
+    %orig(bounds);
+    LNBMirrorSwipe((UIView *)self, bounds.origin.x);
+}
+- (void)setContentOffset:(CGPoint)contentOffset {
+    %orig;
+    LNBMirrorSwipe((UIView *)self, contentOffset.x);
+}
+%end
+
 %hook NCNotificationListCell
 - (void)layoutSubviews {
     %orig;
@@ -603,6 +583,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    LNBTLog(@"v2.0.2 loaded — 素材目录 %@（card.mp4/global.mp4 即生效；左滑跟随已启用）", kBGDirectory);
+    LNBTLog(@"v2.0.3 loaded — 素材目录 %@（card.mp4/global.mp4 即生效；左滑跟随 v2）", kBGDirectory);
 }
 %end
