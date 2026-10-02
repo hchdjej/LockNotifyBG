@@ -187,6 +187,7 @@ static void LNBSharedPlayerDetach(void) {
 @property (nonatomic, strong) AVPlayerLayer *playerLayer;
 @property (nonatomic, assign) BOOL attachedShared;     // 当前持有一个共享引用
 @property (nonatomic, assign) BOOL useSharedPlayer;    // 卡片 YES / 全局 NO
+@property (nonatomic, assign) BOOL windowMode;         // 【v2.0.1】取景窗模式：卡片=列表画面的窗口
 - (void)applyMediaWithVideo:(NSString *)vidName image:(NSString *)imgName;
 - (void)teardownMedia;
 - (void)syncToHostIfNeeded;
@@ -305,6 +306,11 @@ static void LNBSharedPlayerDetach(void) {
     }];
 }
 
+// 列表宿主缓存（取景窗模式用它算卡片在全幅画面里的位置）。
+// 弱引用：列表销毁后自动失效，下次 layout 重新查找。
+static __weak UIView *lnbListHostCache = nil;
+static UIView *LNBGlobalBackgroundHost(void);   // 前向声明（定义在下方）
+
 - (void)layoutSubviews {
     NSNumber *syncing = objc_getAssociatedObject(self, kLNBSyncingKey);
     if (!syncing.boolValue) {
@@ -314,7 +320,34 @@ static void LNBSharedPlayerDetach(void) {
     }
     [super layoutSubviews];
     if (!CGRectEqualToRect(_imageView.frame, self.bounds)) _imageView.frame = self.bounds;
-    if (self.playerLayer) self.playerLayer.frame = self.bounds;   // 无条件赋值，不做读回比较
+
+    if (self.playerLayer) {
+        if (self.windowMode) {
+            // ──【v2.0.1 取景窗模式】──
+            // 用户需求：滑动通知列表时，卡片里的背景内容要跟着变化
+            // （卡片=窗户，窗外=一整幅 video 画面；滚动=移动窗户）。
+            // 做法：把播放层撑成【整个列表大小】，并按卡片在列表里的
+            // 位置负偏移 —— 卡片露出的是全幅画面中它所在的那块区域。
+            // 滚动 → 卡片位置变 → 露出区域变 → 内容跟着滑 ✓
+            // 多卡仍是同一 player，各自取景不同区域，天然同步 ✓
+            UIView *list = lnbListHostCache;
+            if (!list || !list.superview) {
+                list = LNBGlobalBackgroundHost();
+                lnbListHostCache = list;
+            }
+            if (list && self.window) {
+                CGRect r = [self convertRect:self.bounds toView:list];
+                // 播放层 = 全幅画面，负偏移到卡片当前位置
+                self.playerLayer.frame = CGRectMake(-r.origin.x, -r.origin.y,
+                                                    list.bounds.size.width,
+                                                    list.bounds.size.height);
+            } else {
+                self.playerLayer.frame = self.bounds;
+            }
+        } else {
+            self.playerLayer.frame = self.bounds;   // 无条件赋值，不做读回比较
+        }
+    }
 }
 
 - (void)dealloc {
@@ -353,6 +386,7 @@ static void LNBApplyCardBackground(UIView *cell) {
         bg = [[LNBBGView alloc] initWithFrame:cell.bounds];
         bg.tag = kCardBGViewTag;
         bg.useSharedPlayer = YES;
+        bg.windowMode = YES;   // 【v2.0.1】卡片=取景窗：滚动时露出画面的不同区域
     }
     if (bg.superview != cell) {
         [bg removeFromSuperview];
@@ -362,7 +396,9 @@ static void LNBApplyCardBackground(UIView *cell) {
                       image:(hasVideo ? nil : kCardImage)];
 }
 
-// 几何同步（cell setter 调用；时间闸门：每帧最多放行一次）
+// 几何同步（cell setter 调用；时间闸门：每帧最多放行一次）。
+// 【v2.0.1】滚动时 cell 位置变化也要触发卡片取景窗重算 ——
+// 这里除了 setNeedsLayout，直接让背景 layout（含取景窗计算）立即执行。
 static void LNBSyncCardGeometry(UIView *cell) {
     static CFTimeInterval sLast = 0;
     CFTimeInterval now = CACurrentMediaTime();
