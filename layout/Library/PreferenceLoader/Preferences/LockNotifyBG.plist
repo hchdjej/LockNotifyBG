@@ -1,0 +1,10 @@
+{
+    entry = {
+        bundle = "LockNotifyBGPrefs";
+        cell = PSLinkCell;
+        detail = "NGBPrefsRootListController";
+        icon = "icon.png";
+        isController = 1;
+        label = "坏叔叔";
+    };
+}

@@ -10,6 +10,8 @@ INSTALL_TARGET_PROCESSES = SpringBoard
 
 include $(THEOS)/makefiles/common.mk
 
+SUBPROJECTS += prefs
+
 TWEAK_NAME = LockNotifyBG
 LockNotifyBG_FILES = Tweak.xm
 LockNotifyBG_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-arc-performSelector-leaks

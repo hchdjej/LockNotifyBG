@@ -38,6 +38,21 @@
 //   （v2.0.2 的溢出问题由此彻底修正）。折叠/展开两种状态均结构保证跟随。
 //    镜像机制（LNBMirrorSwipe / scrollview hook）随之移除。
 //
+//  v2.2.0 设置面板回归 + 模块化素材（新视频需求驱动）：
+//    用户新视频实证：选项按钮（PLPlatterActionButton）、清除按钮、折叠按钮
+//    （NCToggleControl，v1.4.5 日志实锤的类名）也透出整屏画面。
+//    需求："通知、插件背景、通知背景、选项模块、清除模块都能自定义
+//    背景素材（图片或视频），要有设置面板，效果和视频一样。"
+//    本版交付：
+//    ① 恢复设置面板（v1.4.16 的 prefs 子项目 + 相册选素材 + 改动即时生效）；
+//    ② 整屏背景（global.*）、卡片（card.*）、选项按钮（supp.*）、
+//       清除按钮（supp2.*）全部支持图片和视频，面板内独立选择；
+//    ③ 按钮模块：没选素材时自动"透出化"（藏材质+清底色）—— 参考视频
+//       效果；选了素材则铺自己的圆角图/视频（v1.4.16 铺图逻辑移植）；
+//    ④ 共享播放器升级为【按素材路径分组的播放器池】—— 多种素材同时
+//       播放（整屏+卡片+按钮）各自独立解码、同素材多卡片仍同帧；
+//    ⑤ 声音按面板设置（静音/音量），改动即时生效。
+//
 //  v2.1.2 全屏视频层重构（最新实测对比驱动）：
 //    用户两个视频对比结论：插件折叠滑动跟随已 ✓，但卡片外是静态壁纸、
 //    滑开后露出白色「清除」按钮；参考效果是【整屏连续视频 + 卡片挖洞
@@ -75,6 +90,7 @@
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <QuartzCore/QuartzCore.h>
+#import <notify.h>
 #import <objc/runtime.h>
 #import <stdarg.h>
 
@@ -85,9 +101,20 @@ static NSString *const kCardVideo     = @"card.mp4";
 static NSString *const kCardImage     = @"card.jpg";
 static NSString *const kGlobalVideo   = @"global.mp4";
 static NSString *const kGlobalImage   = @"global.jpg";
+// 【v2.2.0】按钮模块素材：选项 = supp.*，清除 = supp2.*（清除缺省回退 supp.*）
+static NSString *const kSuppVideo     = @"supp.mp4";
+static NSString *const kSuppImage     = @"supp.jpg";
+static NSString *const kSupp2Video    = @"supp2.mp4";
+static NSString *const kSupp2Image    = @"supp2.jpg";
 
 static const NSInteger kCardBGViewTag   = 0x4C4E4243;   // 'LNBC'
 static const NSInteger kGlobalBGViewTag = 0x4C4E4247;   // 'LNBG'
+static const NSInteger kActionBGViewTag = 0x4C4E4241;   // 'LNBA'（按钮独立素材层）
+
+// 【v2.2.0】设置面板域与跨进程同步（与 prefs 面板代码一致）
+static NSString *const kPrefsDomain        = @"com.hchdjej.locknotifybg";
+static NSString *const kReloadNotification = @"com.hchdjej.locknotifybg/reload";
+static NSString *const kPrefsFilePath      = @"/var/mobile/Library/LockNotifyBG/prefs.plist";
 
 // 被本插件藏掉的毛玻璃视图，用关联对象记账，还原时不误伤别人藏的
 static const void *kLNBHiddenByTweak = &kLNBHiddenByTweak;
@@ -99,6 +126,59 @@ static const void *kLNBSyncingKey = &kLNBSyncingKey;
 // 【v2.1.1】背景挂进滑动容器后，目标 = cell.bounds 在容器坐标系里的投影；
 // 挂 cell 时目标 = 铺满 cell。滑动期间 target 不变（结构保证跟随）。
 static const void *kLNBTargetFrameKey = &kLNBTargetFrameKey;
+
+// 【v2.2.0】按钮"透出化"记账：原底色快照（UIColor）+ 当前状态
+static const void *kLNBBtnOrigBgKey  = &kLNBBtnOrigBgKey;
+static const void *kLNBBtnSeeThrough = &kLNBBtnSeeThrough;
+
+#pragma mark - 偏好（v2.2.0 设置面板）
+
+// 面板把设置镜像落盘到 prefs.plist（跨进程最稳通道，v1.x 实证），
+// 改动时面板发 Darwin 通知，这里监听后重读 —— 所有修改即时生效。
+@interface LNBPrefs : NSObject
+@property (nonatomic, assign) BOOL enabled;             // 总开关（默认 YES）
+@property (nonatomic, assign) BOOL globalEnabled;       // 整屏背景（默认 YES）
+@property (nonatomic, assign) BOOL cardTransparent;     // 卡片挖洞透整屏（默认 YES）
+@property (nonatomic, assign) CGFloat dimAlpha;         // 卡片暗化强度（默认 0.16）
+@property (nonatomic, assign) BOOL suppModuleEnabled;   // 按钮背景（默认 YES）
+@property (nonatomic, assign) CGFloat suppAlpha;        // 按钮素材不透明度（默认 1.0）
+@property (nonatomic, assign) BOOL videoMuted;          // 静音（默认 YES）
+@property (nonatomic, assign) double videoVolume;       // 音量（默认 0.6）
++ (instancetype)sharedInstance;
+- (void)reload;
+@end
+
+@implementation LNBPrefs
+
++ (instancetype)sharedInstance {
+    static LNBPrefs *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [[LNBPrefs alloc] init];
+        [s reload];
+        int token = 0;
+        notify_register_dispatch([kReloadNotification UTF8String], &token,
+                                 dispatch_get_main_queue(), ^(int flag) {
+            [[LNBPrefs sharedInstance] reload];
+        });
+    });
+    return s;
+}
+
+- (void)reload {
+    // 文件缺失（首次安装/没打开过面板）时用默认值
+    NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:kPrefsFilePath];
+    self.enabled           = saved[@"enabled"]           ? [saved[@"enabled"] boolValue]           : YES;
+    self.globalEnabled     = saved[@"globalEnabled"]     ? [saved[@"globalEnabled"] boolValue]     : YES;
+    self.cardTransparent   = saved[@"cardTransparent"]   ? [saved[@"cardTransparent"] boolValue]   : YES;
+    self.dimAlpha          = saved[@"dimAlpha"]          ? [saved[@"dimAlpha"] doubleValue]        : 0.16;
+    self.suppModuleEnabled = saved[@"suppModuleEnabled"] ? [saved[@"suppModuleEnabled"] boolValue] : YES;
+    self.suppAlpha         = saved[@"suppAlpha"]         ? [saved[@"suppAlpha"] doubleValue]       : 1.0;
+    self.videoMuted        = saved[@"videoMuted"]        ? [saved[@"videoMuted"] boolValue]        : YES;
+    self.videoVolume       = saved[@"videoVolume"]       ? [saved[@"videoVolume"] doubleValue]     : 0.6;
+}
+
+@end
 
 static void LNBTLog(NSString *fmt, ...) {
     // 轻量日志：直接进 syslog，随时可用 Console 看；量很小，无性能负担
@@ -170,79 +250,107 @@ static void LNBSetCardMaterialsHidden(UIView *root, BOOL hidden) {
     }
 }
 
-#pragma mark - 共享卡片播放器（多卡同帧的核心）
+#pragma mark - 播放器池（v2.2.0：按素材路径分组）
 
-// 一个进程级共享 AVPlayer + 每卡一个 AVPlayerLayer。
-// 同一 player 的所有 layer 渲染同一解码帧 —— 同步是结构保证，不靠追帧。
-// 【判据纪律】（v1.4.12 卡死教训）：只用指针/路径直接比较，绝不做"设进去再读回"。
-static AVPlayer     *lnbSharedPlayer  = nil;
-static NSString     *lnbSharedPath    = nil;
-static uint64_t      lnbSharedSize    = 0;
-static NSTimeInterval lnbSharedMTime = 0;
-static id            lnbSharedEndObs  = nil;
-static NSInteger     lnbSharedAttachN = 0;
+// v2.1.x 的单例共享播放器只支持一种素材；v2.2.0 整屏/卡片/按钮可能同时
+// 使用不同素材 —— 升级为按路径分组的池：同一素材的多个 layer 共享一个
+// AVPlayer（同帧是结构保证），不同素材各自独立解码互不干扰。
+// 文件被更换（size/mtime 变化）时对应条目自动重建。
+// 【判据纪律】（v1.4.12 教训）：只用指针/路径/字典直接比较，绝不做"设进去再读回"。
+static NSMutableDictionary<NSString *, AVPlayer *>     *lnbPoolPlayer = nil;
+static NSMutableDictionary<NSString *, NSNumber *>     *lnbPoolRefs   = nil;
+static NSMutableDictionary<NSString *, NSNumber *>     *lnbPoolSize   = nil;
+static NSMutableDictionary<NSString *, NSNumber *>     *lnbPoolMTime  = nil;
+static NSMutableDictionary<NSString *, id>             *lnbPoolEndObs = nil;
 
-static BOOL LNBSharedPlayerMatches(NSString *videoPath) {
-    if (!lnbSharedPlayer || !lnbSharedPath) return NO;
-    if (![lnbSharedPath isEqualToString:videoPath]) return NO;
-    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:videoPath error:nil];
-    if (!attrs) return NO;
-    return ([attrs fileSize] == lnbSharedSize &&
-            fabs([[attrs fileModificationDate] timeIntervalSince1970] - lnbSharedMTime) < 0.5);
-}
-
-static void LNBSharedPlayerTearDown(void) {
-    if (lnbSharedEndObs) {
-        [[NSNotificationCenter defaultCenter] removeObserver:lnbSharedEndObs];
-        lnbSharedEndObs = nil;
+static void LNBPoolInit(void) {
+    if (!lnbPoolPlayer) {
+        lnbPoolPlayer = [NSMutableDictionary dictionary];
+        lnbPoolRefs   = [NSMutableDictionary dictionary];
+        lnbPoolSize   = [NSMutableDictionary dictionary];
+        lnbPoolMTime  = [NSMutableDictionary dictionary];
+        lnbPoolEndObs = [NSMutableDictionary dictionary];
     }
-    [lnbSharedPlayer pause];
-    lnbSharedPlayer = nil;
-    lnbSharedPath = nil;
-    lnbSharedSize = 0;
-    lnbSharedMTime = 0;
 }
 
-// 领共享播放器（引用计数 +1；从空闲恢复时回片头）
-static AVPlayer *LNBSharedPlayerAcquire(NSString *videoPath) {
-    if (!LNBSharedPlayerMatches(videoPath)) {
-        LNBSharedPlayerTearDown();
-        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:videoPath]];
-        lnbSharedPlayer = [AVPlayer playerWithPlayerItem:item];
-        lnbSharedPlayer.actionAtItemEnd = AVPlayerActionAtItemEndNone;
-        lnbSharedPlayer.muted = YES;   // 锁屏多卡同播，恒静音
-        lnbSharedPlayer.volume = 0.0;
-        lnbSharedPath = [videoPath copy];
-        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:videoPath error:nil];
-        lnbSharedSize = [attrs fileSize];
-        lnbSharedMTime = [[attrs fileModificationDate] timeIntervalSince1970];
-        lnbSharedEndObs = [[NSNotificationCenter defaultCenter]
+static BOOL LNBPoolEntryMatches(NSString *path) {
+    LNBPoolInit();
+    if (!path || !lnbPoolPlayer[path]) return NO;
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    if (!attrs) return NO;
+    return ([attrs fileSize] == [lnbPoolSize[path] unsignedLongLongValue] &&
+            fabs([[attrs fileModificationDate] timeIntervalSince1970] - [lnbPoolMTime[path] doubleValue]) < 0.5);
+}
+
+static AVPlayer *LNBPoolPlayerFor(NSString *path) {
+    LNBPoolInit();
+    return path ? lnbPoolPlayer[path] : nil;
+}
+
+static void LNBPoolDestroyEntry(NSString *path) {
+    id obs = lnbPoolEndObs[path];
+    if (obs) [[NSNotificationCenter defaultCenter] removeObserver:obs];
+    [lnbPoolPlayer[path] pause];
+    [lnbPoolPlayer removeObjectForKey:path];
+    [lnbPoolSize removeObjectForKey:path];
+    [lnbPoolMTime removeObjectForKey:path];
+    [lnbPoolEndObs removeObjectForKey:path];
+    [lnbPoolRefs removeObjectForKey:path];
+}
+
+static void LNBPoolApplyAudio(NSString *path, AVPlayer *p) {
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    p.muted  = prefs.videoMuted;
+    p.volume = prefs.videoVolume;
+}
+
+// 领播放器（同素材引用计数 +1；从空闲恢复时回片头）
+static AVPlayer *LNBPoolAcquire(NSString *path) {
+    LNBPoolInit();
+    if (!LNBPoolEntryMatches(path)) LNBPoolDestroyEntry(path);
+    AVPlayer *p = lnbPoolPlayer[path];
+    if (!p) {
+        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
+        p = [AVPlayer playerWithPlayerItem:item];
+        p.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        lnbPoolSize[path]  = @([attrs fileSize]);
+        lnbPoolMTime[path] = @([[attrs fileModificationDate] timeIntervalSince1970]);
+        lnbPoolEndObs[path] = [[NSNotificationCenter defaultCenter]
             addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
                         object:item queue:nil
                     usingBlock:^(NSNotification *note) {
-            [lnbSharedPlayer seekToTime:kCMTimeZero
-                      completionHandler:^(BOOL done) {
-                if (done && lnbSharedPlayer) [lnbSharedPlayer play];
+                AVPlayer *pl = lnbPoolPlayer[path];
+                if (!pl) return;
+                [pl seekToTime:kCMTimeZero completionHandler:^(BOOL done) {
+                    if (done && pl.rate == 0.0) [pl play];
+                }];
             }];
-        }];
+        lnbPoolPlayer[path] = p;
     }
-    BOOL wasIdle = (lnbSharedAttachN == 0);
-    lnbSharedAttachN++;
+    BOOL wasIdle = ([lnbPoolRefs[path] integerValue] == 0);
+    lnbPoolRefs[path] = @([lnbPoolRefs[path] integerValue] + 1);
+    LNBPoolApplyAudio(path, p);
     if (wasIdle) {
-        [lnbSharedPlayer seekToTime:kCMTimeZero];
-        [lnbSharedPlayer play];
-    } else if (lnbSharedPlayer.rate == 0.0) {
-        [lnbSharedPlayer play];
+        [p seekToTime:kCMTimeZero];
+        [p play];
+    } else if (p.rate == 0.0) {
+        [p play];
     }
-    return lnbSharedPlayer;
+    return p;
 }
 
-// 还共享播放器（引用计数 -1；归零即暂停回片头，省电）
-static void LNBSharedPlayerDetach(void) {
-    if (lnbSharedAttachN > 0) lnbSharedAttachN--;
-    if (lnbSharedAttachN == 0 && lnbSharedPlayer) {
-        [lnbSharedPlayer pause];
-        [lnbSharedPlayer seekToTime:kCMTimeZero];
+// 还播放器（同素材引用计数 -1；归零即暂停回片头，省电）
+static void LNBPoolDetach(NSString *path) {
+    if (!path) return;
+    LNBPoolInit();
+    NSInteger refs = [lnbPoolRefs[path] integerValue];
+    if (refs <= 1) {
+        [lnbPoolPlayer[path] pause];
+        [lnbPoolPlayer[path] seekToTime:kCMTimeZero];
+        lnbPoolRefs[path] = @0;
+    } else {
+        lnbPoolRefs[path] = @(refs - 1);
     }
 }
 
@@ -250,10 +358,8 @@ static void LNBSharedPlayerDetach(void) {
 
 @interface LNBBGView : UIView
 @property (nonatomic, strong) UIImageView *imageView;
-@property (nonatomic, strong) AVPlayer *player;        // 共享引用时恒为 nil
 @property (nonatomic, strong) AVPlayerLayer *playerLayer;
-@property (nonatomic, assign) BOOL attachedShared;     // 当前持有一个共享引用
-@property (nonatomic, assign) BOOL useSharedPlayer;    // 卡片 YES / 全局 NO
+@property (nonatomic, copy) NSString *attachedPath;    // 池内关联的素材路径（v2.2.0）
 - (void)applyMediaWithVideo:(NSString *)vidName image:(NSString *)imgName;
 - (void)applyDimOnlyWithAlpha:(CGFloat)alpha;
 - (void)teardownMedia;
@@ -282,7 +388,7 @@ static void LNBSharedPlayerDetach(void) {
 // 与参考视频一致（卡片内亮度 ≈ 卡片外 × 0.84，即压暗 ~16%）。
 - (void)applyDimOnlyWithAlpha:(CGFloat)alpha {
     // 幂等早退：已是相同暗化状态就不再动（layout 每帧都会调）
-    if (self.imageView.hidden && !self.playerLayer && !self.attachedShared && !self.player &&
+    if (self.imageView.hidden && !self.playerLayer && !self.attachedPath &&
         self.backgroundColor) {
         CGFloat r, g, b, a;
         if ([self.backgroundColor getRed:&r green:&g blue:&b alpha:&a] &&
@@ -310,45 +416,18 @@ static void LNBSharedPlayerDetach(void) {
 }
 
 - (void)setupVideoWith:(NSString *)videoPath {
-    if (self.useSharedPlayer) {
-        // ── 共享模式（卡片）──
-        if (self.playerLayer && self.attachedShared &&
-            self.playerLayer.player == lnbSharedPlayer &&
-            LNBSharedPlayerMatches(videoPath)) {
-            return;   // 已挂对，无事可做
-        }
-        [self teardownMedia];
-        AVPlayer *shared = LNBSharedPlayerAcquire(videoPath);
-        self.attachedShared = YES;
-        self.player = nil;   // 不持有共享实例，防止误停
-        self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:shared];
-        self.playerLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
-        self.playerLayer.frame = self.bounds;
-        [self.layer insertSublayer:self.playerLayer atIndex:0];
-        return;
+    // 统一走播放器池：同素材多 layer 共享（同帧），不同素材各解码
+    if (self.playerLayer && [self.attachedPath isEqualToString:videoPath] &&
+        self.playerLayer.player == LNBPoolPlayerFor(videoPath)) {
+        return;   // 已挂对，无事可做
     }
-    // ── 私有模式（全局背景）──
-    if (self.player && self.playerLayer) return;
     [self teardownMedia];
-    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:videoPath]];
-    self.player = [AVPlayer playerWithPlayerItem:item];
-    self.player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
-    self.player.muted = YES;
-    self.player.volume = 0.0;
-    __weak typeof(self) wself = self;
-    [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
-                                                      object:item queue:nil
-                                                 usingBlock:^(NSNotification *note) {
-        __strong typeof(wself) sself = wself;
-        [sself.player seekToTime:kCMTimeZero completionHandler:^(BOOL done) {
-            if (done) [sself.player play];
-        }];
-    }];
-    self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:self.player];
+    AVPlayer *p = LNBPoolAcquire(videoPath);
+    self.attachedPath = [videoPath copy];
+    self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:p];
     self.playerLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
     self.playerLayer.frame = self.bounds;
     [self.layer insertSublayer:self.playerLayer atIndex:0];
-    [self.player play];
 }
 
 - (void)teardownMedia {
@@ -356,13 +435,9 @@ static void LNBSharedPlayerDetach(void) {
         [self.playerLayer removeFromSuperlayer];
         self.playerLayer = nil;
     }
-    if (self.attachedShared) {
-        self.attachedShared = NO;
-        LNBSharedPlayerDetach();
-    }
-    if (self.player) {
-        [self.player pause];
-        self.player = nil;
+    if (self.attachedPath) {
+        LNBPoolDetach(self.attachedPath);
+        self.attachedPath = nil;
     }
 }
 
@@ -421,9 +496,9 @@ static UIView *LNBGlobalBackgroundHost(UIView *anchor);   // 前向声明（定�
 }
 
 - (void)dealloc {
-    if (_attachedShared) {
-        _attachedShared = NO;
-        LNBSharedPlayerDetach();
+    if (_attachedPath) {
+        LNBPoolDetach(_attachedPath);
+        _attachedPath = nil;
     }
 }
 
@@ -507,13 +582,30 @@ static void LNBApplyCardBackground(UIView *cell) {
     NSString *cls = NSStringFromClass(cell.class);
     if (![cls isEqualToString:@"NCNotificationListCell"]) return;
 
-    // 【v2.1.2】统一透明卡片模式：全屏素材（global 优先 card 兜底）存在时，
-    // 卡片只是一块 16% 暗化板，透出锁屏根上的全屏视频层 ——
-    // 卡片内外画面连续、滑开空隙透视频，与参考视频一致。
+    // 【v2.2.0】卡片行为由面板决定：
+    //   A. 插件关闭 / 无任何素材 → 还原原生样式
+    //   B. 挖洞透出整屏（cardTransparent，默认）→ 暗化板透出锁屏根上的整屏层
+    //   C. 独立素材模式（关闭挖洞）→ 卡片铺 card.*，多卡共享同一播放器同帧
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    BOOL hasCardVideo = LNBFileExists(LNBPathForResource(kCardVideo));
+    BOOL hasCardImage = LNBFileExists(LNBPathForResource(kCardImage));
+
     NSString *fullVid = nil, *fullImg = nil;
     LNBResolveFullMedia(&fullVid, &fullImg);
-    if (!fullVid && !fullImg) {
-        // 没素材：还原并退出（原生样式）
+    BOOL hasFull = (fullVid || fullImg);
+    BOOL hasCard = (hasCardVideo || hasCardImage);
+
+    if (!prefs.enabled || (!hasFull && !hasCard)) {
+        // 关闭 / 无素材：还原并退出（原生样式）
+        LNBSetCardMaterialsHidden(cell, NO);
+        UIView *old = [cell viewWithTag:kCardBGViewTag];
+        if (old) [old removeFromSuperview];
+        return;
+    }
+
+    BOOL transparent = prefs.cardTransparent && hasFull;   // 挖洞需要整屏层存在
+    BOOL standalone  = !transparent && hasCard;
+    if (!transparent && !standalone) {
         LNBSetCardMaterialsHidden(cell, NO);
         UIView *old = [cell viewWithTag:kCardBGViewTag];
         if (old) [old removeFromSuperview];
@@ -539,7 +631,6 @@ static void LNBApplyCardBackground(UIView *cell) {
     if (!bg) {
         bg = [[LNBBGView alloc] initWithFrame:target];
         bg.tag = kCardBGViewTag;
-        bg.useSharedPlayer = YES;
     }
     if (bg.superview != slide) {
         [bg removeFromSuperview];
@@ -552,9 +643,13 @@ static void LNBApplyCardBackground(UIView *cell) {
     CGFloat radius = cell.layer.cornerRadius > 0 ? cell.layer.cornerRadius : 18.0;
     if (fabs(bg.layer.cornerRadius - radius) > 0.5) bg.layer.cornerRadius = radius;
 
-    if (fullVid || fullImg) {
-        // 透明卡片模式：半透明暗化板，透出锁屏根上的全屏视频层
-        [bg applyDimOnlyWithAlpha:0.16];
+    if (standalone) {
+        // 独立素材模式：卡片铺 card.*（面板里关掉"挖洞透出整屏"）
+        [bg applyMediaWithVideo:(hasCardVideo ? kCardVideo : nil)
+                          image:(hasCardVideo ? nil : kCardImage)];
+    } else {
+        // 挖洞模式：半透明暗化板，透出锁屏根上的整屏视频层
+        [bg applyDimOnlyWithAlpha:prefs.dimAlpha];
     }
 }
 
@@ -569,6 +664,165 @@ static void LNBSyncCardGeometry(UIView *cell) {
     sLast = now;
     UIView *bg = [cell viewWithTag:kCardBGViewTag];
     if ([bg isKindOfClass:[LNBBGView class]]) [bg setNeedsLayout];
+}
+
+#pragma mark - 选项 / 清除 / 折叠按钮（v2.2.0）
+
+// 收集一个视图子树里的所有文字（按钮归属判定用）
+static NSString *LNBGatherText(UIView *root) {
+    NSMutableString *acc = [NSMutableString string];
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    NSInteger steps = 0;
+    while (stack.count > 0 && steps < 256) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        steps++;
+        if ([v isKindOfClass:[UILabel class]]) {
+            if (acc.length) [acc appendString:@" "];
+            [acc appendString:[(UILabel *)v text] ?: @""];
+        }
+        for (UIView *sub in v.subviews) [stack addObject:sub];
+    }
+    return acc;
+}
+
+// 按钮候选判定 —— 全部来自 v1.4.x 十几轮设备日志实证：
+//   ✅ NCToggleControl         45x34 / 66x34 "清除"、折叠开关
+//   ✅ PLPlatterActionButton   77x66 "选项" / 73x66 "清除"
+//   ❌ PLActionButtonsPresentingView（容器，铺了会盖住子按钮）
+//   ❌ Coalescing / Pair / Header*（容器与标题）
+static BOOL LNBIsCandidateActionButton(UIView *v) {
+    if (!v) return NO;
+    CGSize sz = v.bounds.size;
+    if (sz.width < 20.0 || sz.height < 20.0) return NO;   // 未布局的 {0,0}
+    if (sz.width > 260.0 || sz.height > 120.0) return NO;
+
+    NSString *cls = NSStringFromClass(v.class);
+    if ([cls isEqualToString:@"NCToggleControl"]) return YES;
+    if ([cls isEqualToString:@"PLPlatterActionButton"]) return YES;
+
+    if ([cls containsString:@"ActionButtonsPresenting"]) return NO;
+    if ([cls containsString:@"Coalescing"])      return NO;
+    if ([cls containsString:@"HeaderTitle"])     return NO;
+    if ([cls containsString:@"HeaderCell"])      return NO;
+    if ([cls containsString:@"Pair"])            return NO;
+    if ([cls containsString:@"SectionHeader"])   return NO;
+    if ([cls containsString:@"SectionView"])     return NO;
+    if ([cls containsString:@"Avatar"])          return NO;
+    if ([cls containsString:@"BadgedIcon"])      return NO;
+    if ([cls isEqualToString:@"UIImageView"])    return NO;
+    if ([cls isEqualToString:@"UILabel"])        return NO;
+
+    // 其它自定义按钮兜底：类名含 Button 且祖先在通知体系内
+    if ([cls containsString:@"Button"]) {
+        for (UIView *p = v.superview; p; p = p.superview) {
+            if ([NSStringFromClass(p.class) containsString:@"NCNotification"]) return YES;
+        }
+    }
+    return NO;
+}
+
+// 按钮"透出化"：藏材质 + 清底色 → 透出底下的整屏画面（参考视频效果）。
+// 原底色用 UIColor 快照记账，开关关闭时还原。
+static void LNBSetButtonSeeThrough(UIView *btn, BOOL on) {
+    BOOL cur = [objc_getAssociatedObject(btn, kLNBBtnSeeThrough) boolValue];
+    if (on == cur) return;
+    if (on) {
+        LNBSetCardMaterialsHidden(btn, YES);
+        CGColorRef cg = btn.layer.backgroundColor;
+        UIColor *snap = cg ? [UIColor colorWithCGColor:cg] : nil;
+        objc_setAssociatedObject(btn, kLNBBtnOrigBgKey, snap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        btn.layer.backgroundColor = [UIColor clearColor].CGColor;
+        objc_setAssociatedObject(btn, kLNBBtnSeeThrough, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else {
+        UIColor *snap = objc_getAssociatedObject(btn, kLNBBtnOrigBgKey);
+        btn.layer.backgroundColor = snap.CGColor;
+        LNBSetCardMaterialsHidden(btn, NO);
+        objc_setAssociatedObject(btn, kLNBBtnSeeThrough, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+// 给单个按钮挂背景：
+//   归属（v1.4.5 定论，先判「选项」再判「清除」，折叠跳过独立素材）：
+//     含「选项」不含「清除」 → supp.*；含「清除」 → supp2.*（缺省回退 supp.*）
+//   有素材 → 铺圆角图/视频（文字天然浮在最上）；无素材 → 透出化
+static void LNBApplyButtonBackground(UIView *btn) {
+    if (!btn) return;
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    BOOL wantOn = prefs.enabled && prefs.suppModuleEnabled;
+
+    // 先清掉本按钮上已铺的独立素材层
+    UIView *oldMedia = [btn viewWithTag:kActionBGViewTag];
+    if (oldMedia) [oldMedia removeFromSuperview];
+
+    if (!wantOn) {
+        LNBSetButtonSeeThrough(btn, NO);
+        return;
+    }
+
+    NSString *label = LNBGatherText(btn);
+    NSString *lower = label.lowercaseString;
+    BOOL hasOption = ([label containsString:@"选项"] || [lower containsString:@"option"]);
+    BOOL hasClear  = ([label containsString:@"清除"] || [lower containsString:@"clear"]);
+    BOOL isClear   = hasClear && !hasOption;   // 「清除」用 supp2.*
+
+    // 素材回退链：清除 supp2.* → supp.*；选项 supp.* → supp2.*（反向兜底）
+    NSString *vidName = isClear ? kSupp2Video : kSuppVideo;
+    NSString *imgName = isClear ? kSupp2Image : kSuppImage;
+    if (!LNBFileExists(LNBPathForResource(vidName)) &&
+        !LNBFileExists(LNBPathForResource(imgName))) {
+        vidName = isClear ? kSuppVideo : kSupp2Video;
+        imgName = isClear ? kSuppImage : kSupp2Image;
+    }
+    BOOL hasMedia = LNBFileExists(LNBPathForResource(vidName)) ||
+                    LNBFileExists(LNBPathForResource(imgName));
+
+    if (!hasMedia) {
+        // 参考视频效果：按钮区域透出整屏画面，文字浮在上面
+        LNBSetButtonSeeThrough(btn, YES);
+        return;
+    }
+
+    // 有素材：铺圆角媒体层（插 index 0，按钮文字/图标天然浮上）
+    LNBSetButtonSeeThrough(btn, NO);
+    LNBBGView *bg = (LNBBGView *)[btn viewWithTag:kActionBGViewTag];
+    if (!bg) {
+        bg = [[LNBBGView alloc] initWithFrame:btn.bounds];
+        bg.tag = kActionBGViewTag;
+    }
+    [bg removeFromSuperview];
+    [btn insertSubview:bg atIndex:0];
+
+    CGFloat cr = btn.layer.cornerRadius;
+    if (cr <= 0.5) {
+        CGFloat shortSide = MIN(btn.bounds.size.width, btn.bounds.size.height);
+        cr = shortSide * 0.3;   // v1.4.5 定论：短边 30%，接近圆角方块而非胶囊
+    }
+    bg.layer.cornerRadius = cr;
+    bg.layer.masksToBounds = YES;
+    bg.alpha = prefs.suppAlpha;
+    [bg applyMediaWithVideo:(LNBFileExists(LNBPathForResource(vidName)) ? vidName : nil)
+                      image:(LNBFileExists(LNBPathForResource(vidName)) ? nil : imgName)];
+}
+
+// 按钮扫描（0.25s 节流）：在通知相关子树里找候选按钮逐个应用
+static CFTimeInterval lnbBtnScanLast = 0;
+
+static void LNBScanButtonsIfNeeded(UIView *root) {
+    if (!root) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lnbBtnScanLast < 0.25) return;
+    lnbBtnScanLast = now;
+
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    NSInteger steps = 0;
+    while (stack.count > 0 && steps < 512) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        steps++;
+        if (LNBIsCandidateActionButton(v)) LNBApplyButtonBackground(v);
+        for (UIView *sub in v.subviews) [stack addObject:sub];
+    }
 }
 
 #pragma mark - 全屏背景图层
@@ -656,11 +910,13 @@ static void LNBEnsureListBackground(UIView *anchor) {
     if (now - lnbGlobalBGLastCheck < 0.5) return;
     lnbGlobalBGLastCheck = now;
 
-    // 【v2.1.2】素材自动全屏化：global 优先，card 兜底
+    // 【v2.2.0】面板开关：整屏层受 enabled + globalEnabled 双重控制
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
     NSString *fullVid = nil, *fullImg = nil;
     LNBResolveFullMedia(&fullVid, &fullImg);
-    if (!fullVid && !fullImg) {
-        // 无素材：清理所有历史挂载
+    BOOL wantGlobal = prefs.enabled && prefs.globalEnabled;
+    if (!wantGlobal || (!fullVid && !fullImg)) {
+        // 关闭 / 无素材：清理所有历史挂载
         for (UIWindow *window in [UIApplication sharedApplication].windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
             while (stack.count > 0) {
@@ -695,7 +951,6 @@ static void LNBEnsureListBackground(UIView *anchor) {
         bg = [[LNBBGView alloc] initWithFrame:host.bounds];
         bg.tag = kGlobalBGViewTag;
         bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        bg.useSharedPlayer = YES;   // 全屏层也走共享播放器：进程内唯一解码器
     }
 
     // 每次复查都走一遍素材匹配（setupVideoWith 内部幂等：已挂对直接返回；
@@ -736,6 +991,7 @@ static void LNBScanAndApplyCards(UIView *root) {
     %orig;
     LNBEnsureListBackground((UIView *)self);
     LNBScanAndApplyCards((UIView *)self);
+    LNBScanButtonsIfNeeded((UIView *)self);
 }
 %end
 
@@ -743,6 +999,7 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)layoutSubviews {
     %orig;
     LNBEnsureListBackground((UIView *)self);
+    LNBScanButtonsIfNeeded((UIView *)self);
 }
 %end
 
@@ -754,6 +1011,7 @@ static void LNBScanAndApplyCards(UIView *root) {
     // 只有 cell 的 layout 稳定触发（ListView/SectionView 未必），
     // v2.0.0~v2.0.3 的全屏背景层因此一直没挂上（卡片后面是静态壁纸）。
     LNBEnsureListBackground((UIView *)self);
+    LNBScanButtonsIfNeeded((UIView *)self);
 }
 - (void)setFrame:(CGRect)frame {
     %orig(frame);
@@ -776,6 +1034,7 @@ static void LNBScanAndApplyCards(UIView *root) {
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    LNBTLog(@"v2.1.2 loaded — 素材目录 %@（全屏视频挂锁屏根 + 卡片透明暗化；global 优先 card 兜底）", kBGDirectory);
+    [[LNBPrefs sharedInstance] reload];
+    LNBTLog(@"v2.2.0 loaded — 素材目录 %@；整屏/卡片/选项/清除独立素材（图片或视频），无素材按钮自动透出整屏", kBGDirectory);
 }
 %end
