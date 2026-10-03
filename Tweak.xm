@@ -165,13 +165,6 @@
 //       必须是"像按钮"的视图（已知按钮类 / 类名含 Button/Action / 高度
 //       30~90）才放行。
 //
-//  v2.2.17 按钮素材不再继承卡片（用户明确：按钮没单独选素材就别铺，
-//    纯透出/原生）：
-//    删除 v2.2.5/v2.2.11 的"按钮没设素材 → 继承 card.*/global.*"回退链
-//    —— 那种"按钮自动和卡片同步"不是用户想要的效果。按钮素材现在完全由
-//    supp.*（选项）/ supp2.*（清除）决定，都没设 → 走透出化（整屏画面）
-//    或还原原生。
-//
 //  v2.2.7 挂载架构终极重构（v2.2.6 实测 M11 复盘）：
 //    M11 实锤：zPosition+置顶双保险仍救不回文字 —— 文字容器根本不在
 //    contentView 子树里（图片消息类 cell 的层级与文字消息不同），
@@ -278,6 +271,7 @@ static const NSInteger kCardBGViewTag   = 0x4C4E4243;   // 'LNBC'
 static const NSInteger kGlobalBGViewTag = 0x4C4E4247;   // 'LNBG'
 static const NSInteger kActionBGViewTag = 0x4C4E4241;   // 'LNBA'（按钮独立素材层）
 static char kLNBBtnMediaKey;                            // 【v2.2.10】按钮 bg 素材标识（幂等，关联键取地址）
+static char kLNBBtnBGKey;                                // 【v2.2.19】按钮 bg 本体引用（延迟插入期间也要能找回）
 
 // 【v2.2.0】设置面板域与跨进程同步（与 prefs 面板代码一致）
 static NSString *const kPrefsDomain        = @"com.hchdjej.locknotifybg";
@@ -870,89 +864,6 @@ static UIView *LNBFindSlideContainer(UIView *cell) {
     }
     return best;
 }
-// 【v2.2.18】延迟挂载核心 —— 崩溃根因修复
-// ---------------------------------------------------------------------------
-// 崩溃日志实锤（SpringBoard-2026-10-03-180652.ips）：
-//   EXC_CRASH / SIGABRT，主线程，栈为
-//     CA::Transaction::commit → layout_if_needed
-//       → -[UIView(CALayerDelegate) layoutSublayersOfLayer:]
-//         → LockNotifyBG.dylib @off 37804   ← 我们
-//           → -[UIView(Internal) _addSubview:positioned:relativeTo:]
-//             → __CFDictionaryCreateGeneric → objc_exception_throw → abort
-//
-// 即：我们在 layoutSubviews / layoutSublayersOfLayer 的**系统布局回调链内部**
-// 直接 insertSubview，UIKit 判定"布局期非法改动视图层级"抛内部异常，
-// 异常穿透 main runloop（CFRunLoopRunSpecific 处 rethrow）→ SpringBoard 崩。
-//
-// 为什么"只有放素材才崩"：没素材时走纯透出分支（只改 layer 属性，不插视图），
-// 有素材时才创建 LNBBGView 并 insertSubview:atIndex:0 → 命中该路径。
-//
-// 修法：把所有"改视图层级"的动作推迟到当前 runloop tick 结束之后执行，
-// 让系统先把布局收尾，再安全地插入/移除。用 NSHashTable 登记待处理视图，
-// 去重 + 弱引用，避免视图提前释放导致野指针。
-static NSHashTable *lnbDeferredHosts(void) {
-    static NSHashTable *t = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        t = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory |
-                                            NSPointerFunctionsObjectPointerPersonality];
-    });
-    return t;
-}
-static BOOL lnbDeferScheduled = NO;
-
-// 前向声明（真正干活的是 LNBApplyButtonBackgroundNow）
-static void LNBApplyButtonBackgroundNow(UIView *btn);
-static void LNBFlushDeferredButtonWork(void);
-static void LNBDeferStructural(dispatch_block_t block);
-
-// 布局回调里只调这个：把宿主登记下来，出栈后再统一处理。
-static void LNBApplyButtonBackgroundDeferred(UIView *btn) {
-    if (!btn) return;
-    [lnbDeferredHosts() addObject:btn];
-    LNBDeferStructural(^{});   // 共用一次 flush：空块仅用于触发调度
-}
-
-// 通用：把任意"改视图层级/改 window 归属"的动作推到当前 runloop tick 之后。
-// 与按钮那条路径共用同一批次 —— 一个 tick 内登记的所有工作一次性 flush，
-// 绝不在系统 layout 回调栈里直接动视图树。
-static NSMutableArray *lnbDeferredBlocks(void) {
-    static NSMutableArray *a = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ a = [NSMutableArray array]; });
-    return a;
-}
-
-static void LNBDeferStructural(dispatch_block_t block) {
-    if (!block) return;
-    [lnbDeferredBlocks() addObject:[block copy]];
-    if (lnbDeferScheduled) return;
-    lnbDeferScheduled = YES;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSArray *blocks = [lnbDeferredBlocks() copy];
-        [lnbDeferredBlocks() removeAllObjects];
-        for (dispatch_block_t b in blocks) {
-            @try { b(); } @catch (NSException *e) {
-                LNBTLog(@"[v2.2.18] deferred block failed: %@", e.reason);
-            }
-        }
-        LNBFlushDeferredButtonWork();
-    });
-}
-
-static void LNBFlushDeferredButtonWork(void) {
-    NSHashTable *hosts = lnbDeferredHosts();
-    NSArray<UIView *> *snapshot = hosts.allObjects;
-    [hosts removeAllObjects];
-    for (UIView *v in snapshot) {
-        if (!v) continue;
-        @try {
-            LNBApplyButtonBackgroundNow(v);
-        } @catch (NSException *e) {
-            LNBTLog(@"[v2.2.18] deferred button bg failed: %@", e.reason);
-        }
-    }
-}
 
 // 给一条通知卡片挂背景。
 // 【v2.1.1】背景挂进滑动容器（cell.contentView 体系），目标 frame =
@@ -1012,15 +923,9 @@ static void LNBApplyCardBackground(UIView *cell) {
     // 都被 slide 整体盖住）。挂 cell + 负 zPosition = 跨容器垫底，
     // cell 的所有子树（无论文字藏哪个容器）必然浮在素材之上；
     // 滑动跟随交给 syncFrame 逐帧投影（CADisplayLink）。
-    // 【v2.2.18】插入动作延后到布局回调之外（崩溃根因修复，见文件头注释）
     if (bg.superview != cell) {
-        LNBDeferStructural(^{
-            if (!cell.window) return;
-            if (bg.superview != cell) {
-                [bg removeFromSuperview];
-                [cell insertSubview:bg atIndex:0];
-            }
-        });
+        [bg removeFromSuperview];
+        [cell insertSubview:bg atIndex:0];
     }
     bg.layer.zPosition = -1000.0;
     [bg startSyncLink];
@@ -1206,14 +1111,65 @@ static void LNBSetButtonSeeThrough(UIView *btn, BOOL on) {
     }
 }
 
-// 给单个按钮挂背景（真正干活的实现，只在"离开布局回调链"后执行）：
+// 【v2.2.19】按钮素材层"延迟挂载" —— 崩溃根因的唯一修复点。
+// ---------------------------------------------------------------------------
+// 崩溃日志实锤（SpringBoard-2026-10-03-180652.ips，EXC_CRASH/SIGABRT 主线程）：
+//   CA::Transaction::commit → layout_if_needed
+//     → -[UIView(CALayerDelegate) layoutSublayersOfLayer:]
+//       → LockNotifyBG.dylib @off 37804        ← 我们
+//         → -[UIView(Internal) _addSubview:positioned:relativeTo:]
+//           → __CFDictionaryCreateGeneric → objc_exception_throw → abort
+//
+// LNBApplyButtonBackground 是在 cell/ListView 的 layoutSubviews hook 链里被
+// 调用的，此时同步 insertSubview 会撞上 UIKit 的"布局期间禁止改层级"断言。
+// 没有素材时走纯透出分支（只改 layer 属性）所以不崩 —— 这解释了
+// "只有放素材才安全模式"。
+//
+// 修法：把插入动作 dispatch 到当前 runloop tick 之后。**只改这一处**，
+// 卡片（挂 cell）与整屏（挂 host）路径保持同步插入不动 —— v2.2.18 曾把
+// 三处一起延后，导致卡片/整屏素材失效（用户实测），本轮严格限定范围。
+static void LNBDeferAttachButtonBG(UIView *btn, LNBBGView *bg) {
+    if (!btn || !bg) return;
+    __weak UIView *weakBtn = btn;
+    __weak LNBBGView *weakBg = bg;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *b = weakBtn;
+        LNBBGView *g = weakBg;
+        if (!b || !g) return;
+        if (g.superview == b) return;      // 已挂好 → 不重复插
+        if (!b.window) return;             // 已离屏 → 不插（避免无效/危险操作）
+        @try {
+            [g removeFromSuperview];
+            [b insertSubview:g atIndex:0];
+            g.layer.zPosition = -100.0;
+        } @catch (NSException *e) {
+            LNBTLog(@"[v2.2.19] button bg attach failed: %@", e.reason);
+        }
+    });
+}
+
+// 【v2.2.19】按钮 bg 统一清理：无论它当前挂在按钮上、还是处于"已创建但
+// 延迟插入尚未落地/host 已离屏"的状态，都能完整摘掉并断开引用。
+// （插入延后引入了"未挂载窗口期"，只看 viewWithTag 会漏掉这种 bg。）
+static void LNBClearButtonBG(UIView *btn) {
+    if (!btn) return;
+    LNBBGView *bg = objc_getAssociatedObject(btn, &kLNBBtnBGKey);
+    if (!bg || ![bg isKindOfClass:[LNBBGView class]]) {
+        bg = (LNBBGView *)[btn viewWithTag:kActionBGViewTag];
+    }
+    if (bg) {
+        [bg stopSyncLink];
+        [bg removeFromSuperview];
+        objc_setAssociatedObject(btn, &kLNBBtnBGKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+// 给单个按钮挂背景：
 //   归属（v1.4.5 定论，先判「选项」再判「清除」，折叠跳过独立素材）：
 //     含「选项」不含「清除」 → supp.*；含「清除」 → supp2.*（缺省回退 supp.*）
 //   有素材 → 铺圆角图/视频（文字天然浮在最上）；无素材 → 透出化
-static void LNBApplyButtonBackgroundNow(UIView *btn) {
+static void LNBApplyButtonBackground(UIView *btn) {
     if (!btn) return;
-    // 【v2.2.18】视图可能已被系统回收/摘出窗口 —— 此时改层级毫无意义且危险
-    if (!btn.window) return;
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
     BOOL wantOn = prefs.enabled && prefs.suppModuleEnabled;
 
@@ -1222,8 +1178,7 @@ static void LNBApplyButtonBackgroundNow(UIView *btn) {
 
     if (!wantOn) {
         LNBSetButtonSeeThrough(btn, NO);
-        UIView *staleBg = [btn viewWithTag:kActionBGViewTag];
-        if (staleBg) { LNBBGView *sb = (LNBBGView *)staleBg; [sb stopSyncLink]; [staleBg removeFromSuperview]; }
+        LNBClearButtonBG(btn);   // 【v2.2.19】含未挂载窗口期的 bg
         return;
     }
 
@@ -1249,8 +1204,7 @@ static void LNBApplyButtonBackgroundNow(UIView *btn) {
         if (inAction) isClear = YES;   // 无文字操作按钮按清除归属取 supp2.* 链
         if (isToggle || (!inAction && (!isPlatter || !LNBInSlideCellWide(btn)))) {
             LNBSetButtonSeeThrough(btn, NO);
-            UIView *staleBg = [btn viewWithTag:kActionBGViewTag];
-            if (staleBg) { LNBBGView *sb = (LNBBGView *)staleBg; [sb stopSyncLink]; [staleBg removeFromSuperview]; }
+            LNBClearButtonBG(btn);   // 【v2.2.19】含未挂载窗口期的 bg
             return;
         }
     }
@@ -1263,10 +1217,28 @@ static void LNBApplyButtonBackgroundNow(UIView *btn) {
         vidName = isClear ? kSuppVideo : kSupp2Video;
         imgName = isClear ? kSuppImage : kSupp2Image;
     }
-    // 【v2.2.17】取消"继承卡片/整屏素材"（用户明确：按钮没单独选素材就
-    // 不要铺任何素材，纯透出/原生）。原 v2.2.5/v2.2.11 的回退链（按钮没设
-    // → 拿 card.*/global.*）已删除 —— 那种"按钮和卡片自动同步"不是用户
-    // 想要的效果。按钮素材完全由 supp.* / supp2.* 决定，没有就不铺。
+    // 【v2.2.5→v2.2.11】按钮没专设素材 → 继承：
+    // 挖洞模式（默认）下卡片透出的是整屏层画面 —— 继承终点改为 global.*
+    // （按钮画面与卡片画面同源同帧；继承 card.* 会和卡片内容对不上，
+    // M15 实测按钮浅色画面 vs 卡片深蓝画面的不协调根因）；
+    // 独立素材模式（关挖洞）卡片铺 card.* → 维持继承 card.*。
+    // global 也没有 → 回退 card.*；朋友视频里"清除"按钮铺的正是与卡片
+    // 同款的橙色鸭子素材，红字"清除"浮在上面。
+    if (!LNBFileExists(LNBPathForResource(vidName)) &&
+        !LNBFileExists(LNBPathForResource(imgName))) {
+        if (prefs.cardTransparent) {
+            vidName = kGlobalVideo;
+            imgName = kGlobalImage;
+            if (!LNBFileExists(LNBPathForResource(vidName)) &&
+                !LNBFileExists(LNBPathForResource(imgName))) {
+                vidName = kCardVideo;
+                imgName = kCardImage;
+            }
+        } else {
+            vidName = kCardVideo;
+            imgName = kCardImage;
+        }
+    }
     BOOL hasMedia = LNBFileExists(LNBPathForResource(vidName)) ||
                     LNBFileExists(LNBPathForResource(imgName));
 
@@ -1274,8 +1246,7 @@ static void LNBApplyButtonBackgroundNow(UIView *btn) {
         // 参考视频效果：按钮区域透出整屏画面，文字浮在上面；
         // 素材被删掉时旧 bg 也要清掉（v2.2.8 池治理的同款思路）
         LNBSetButtonSeeThrough(btn, YES);
-        UIView *staleBg = [btn viewWithTag:kActionBGViewTag];
-        if (staleBg) { LNBBGView *sb = (LNBBGView *)staleBg; [sb stopSyncLink]; [staleBg removeFromSuperview]; }
+        LNBClearButtonBG(btn);   // 【v2.2.19】含未挂载窗口期的 bg
         return;
     }
 
@@ -1283,7 +1254,15 @@ static void LNBApplyButtonBackgroundNow(UIView *btn) {
     // 【v2.2.9】必须保持透出化：还原按钮材质会盖住 bg（材质 subview 在素材层之上），
     // M13 实锤清除按钮显示灰色原生的根因。材质已藏、底色已清 → 素材垫底、文字浮上。
     LNBSetButtonSeeThrough(btn, YES);
-    LNBBGView *bg = (LNBBGView *)[btn viewWithTag:kActionBGViewTag];
+    // 【v2.2.19】bg 归属改记在按钮的关联对象上，而不是只靠 viewWithTag 找：
+    //   插入被延后后，bg 会有"已创建但还没挂上"的窗口期 —— 此时
+    //   [btn viewWithTag:] 找不到它，下一轮扫描（0.25s 后）就会再 new 一个，
+    //   多个 bg 抢同一个 tag/播放器 → 素材不显示或闪烁。改用关联对象做
+    //   权威索引，插入成功后 superview 自然对齐，幂等判定永远生效。
+    LNBBGView *bg = objc_getAssociatedObject(btn, &kLNBBtnBGKey);
+    if (!bg || ![bg isKindOfClass:[LNBBGView class]]) {
+        bg = (LNBBGView *)[btn viewWithTag:kActionBGViewTag];
+    }
     // 【v2.2.10】幂等：素材没换就不拆不重建 —— 之前每次扫描都
     // removeFromSuperview + 重挂播放器层，慢滑动时反复闪烁 = "卡动"根因。
     NSString *wantKey = LNBFileExists(LNBPathForResource(vidName))
@@ -1300,6 +1279,8 @@ static void LNBApplyButtonBackgroundNow(UIView *btn) {
             bg.audioProfile = 1;
             // 【v2.2.16】按钮 bg 不挂 displayLink（autoresizing 跟随即可）
             if (bg.frame.size.width < 1.0 || bg.frame.size.height < 1.0) bg.frame = btn.bounds;
+            // 【v2.2.19】兜底：已创建但上轮延迟插入没落地（视图曾被摘出窗口）
+            if (bg.superview != btn) LNBDeferAttachButtonBG(btn, bg);
             return;
         }
     }
@@ -1307,6 +1288,7 @@ static void LNBApplyButtonBackgroundNow(UIView *btn) {
         bg = [[LNBBGView alloc] initWithFrame:btn.bounds];
         bg.tag = kActionBGViewTag;
     }
+    objc_setAssociatedObject(btn, &kLNBBtnBGKey, bg, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     bg.audioProfile = 1;   // 【v2.2.8】按钮素材声音 = suppAudioEnabled 开关
     objc_setAssociatedObject(bg, &kLNBBtnMediaKey, wantKey, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     // 【v2.2.16】按钮 bg 改用 autoresizing 跟随，不再挂 displayLink：
@@ -1317,9 +1299,8 @@ static void LNBApplyButtonBackgroundNow(UIView *btn) {
     [bg stopSyncLink];
     bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     bg.frame = btn.bounds;
-    [bg removeFromSuperview];
-    [btn insertSubview:bg atIndex:0];
-    bg.layer.zPosition = -100.0;   // 【v2.2.6】按钮素材强制垫底保险
+    // 【v2.2.19】插入延后执行（崩溃根因修复，说明见 LNBDeferAttachButtonBG）
+    LNBDeferAttachButtonBG(btn, bg);
 
     CGFloat cr = btn.layer.cornerRadius;
     if (cr <= 0.5) {
@@ -1350,7 +1331,7 @@ static void LNBScanButtonsIfNeeded(UIView *root) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
         steps++;
-        if (LNBIsCandidateActionButton(v)) LNBApplyButtonBackgroundDeferred(v);
+        if (LNBIsCandidateActionButton(v)) LNBApplyButtonBackground(v);
         for (UIView *sub in v.subviews) [stack addObject:sub];
     }
 }
@@ -1555,14 +1536,10 @@ static void LNBEnsureListBackground(UIView *anchor) {
     [bg applyMediaWithVideo:fullVid image:fullImg];
 
     // 【v2.2.1】插入位置：锚点视图（壁纸）之上；无锚点 → 最底层
-    // 【v2.2.18】延后到布局回调之外执行（崩溃根因同源）
     if (bg.superview != host) {
-        LNBDeferStructural(^{
-            if (!host.window) return;
-            [bg removeFromSuperview];
-            if (anchorView && anchorView.superview == host) [host insertSubview:bg aboveSubview:anchorView];
-            else    [host insertSubview:bg atIndex:0];
-        });
+        [bg removeFromSuperview];
+        if (anchorView && anchorView.superview == host) [host insertSubview:bg aboveSubview:anchorView];
+        else    [host insertSubview:bg atIndex:0];
     }
 
     // 铺满宿主（bounds+center 赋值，判据纪律）
@@ -1650,6 +1627,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.18 loaded — 修复按钮素材安全模式：所有视图插入延后到布局回调之外执行", kBGDirectory);
+    LNBTLog(@"v2.2.19 loaded — 按钮素材层延迟挂载（修复放入素材即安全模式；卡片/整屏路径不动）", kBGDirectory);
 }
 %end
