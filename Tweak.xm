@@ -107,6 +107,15 @@
 //    ④ 幂等防闪：素材没换不拆不重建 bg（此前每次扫描都 removeFromSuperview
 //       + 重挂播放器层 = 反复闪烁），旧 bg 清除移入各还原分支。
 //
+//  v2.2.11 独立通知铺装 + 按钮画面同源（用户实测 M15 对比参考视频二）：
+//    ① 独立通知白卡：堆叠外的独立通知 cell 类名不是 NCNotificationListCell
+//       （M15 实锤：堆叠卡全铺了、独立卡一直白原生）—— 卡片扫描与
+//       syncFrame 的 cell 判定放宽为 NCNotification*Cell；
+//    ② 按钮画面与卡片同源：挖洞模式（默认）下卡片透出整屏层画面，
+//       按钮继承终点从 card.* 改为 global.*（否则按钮素材与卡片内容
+//       对不上 —— M15 实测按钮浅色画面 vs 卡片深蓝画面的不协调根因）；
+//       独立素材模式维持继承 card.*。
+//
 //  v2.2.7 挂载架构终极重构（v2.2.6 实测 M11 复盘）：
 //    M11 实锤：zPosition+置顶双保险仍救不回文字 —— 文字容器根本不在
 //    contentView 子树里（图片消息类 cell 的层级与文字消息不同），
@@ -542,7 +551,11 @@ static void LNBPoolDetach(NSString *path) {
 - (void)syncFrame {
     UIView *host = self.superview;
     if (!host || !host.window) { [self stopSyncLink]; return; }
-    if (![NSStringFromClass(host.class) isEqualToString:@"NCNotificationListCell"]) {
+    // 【v2.2.11】cell 宿主判定同步放宽（堆叠外独立通知类名不同）
+    NSString *hcls = NSStringFromClass(host.class);
+    BOOL isCardHost = [hcls isEqualToString:@"NCNotificationListCell"] ||
+                      ([hcls hasPrefix:@"NCNotification"] && [hcls containsString:@"Cell"]);
+    if (!isCardHost) {
         CGRect t = host.bounds;
         if (t.size.width < 1.0 || t.size.height < 1.0) return;
         if (!CGAffineTransformIsIdentity(self.transform)) self.transform = CGAffineTransformIdentity;
@@ -1036,13 +1049,27 @@ static void LNBApplyButtonBackground(UIView *btn) {
         vidName = isClear ? kSuppVideo : kSupp2Video;
         imgName = isClear ? kSuppImage : kSupp2Image;
     }
-    // 【v2.2.5】按钮没专设素材 → 直接继承卡片素材：
-    // 只选一个卡片素材，卡片+选项+清除全套统一（朋友视频里"清除"
-    // 按钮铺的正是和卡片同款的橙色鸭子素材，红字"清除"浮在上面）。
+    // 【v2.2.5→v2.2.11】按钮没专设素材 → 继承：
+    // 挖洞模式（默认）下卡片透出的是整屏层画面 —— 继承终点改为 global.*
+    // （按钮画面与卡片画面同源同帧；继承 card.* 会和卡片内容对不上，
+    // M15 实测按钮浅色画面 vs 卡片深蓝画面的不协调根因）；
+    // 独立素材模式（关挖洞）卡片铺 card.* → 维持继承 card.*。
+    // global 也没有 → 回退 card.*；朋友视频里"清除"按钮铺的正是与卡片
+    // 同款的橙色鸭子素材，红字"清除"浮在上面。
     if (!LNBFileExists(LNBPathForResource(vidName)) &&
         !LNBFileExists(LNBPathForResource(imgName))) {
-        vidName = kCardVideo;
-        imgName = kCardImage;
+        if (prefs.cardTransparent) {
+            vidName = kGlobalVideo;
+            imgName = kGlobalImage;
+            if (!LNBFileExists(LNBPathForResource(vidName)) &&
+                !LNBFileExists(LNBPathForResource(imgName))) {
+                vidName = kCardVideo;
+                imgName = kCardImage;
+            }
+        } else {
+            vidName = kCardVideo;
+            imgName = kCardImage;
+        }
     }
     BOOL hasMedia = LNBFileExists(LNBPathForResource(vidName)) ||
                     LNBFileExists(LNBPathForResource(imgName));
@@ -1342,7 +1369,13 @@ static void LNBScanAndApplyCards(UIView *root) {
     while (stack.count > 0) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
-        if ([NSStringFromClass(v.class) isEqualToString:@"NCNotificationListCell"]) {
+        // 【v2.2.11】类名放宽：堆叠外的独立通知 cell 类名不是
+        // NCNotificationListCell（M15 实锤：堆叠卡全铺了、独立卡一直白原生）。
+        // NCNotification*Cell 前后缀同时命中才应用，容器类不会被误伤。
+        NSString *cls = NSStringFromClass(v.class);
+        BOOL isCardCell = [cls isEqualToString:@"NCNotificationListCell"] ||
+                          ([cls hasPrefix:@"NCNotification"] && [cls containsString:@"Cell"]);
+        if (isCardCell) {
             LNBApplyCardBackground(v);
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
@@ -1400,6 +1433,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.10 loaded — 左滑按钮三连修（折叠区还原/扫描加深/跟随防闪）", kBGDirectory);
+    LNBTLog(@"v2.2.11 loaded — 独立通知铺装 + 按钮继承整屏素材（挖洞模式同源）", kBGDirectory);
 }
 %end

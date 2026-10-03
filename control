@@ -1,6 +1,6 @@
 Package: com.hchdjej.locknotifybg
 Name: 坏叔叔 (LockNotifyBG)
-Version: 2.2.10
+Version: 2.2.11
 Architecture: iphoneos-arm64
 Description: 锁屏通知双层视频背景 —— 卡片动画层(card.mp4)+全屏背景图层(global.mp4)，多卡同步播放，零配置。适配 iOS 16.5 无根越狱（Dopamine / palera1n rootless）。
 Maintainer: hchdjej
