@@ -68,6 +68,16 @@
 //       旧模式 —— 参考视频卡片根本没有独立视频层。
 //    全屏层也改走共享播放器（进程内唯一解码器，卡片暗化板零解码）。
 //
+//  v2.2.6 垫底失效修复 + 折叠回归原生（v2.2.5 实测 M9 复盘）：
+//    ① M9 实锤：卡片素材盖死全部文字（时间区放大零文字痕迹），而
+//       insertSubview:index 在图片消息类 cell 上失效。改用双保险：
+//       内容锚点容器（含 UILabel/UIImageView 的直接子视图）全部
+//       bringSubviewToFront + bg.layer.zPosition=-100（CALayer 硬规则，
+//       兄弟间永远最底，不依赖 subview 顺序）。
+//    ② M9 顶部多出圆形素材按钮 = 折叠开关被 v2.2.5 继承链铺了素材
+//      （"折叠跳过"注释有但代码没实现）——回归 v1.4.5：无归属按钮
+//       还原原生不铺素材。
+//
 //  v2.2.5 按钮继承卡片素材（用户点题：要的就是朋友视频里
 //    「消息通知/选项/删除」三个模块的模式 —— M8 逐帧实证）：
 //    ① 消息通知卡：素材铺满+文字浮上（v2.2.3 已达成 ✓）
@@ -630,14 +640,13 @@ static UIView *LNBFindSlideContainer(UIView *cell) {
     return best;
 }
 
-// 【v2.2.3】素材必须垫在内容之下（朋友视频 M5 实证：文字/头像浮在素材上）。
-// 在 slide 子树里收集所有含 UILabel/UIImageView 的视图，沿 superview
-// 爬到 slide 的直接子视图层，取其中最靠前的 index —— bg 插到这个
-// index，标题/正文/时间/头像必然浮在素材之上。找不到内容 → 0 兜底。
-static NSInteger LNBContentInsertIndex(UIView *slide) {
+// 【v2.2.6】内容锚点容器收集：返回 slide 中包含 UILabel/UIImageView 的
+// "直接子视图"集合（去重）。M9 实测：insertSubview:index 方案在图片消息
+// 类 cell 上失效（素材盖死文字）—— 不再依赖 index，改用强制置顶+zPosition。
+static NSMutableSet *LNBCollectContentAnchors(UIView *slide) {
+    NSMutableSet *anchors = [NSMutableSet set];
     NSMutableArray *stack = [NSMutableArray arrayWithObject:slide];
-    NSInteger steps = 0, best = 0;
-    BOOL has = NO;
+    NSInteger steps = 0;
     while (stack.count > 0 && steps < 768) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
@@ -646,14 +655,11 @@ static NSInteger LNBContentInsertIndex(UIView *slide) {
             ([v isKindOfClass:[UILabel class]] || [v isKindOfClass:[UIImageView class]])) {
             UIView *p = v;
             while (p.superview && p.superview != slide) p = p.superview;
-            if (p.superview == slide) {
-                NSInteger i = (NSInteger)[slide.subviews indexOfObject:p];
-                if (i != NSNotFound && (!has || i < best)) { best = i; has = YES; }
-            }
+            if (p.superview == slide) [anchors addObject:p];
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
     }
-    return has ? best : 0;
+    return anchors;
 }
 
 // 给一条通知卡片挂背景。
@@ -714,17 +720,16 @@ static void LNBApplyCardBackground(UIView *cell) {
         bg = [[LNBBGView alloc] initWithFrame:target];
         bg.tag = kCardBGViewTag;
     }
-    // 【v2.2.3】插入点 = 内容锚点之下：素材垫底，文字/头像浮在素材上
-    //（v2.2.2 固定 atIndex:0 在真机上被实测打脸 —— 内容不在 contentView
-    // 常规子链上层，紫色素材直接盖死了标题/正文/头像，M4 视频实证）。
-    NSInteger wantIdx = LNBContentInsertIndex(slide);
+    // 【v2.2.6】垫底双保险（index 方案在 M9 图片消息 cell 上被实测打脸）：
+    // ① 含文字/图片的容器全部置顶 —— 内容无论藏在哪个容器必然浮出；
+    // ② bg zPosition=-100 —— CALayer 硬规则，兄弟之间永远画在最底。
+    NSMutableSet *anchors = LNBCollectContentAnchors(slide);
+    for (UIView *p in anchors) [slide bringSubviewToFront:p];
     if (bg.superview != slide) {
         [bg removeFromSuperview];
-        [slide insertSubview:bg atIndex:wantIdx];
-    } else if ((NSInteger)[slide.subviews indexOfObject:bg] > wantIdx) {
-        // 已挂载但层级漂移（内容容器重建后 bg 被顶到内容之上）→ 重新垫底
-        [slide insertSubview:bg atIndex:wantIdx];
+        [slide insertSubview:bg atIndex:0];
     }
+    bg.layer.zPosition = -100.0;
     objc_setAssociatedObject(bg, kLNBTargetFrameKey, [NSValue valueWithCGRect:target],
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
@@ -855,6 +860,14 @@ static void LNBApplyButtonBackground(UIView *btn) {
     BOOL hasClear  = ([label containsString:@"清除"] || [lower containsString:@"clear"]);
     BOOL isClear   = hasClear && !hasOption;   // 「清除」用 supp2.*
 
+    // 【v2.2.6】无归属按钮（折叠开关 ^ 等）：还原原生，不铺素材 ——
+    // 朋友视频顶部按钮就是原生灰胶囊；v2.2.5 继承链让折叠开关也铺上了
+    // 卡片素材（用户实测顶部多出圆形素材按钮），这里回归 v1.4.5 定论。
+    if (!hasOption && !hasClear) {
+        LNBSetButtonSeeThrough(btn, NO);
+        return;
+    }
+
     // 素材回退链：清除 supp2.* → supp.*；选项 supp.* → supp2.*（反向兜底）
     NSString *vidName = isClear ? kSupp2Video : kSuppVideo;
     NSString *imgName = isClear ? kSupp2Image : kSuppImage;
@@ -889,6 +902,7 @@ static void LNBApplyButtonBackground(UIView *btn) {
     }
     [bg removeFromSuperview];
     [btn insertSubview:bg atIndex:0];
+    bg.layer.zPosition = -100.0;   // 【v2.2.6】按钮素材强制垫底保险
 
     CGFloat cr = btn.layer.cornerRadius;
     if (cr <= 0.5) {
@@ -1197,6 +1211,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.5 loaded — 素材目录 %@；三模块统一（卡片/选项/清除，按钮继承卡片素材）", kBGDirectory);
+    LNBTLog(@"v2.2.6 loaded — 素材目录 %@；垫底双保险（置顶+zPosition）+ 折叠回归原生", kBGDirectory);
 }
 %end
