@@ -127,6 +127,12 @@
 //       v2.2.11 放宽误铺了素材 —— 卡片扫描加宽度过滤（>200pt 才铺），
 //       已误铺的自动清掉恢复原生（"和小窗口不同步"的来源）。
 //
+//  v2.2.13 折叠区/X 图标彻底排除（用户明确：不美化、不加背景、一直原生）：
+//    候选判定最前面加硬性排除 —— 这次是「从不进入美化流程」而非
+//    「进去再还原」：① 类名含 close/dismiss/expandedplatter/clearall
+//    的按钮排除；② 祖先链里没有任何通知 cell 的按钮（折叠区 header 区）
+//    一律排除。左滑选项/清除必然在 cell 内，不受影响。
+//
 //  v2.2.7 挂载架构终极重构（v2.2.6 实测 M11 复盘）：
 //    M11 实锤：zPosition+置顶双保险仍救不回文字 —— 文字容器根本不在
 //    contentView 子树里（图片消息类 cell 的层级与文字消息不同），
@@ -958,6 +964,18 @@ static BOOL LNBInSlideCell(UIView *v) {
     return NO;
 }
 
+// 【v2.2.13】宽口径 cell 判定：堆叠外的独立通知 cell 类名不是
+// NCNotificationListCell（v2.2.11 实锤），放宽为 NCNotification*Cell。
+// 折叠区按钮的祖先链里没有 cell —— 用它把折叠区/X 图标挡在美化流程外。
+static BOOL LNBInSlideCellWide(UIView *v) {
+    for (UIView *p = v.superview; p; p = p.superview) {
+        NSString *c = NSStringFromClass(p.class);
+        if ([c isEqualToString:@"NCNotificationListCell"]) return YES;
+        if ([c hasPrefix:@"NCNotification"] && [c containsString:@"Cell"]) return YES;
+    }
+    return NO;
+}
+
 static BOOL LNBIsCandidateActionButton(UIView *v) {
     if (!v) return NO;
     CGSize sz = v.bounds.size;
@@ -966,6 +984,30 @@ static BOOL LNBIsCandidateActionButton(UIView *v) {
     if (sz.width > 260.0 || sz.height > 120.0) return NO;
 
     NSString *cls = NSStringFromClass(v.class);
+
+    // 【v2.2.13】折叠区 / X 图标硬性排除（用户明确要求：不美化、不加背景、
+    // 一直保持原生）。
+    //   · 折叠区（cell 外的 header 区：展开/收起按钮、堆叠预览小卡、右上角
+    //     X 关闭钮）→ 一律不碰，保持原样；
+    //   · X 图标（关闭按钮，类名含 Close/Dismiss 或叫 PLExpandedPlatterCloseButton
+    //     之类）→ 一律不碰。
+    // 注意：这是"从不进入美化流程"，比"进去再还原原生"更干净 ——
+    // 还原路径在快照丢失时可能留残余，直接排除则零干预。
+    {
+        NSString *lcls = cls.lowercaseString;
+        if ([lcls containsString:@"close"] || [lcls containsString:@"dismiss"] ||
+            [lcls containsString:@"expandedplatter"] || [lcls containsString:@"clearall"] ||
+            [lcls containsString:@"dismissall"]) {
+            return NO;
+        }
+        // 折叠区：不在任何通知 cell 内的按钮一律排除。
+        // （左滑选项/清除必然在 NCNotificationListCell 内；
+        //   折叠区按钮在 cell 外的 header 容器里 —— 用宽口径判定，
+        //   含 cell 的就放行，避免 v2.2.11 那种"独立通知 cell 类名不同"
+        //   导致漏铺的坑。）
+        if (!LNBInSlideCellWide(v)) return NO;
+    }
+
     if ([cls isEqualToString:@"NCToggleControl"]) return YES;
     if ([cls isEqualToString:@"PLPlatterActionButton"]) return YES;
 
@@ -1475,6 +1517,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.12 loaded — 宽清除胶囊铺装（几何兜底）+ 预览小卡还原原生", kBGDirectory);
+    LNBTLog(@"v2.2.13 loaded — 折叠区/X 图标彻底排除（从不进入美化流程）", kBGDirectory);
 }
 %end
