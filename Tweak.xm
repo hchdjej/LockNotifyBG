@@ -68,6 +68,21 @@
 //       旧模式 —— 参考视频卡片根本没有独立视频层。
 //    全屏层也改走共享播放器（进程内唯一解码器，卡片暗化板零解码）。
 //
+//  v2.2.2 回归朋友效果的本源（v2.2.1 实测复盘）：
+//    用户实测暴露两个问题：① 整屏层挂载仍不稳（紫色素材只铺了通知区域，
+//    时钟/下半屏还是壁纸）；② card 素材被兜底拿去铺"半截屏幕"→ 视觉全乱。
+//    想通的本质：朋友视频里的整屏画面 = 朋友自己的【视频壁纸】
+//   （用户最早就澄清过"整个屏幕那是人家壁纸"，用户手机也装了视频壁纸 App）。
+//    朋友插件要做的从来不是自己画整屏层，而是【把卡片挖成透明洞】——
+//    壁纸在所有锁屏内容之下，卡片透明 = 透出壁纸对应区域，天然连续、
+//    天然跟随、天然多卡对齐，零挂载风险。
+//    本版结构：
+//    ① 卡片挖洞不再依赖整屏层：只要"挖洞透出整屏"开着，卡片就是
+//       一块 16% 暗化板，透出底下的一切（视频壁纸 / 静态壁纸 / 整屏层）；
+//    ② global.* 与 card.* 职责彻底分离：整屏层只认 global.*（可选增强，
+//       给没装视频壁纸 App 的场景），card.* 只做卡片独立素材；
+//    ③ 按钮透出化不变（透出壁纸）。
+//
 //  v2.1.0 架构修正（关键认知更新）：
 //    用户澄清：参考视频里"整个屏幕的画面是朋友的视频壁纸"。
 //    定量分析实锤：朋友卡片内亮度 = 卡片外 × 0.84、卡片边界上下
@@ -197,18 +212,15 @@ static BOOL LNBFileExists(NSString *path) {
     return [[NSFileManager defaultManager] fileExistsAtPath:path];
 }
 
-// 【v2.1.2】解析全屏素材：global 优先，card 兜底 —— 只装一个素材也能全屏。
+// 【v2.2.2】解析整屏素材：只认 global.*。
+// card.* 是卡片独立素材，不再兜底铺全屏（v2.2.1 实测：卡片素材铺半截
+// 屏幕导致整屏混乱）。用户要整屏视频：装视频壁纸 App（朋友的方式），
+// 或放一个 global.mp4（插件可选增强）。
 static void LNBResolveFullMedia(NSString **outVid, NSString **outImg) {
-    BOOL gv = LNBFileExists(LNBPathForResource(kGlobalVideo));
-    BOOL gi = LNBFileExists(LNBPathForResource(kGlobalImage));
-    BOOL cv = LNBFileExists(LNBPathForResource(kCardVideo));
-    BOOL ci = LNBFileExists(LNBPathForResource(kCardImage));
     *outVid = nil;
     *outImg = nil;
-    if      (gv) *outVid = kGlobalVideo;
-    else if (cv) *outVid = kCardVideo;
-    else if (gi) *outImg = kGlobalImage;
-    else if (ci) *outImg = kCardImage;
+    if (LNBFileExists(LNBPathForResource(kGlobalVideo))) *outVid = kGlobalVideo;
+    else if (LNBFileExists(LNBPathForResource(kGlobalImage))) *outImg = kGlobalImage;
 }
 
 #pragma mark - 毛玻璃白底隐藏
@@ -591,21 +603,19 @@ static void LNBApplyCardBackground(UIView *cell) {
     BOOL hasCardVideo = LNBFileExists(LNBPathForResource(kCardVideo));
     BOOL hasCardImage = LNBFileExists(LNBPathForResource(kCardImage));
 
-    NSString *fullVid = nil, *fullImg = nil;
-    LNBResolveFullMedia(&fullVid, &fullImg);
-    BOOL hasFull = (fullVid || fullImg);
+    // 【v2.2.2】挖洞不再依赖整屏层：挖洞 = 藏白底 + 16% 暗化板，
+    // 透出底下的一切（视频壁纸/静态壁纸/整屏层）—— 壁纸在所有卡片之下，
+    // 天然连续、天然跟随，零挂载风险（朋友效果的本源）。
     BOOL hasCard = (hasCardVideo || hasCardImage);
-
-    if (!prefs.enabled || (!hasFull && !hasCard)) {
-        // 关闭 / 无素材：还原并退出（原生样式）
+    if (!prefs.enabled) {
         LNBSetCardMaterialsHidden(cell, NO);
         UIView *old = [cell viewWithTag:kCardBGViewTag];
         if (old) [old removeFromSuperview];
         return;
     }
 
-    BOOL transparent = prefs.cardTransparent && hasFull;   // 挖洞需要整屏层存在
-    BOOL standalone  = !transparent && hasCard;
+    BOOL transparent = prefs.cardTransparent;              // 挖洞（默认）
+    BOOL standalone  = !prefs.cardTransparent && hasCard;  // 独立素材
     if (!transparent && !standalone) {
         LNBSetCardMaterialsHidden(cell, NO);
         UIView *old = [cell viewWithTag:kCardBGViewTag];
@@ -1101,6 +1111,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.0 loaded — 素材目录 %@；整屏/卡片/选项/清除独立素材（图片或视频），无素材按钮自动透出整屏", kBGDirectory);
+    LNBTLog(@"v2.2.2 loaded — 素材目录 %@；卡片挖洞透壁纸（朋友效果本源），global 仅作可选整屏层", kBGDirectory);
 }
 %end

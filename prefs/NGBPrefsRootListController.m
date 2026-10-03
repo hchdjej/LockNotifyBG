@@ -378,8 +378,8 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 
         // ---- 1. 整屏背景（对齐参考视频的全屏连续画面）----
         [specs addObject:LNBGroup(@"整屏背景（对齐参考视频）",
-                                  @"铺满整个锁屏的连续视频/图片层 —— 通知卡片、选项、清除按钮透出的就是它。"
-                                  @"\n没选整屏素材时自动用卡片素材兜底。")];
+                                  @"可选增强：铺满整个锁屏的视频/图片层（没装视频壁纸 App 时用）。"
+                                  @"\n用视频壁纸 App 的话这层可以不开 —— 卡片挖洞直接透出壁纸。")];
         [specs addObject:LNBSwitch(self, @"整屏背景开关", @"globalEnabled")];
         [specs addObject:LNBButton(self, @"选择整屏图片", @selector(lnbPickGlobalImage:), @"pickGlobalImage")];
         [specs addObject:LNBButton(self, @"选择整屏视频", @selector(lnbPickGlobalVideo:), @"pickGlobalVideo")];
@@ -387,7 +387,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         // ---- 2. 通知卡片背景 ----
         [specs addObject:LNBGroup(@"通知卡片背景",
                                   @"「挖洞透出整屏」= 参考视频效果：卡片只是一块半透明暗化板，"
-                                  @"透过它看到整屏视频在卡片位置的那一块画面，卡片内外连续。"
+                                  @"透过它看到壁纸（搭配视频壁纸 App 就是朋友的效果，天然连续跟随）。"
                                   @"\n关闭挖洞后卡片铺自己的独立素材（每张卡片显示完整画面）。")];
         [specs addObject:LNBSwitch(self, @"挖洞透出整屏", @"cardTransparent")];
         [specs addObject:LNBSlider(self, @"卡片暗化强度", @"dimAlpha", 0.0, 0.5)];
