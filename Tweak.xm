@@ -68,6 +68,15 @@
 //       旧模式 —— 参考视频卡片根本没有独立视频层。
 //    全屏层也改走共享播放器（进程内唯一解码器，卡片暗化板零解码）。
 //
+//  v2.2.5 按钮继承卡片素材（用户点题：要的就是朋友视频里
+//    「消息通知/选项/删除」三个模块的模式 —— M8 逐帧实证）：
+//    ① 消息通知卡：素材铺满+文字浮上（v2.2.3 已达成 ✓）
+//    ② 左滑「选项/清除」按钮：各自铺素材，文字（红色"清除"）浮上；
+//       朋友"清除"按钮铺的正是和卡片同款的橙色鸭子素材！
+//    修法：按钮素材回退链末端从"透出化"改为"继承卡片素材"——
+//    用户只选一个卡片素材 = 卡片+选项+清除全套统一，开箱即朋友效果；
+//    面板里仍可给按钮单独选素材（supp/supp2 优先）。
+//
 //  v2.2.4 素材暗化（v2.2.3 实测 M6 vs M7 复盘）：
 //    垫底生效：文字/头像已浮在素材上 ✓（与朋友结构对齐）。
 //    剩余感知差距：用户的亮素材（人脸/写字视频）白字压上去几乎看不清，
@@ -854,6 +863,14 @@ static void LNBApplyButtonBackground(UIView *btn) {
         vidName = isClear ? kSuppVideo : kSupp2Video;
         imgName = isClear ? kSuppImage : kSupp2Image;
     }
+    // 【v2.2.5】按钮没专设素材 → 直接继承卡片素材：
+    // 只选一个卡片素材，卡片+选项+清除全套统一（朋友视频里"清除"
+    // 按钮铺的正是和卡片同款的橙色鸭子素材，红字"清除"浮在上面）。
+    if (!LNBFileExists(LNBPathForResource(vidName)) &&
+        !LNBFileExists(LNBPathForResource(imgName))) {
+        vidName = kCardVideo;
+        imgName = kCardImage;
+    }
     BOOL hasMedia = LNBFileExists(LNBPathForResource(vidName)) ||
                     LNBFileExists(LNBPathForResource(imgName));
 
@@ -1180,6 +1197,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.4 loaded — 素材目录 %@；素材垫底+素材暗化（cardDim），挖洞透壁纸", kBGDirectory);
+    LNBTLog(@"v2.2.5 loaded — 素材目录 %@；三模块统一（卡片/选项/清除，按钮继承卡片素材）", kBGDirectory);
 }
 %end

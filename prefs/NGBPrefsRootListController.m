@@ -400,8 +400,9 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
 
         // ---- 3. 选项 / 清除按钮 ----
         [specs addObject:LNBGroup(@"选项 / 清除按钮背景",
-                                  @"没选素材时按钮自动透出整屏背景（参考视频效果，按钮文字浮在画面上）；"
-                                  @"选了素材则按钮铺自己的圆角图/视频，跟着自己的框走。")];
+                                  @"没选素材时自动继承卡片素材（参考视频效果：清除按钮铺的"
+                                  @"就是和卡片同款的素材，文字浮在上面）；"
+                                  @"单独选了素材则优先用按钮自己的。")];
         [specs addObject:LNBSwitch(self, @"按钮背景开关", @"suppModuleEnabled")];
         [specs addObject:LNBButton(self, @"选择「选项」按钮图片", @selector(lnbPickSuppImage:), @"pickSuppImage")];
         [specs addObject:LNBButton(self, @"选择「选项」按钮视频", @selector(lnbPickSuppVideo:), @"pickSuppVideo")];
