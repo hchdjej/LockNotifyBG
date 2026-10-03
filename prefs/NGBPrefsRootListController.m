@@ -310,6 +310,7 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
                                @"globalEnabled":     @YES,
                                @"cardTransparent":   @YES,
                                @"dimAlpha":          @0.16,
+                               @"cardDim":           @0.20,
                                @"suppModuleEnabled": @YES,
                                @"suppAlpha":         @1.0,
                                @"videoMuted":        @YES,
@@ -388,9 +389,12 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
         [specs addObject:LNBGroup(@"通知卡片背景",
                                   @"「挖洞透出整屏」= 参考视频效果：卡片只是一块半透明暗化板，"
                                   @"透过它看到壁纸（搭配视频壁纸 App 就是朋友的效果，天然连续跟随）。"
-                                  @"\n关闭挖洞后卡片铺自己的独立素材（每张卡片显示完整画面）。")];
+                                  @"\n关闭挖洞后卡片铺自己的独立素材（每张卡片显示完整画面）。"
+                                  @"\n「素材暗化」给亮素材压一层黑色（默认 20%），文字浮得出来；"
+                                  @"素材本身偏暗可调回 0。")];
         [specs addObject:LNBSwitch(self, @"挖洞透出整屏", @"cardTransparent")];
         [specs addObject:LNBSlider(self, @"卡片暗化强度", @"dimAlpha", 0.0, 0.5)];
+        [specs addObject:LNBSlider(self, @"素材暗化（文字更清楚）", @"cardDim", 0.0, 0.6)];
         [specs addObject:LNBButton(self, @"选择卡片图片", @selector(lnbPickCardImage:), @"pickCardImage")];
         [specs addObject:LNBButton(self, @"选择卡片视频", @selector(lnbPickCardVideo:), @"pickCardVideo")];
 

@@ -68,6 +68,14 @@
 //       旧模式 —— 参考视频卡片根本没有独立视频层。
 //    全屏层也改走共享播放器（进程内唯一解码器，卡片暗化板零解码）。
 //
+//  v2.2.4 素材暗化（v2.2.3 实测 M6 vs M7 复盘）：
+//    垫底生效：文字/头像已浮在素材上 ✓（与朋友结构对齐）。
+//    剩余感知差距：用户的亮素材（人脸/写字视频）白字压上去几乎看不清，
+//    朋友的素材本身均匀偏暗（暗橙鸭子），文字才天然清楚。
+//    修法：LNBBGView 加 dimOverlay（黑色覆盖层，素材之上内容之下），
+//    面板新增"素材暗化"滑块 cardDim（0~0.6，默认 0.20）——
+//    亮素材调到 30~40% 即可达到朋友素材的文字可读性。
+//
 //  v2.2.3 素材垫底修正（v2.2.2 实测 M4 vs M5 对比复盘）：
 //    挖洞/全屏已对齐朋友（红发壁纸全屏连续 ✓），但独立素材模式下
 //    紫色素材把卡片标题/正文/头像全部盖死（朋友视频 M5 里文字清晰
@@ -164,6 +172,7 @@ static const void *kLNBBtnSeeThrough = &kLNBBtnSeeThrough;
 @property (nonatomic, assign) BOOL globalEnabled;       // 整屏背景（默认 YES）
 @property (nonatomic, assign) BOOL cardTransparent;     // 卡片挖洞透整屏（默认 YES）
 @property (nonatomic, assign) CGFloat dimAlpha;         // 卡片暗化强度（默认 0.16）
+@property (nonatomic, assign) CGFloat cardDim;          // 卡片素材暗化（默认 0.20，v2.2.4）
 @property (nonatomic, assign) BOOL suppModuleEnabled;   // 按钮背景（默认 YES）
 @property (nonatomic, assign) CGFloat suppAlpha;        // 按钮素材不透明度（默认 1.0）
 @property (nonatomic, assign) BOOL videoMuted;          // 静音（默认 YES）
@@ -196,6 +205,7 @@ static const void *kLNBBtnSeeThrough = &kLNBBtnSeeThrough;
     self.globalEnabled     = saved[@"globalEnabled"]     ? [saved[@"globalEnabled"] boolValue]     : YES;
     self.cardTransparent   = saved[@"cardTransparent"]   ? [saved[@"cardTransparent"] boolValue]   : YES;
     self.dimAlpha          = saved[@"dimAlpha"]          ? [saved[@"dimAlpha"] doubleValue]        : 0.16;
+    self.cardDim           = saved[@"cardDim"]           ? [saved[@"cardDim"] doubleValue]         : 0.20;
     self.suppModuleEnabled = saved[@"suppModuleEnabled"] ? [saved[@"suppModuleEnabled"] boolValue] : YES;
     self.suppAlpha         = saved[@"suppAlpha"]         ? [saved[@"suppAlpha"] doubleValue]       : 1.0;
     self.videoMuted        = saved[@"videoMuted"]        ? [saved[@"videoMuted"] boolValue]        : YES;
@@ -380,6 +390,7 @@ static void LNBPoolDetach(NSString *path) {
 @interface LNBBGView : UIView
 @property (nonatomic, strong) UIImageView *imageView;
 @property (nonatomic, strong) AVPlayerLayer *playerLayer;
+@property (nonatomic, strong) CALayer *dimOverlay;      // 素材暗化层（v2.2.4）
 @property (nonatomic, copy) NSString *attachedPath;    // 池内关联的素材路径（v2.2.0）
 - (void)applyMediaWithVideo:(NSString *)vidName image:(NSString *)imgName;
 - (void)applyDimOnlyWithAlpha:(CGFloat)alpha;
@@ -400,6 +411,14 @@ static void LNBPoolDetach(NSString *path) {
         _imageView.clipsToBounds = YES;
         _imageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [self addSubview:_imageView];
+        // 【v2.2.4】素材暗化层：压在素材（playerLayer/imageView）之上、
+        // 卡片内容之下（bg 整体垫在内容下），黑素材变暗 → 白字浮出。
+        _dimOverlay = [CALayer layer];
+        _dimOverlay.backgroundColor = [UIColor blackColor].CGColor;
+        _dimOverlay.opacity = 0.0;
+        _dimOverlay.hidden = YES;
+        _dimOverlay.frame = self.bounds;
+        [self.layer addSublayer:_dimOverlay];
     }
     return self;
 }
@@ -410,13 +429,14 @@ static void LNBPoolDetach(NSString *path) {
 - (void)applyDimOnlyWithAlpha:(CGFloat)alpha {
     // 幂等早退：已是相同暗化状态就不再动（layout 每帧都会调）
     if (self.imageView.hidden && !self.playerLayer && !self.attachedPath &&
-        self.backgroundColor) {
+        self.backgroundColor && self.dimOverlay.hidden) {
         CGFloat r, g, b, a;
         if ([self.backgroundColor getRed:&r green:&g blue:&b alpha:&a] &&
             fabs(a - alpha) < 0.005) return;
     }
     [self teardownMedia];
     self.imageView.hidden = YES;
+    self.dimOverlay.hidden = YES;   // 挖洞模式用底色暗化，不用素材暗化层
     self.backgroundColor = [UIColor colorWithWhite:0.0 alpha:alpha];
     [self setNeedsLayout];
 }
@@ -433,6 +453,12 @@ static void LNBPoolDetach(NSString *path) {
         self.imageView.image = img;
         self.imageView.hidden = (img == nil);
     }
+    // 【v2.2.4】素材暗化：panel cardDim 滑块（0~0.6），默认 0.20。
+    // 亮素材压暗后白字自然浮出（朋友素材本身均匀偏暗，文字才清楚）。
+    CGFloat dim = [LNBPrefs sharedInstance].cardDim;
+    self.dimOverlay.opacity = dim;
+    self.dimOverlay.hidden = (dim <= 0.005);
+    self.dimOverlay.frame = self.bounds;
     [self setNeedsLayout];
 }
 
@@ -509,6 +535,7 @@ static UIView *LNBGlobalBackgroundHost(UIView *anchor, UIView **outAnchorView);
     }
     [super layoutSubviews];
     if (!CGRectEqualToRect(_imageView.frame, self.bounds)) _imageView.frame = self.bounds;
+    if (!CGRectEqualToRect(_dimOverlay.frame, self.bounds)) _dimOverlay.frame = self.bounds;   // v2.2.4
 
     if (self.playerLayer) {
         // 背景铺满自身 bounds（自身=滑动容器里的卡片层）。
@@ -1153,6 +1180,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.3 loaded — 素材目录 %@；素材垫底（文字/头像浮在素材上），挖洞透壁纸", kBGDirectory);
+    LNBTLog(@"v2.2.4 loaded — 素材目录 %@；素材垫底+素材暗化（cardDim），挖洞透壁纸", kBGDirectory);
 }
 %end
