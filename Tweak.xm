@@ -133,6 +133,16 @@
 //    的按钮排除；② 祖先链里没有任何通知 cell 的按钮（折叠区 header 区）
 //    一律排除。左滑选项/清除必然在 cell 内，不受影响。
 //
+//  v2.2.14 动作容器锁定 + 预览小卡还原（用户实测 M17）：
+//    ① 宽清除胶囊铺装："选项和清除添加了素材没反应" —— 宽清除胶囊的
+//       「清除」二字不是 UILabel（文字收集拿不到），被当无文字未知类
+//       还原原生。新增 LNBInActionContainer：左滑操作按钮全部挂在
+//       PLActionButtonsPresentingView 系容器里，容器子视图 = 铁按钮，
+//       无文字也铺（按清除归属取 supp2.* 链），优先级高于一切排除；
+//    ② 预览小卡还原：折叠区堆叠预览小卡（宽度 <200pt 的
+//       NCNotification*Cell）内的按钮一律排除 —— M17 实锤预览小卡被
+//       误铺 supp 素材（橙色），用户点名"叠加上面的清除不要加效果"。
+//
 //  v2.2.7 挂载架构终极重构（v2.2.6 实测 M11 复盘）：
 //    M11 实锤：zPosition+置顶双保险仍救不回文字 —— 文字容器根本不在
 //    contentView 子树里（图片消息类 cell 的层级与文字消息不同），
@@ -976,6 +986,20 @@ static BOOL LNBInSlideCellWide(UIView *v) {
     return NO;
 }
 
+// 【v2.2.14】动作按钮容器判定：左滑的操作按钮（方形选项/清除、宽清除
+// 胶囊）全部挂在 PLActionButtonsPresentingView 系容器里（v1.4.x 实证该
+// 容器本身不能铺，但其直接子视图一定是操作按钮）—— 比类名/文字判定
+// 可靠（宽清除胶囊的「清除」二字不是 UILabel，文字收集拿不到，M17 实锤
+// "添加了素材没反应"的根因）。向上爬到通知 cell/section 即止。
+static BOOL LNBInActionContainer(UIView *v) {
+    for (UIView *p = v.superview; p; p = p.superview) {
+        NSString *c = NSStringFromClass(p.class);
+        if ([c containsString:@"ActionButtonsPresenting"]) return YES;
+        if ([c hasPrefix:@"NCNotification"]) return NO;
+    }
+    return NO;
+}
+
 static BOOL LNBIsCandidateActionButton(UIView *v) {
     if (!v) return NO;
     CGSize sz = v.bounds.size;
@@ -985,12 +1009,15 @@ static BOOL LNBIsCandidateActionButton(UIView *v) {
 
     NSString *cls = NSStringFromClass(v.class);
 
+    // 【v2.2.14】动作按钮容器的直接子视图 = 左滑操作按钮（铁证），最优先
+    // 放行 —— 宽清除胶囊文字收集不到、类名未知，只有靠容器锁定（M17）。
+    if (LNBInActionContainer(v)) return YES;
+
     // 【v2.2.13】折叠区 / X 图标硬性排除（用户明确要求：不美化、不加背景、
     // 一直保持原生）。
     //   · 折叠区（cell 外的 header 区：展开/收起按钮、堆叠预览小卡、右上角
     //     X 关闭钮）→ 一律不碰，保持原样；
-    //   · X 图标（关闭按钮，类名含 Close/Dismiss 或叫 PLExpandedPlatterCloseButton
-    //     之类）→ 一律不碰。
+    //   · X 图标（关闭按钮，类名含 Close/Dismiss）→ 一律不碰。
     // 注意：这是"从不进入美化流程"，比"进去再还原原生"更干净 ——
     // 还原路径在快照丢失时可能留残余，直接排除则零干预。
     {
@@ -999,6 +1026,15 @@ static BOOL LNBIsCandidateActionButton(UIView *v) {
             [lcls containsString:@"expandedplatter"] || [lcls containsString:@"clearall"] ||
             [lcls containsString:@"dismissall"]) {
             return NO;
+        }
+        // 【v2.2.14】堆叠预览小卡（宽度 <200pt 的 NCNotification*Cell）内的
+        // 按钮 → 排除（M17 实锤预览小卡被误铺 supp 素材，用户点名不要）。
+        for (UIView *p = v.superview; p; p = p.superview) {
+            NSString *pc = NSStringFromClass(p.class);
+            if ([pc hasPrefix:@"NCNotification"] && [pc containsString:@"Cell"] &&
+                p.bounds.size.width < 200.0) {
+                return NO;
+            }
         }
         // 折叠区：不在任何通知 cell 内的按钮一律排除。
         // （左滑选项/清除必然在 NCNotificationListCell 内；
@@ -1098,17 +1134,20 @@ static void LNBApplyButtonBackground(UIView *btn) {
                       [label containsString:@"删除"]);   // v2.2.7：左滑按钮可能叫"删除"
     BOOL isClear   = hasClear && !hasOption;   // 「清除」用 supp2.*
 
-    // 【v2.2.12】无归属按钮分流（收紧把关）：
-    //   · 有「选项/清除/删除」文字 → 不进这里，一律走素材链（宽清除胶囊、
-    //     方形按钮全覆盖，M16 截图实锤宽胶囊也是清除按钮）；
-    //   · 无文字：NCToggleControl（折叠开关）还原原生；PLPlatterActionButton
-    //     且在 cell 内（纯图标左滑按钮）继续铺继承；其余未知类（含 v2.2.12
-    //     几何兜底放进来的普通视图）一律还原原生 —— 防误铺。
+    // 【v2.2.14】无归属按钮分流（再修）：
+    //   · 有「选项/清除/删除」文字 → 不进这里，一律走素材链；
+    //   · 动作按钮容器内的无文字按钮（PLActionButtonsPresentingView 子视图）
+    //     → 继续铺，按清除归属（M17 实锤宽清除胶囊文字收集不到）；
+    //   · PLPlatterActionButton 且在 cell 内（纯图标左滑按钮）→ 继续铺；
+    //   · NCToggleControl（折叠开关）→ 还原原生；
+    //   · 其余未知类无文字 → 还原原生（几何兜底放进来的普通视图，防误铺）。
     if (!hasOption && !hasClear) {
         NSString *bcls = NSStringFromClass(btn.class);
         BOOL isToggle  = [bcls isEqualToString:@"NCToggleControl"];
         BOOL isPlatter = [bcls isEqualToString:@"PLPlatterActionButton"];
-        if (isToggle || !isPlatter || !LNBInSlideCell(btn)) {
+        BOOL inAction  = LNBInActionContainer(btn);
+        if (inAction) isClear = YES;   // 无文字操作按钮按清除归属取 supp2.* 链
+        if (isToggle || (!inAction && (!isPlatter || !LNBInSlideCellWide(btn)))) {
             LNBSetButtonSeeThrough(btn, NO);
             UIView *staleBg = [btn viewWithTag:kActionBGViewTag];
             if (staleBg) { LNBBGView *sb = (LNBBGView *)staleBg; [sb stopSyncLink]; [staleBg removeFromSuperview]; }
@@ -1517,6 +1556,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.13 loaded — 折叠区/X 图标彻底排除（从不进入美化流程）", kBGDirectory);
+    LNBTLog(@"v2.2.14 loaded — 动作容器锁定按钮（宽清除铺装）+ 预览小卡彻底还原", kBGDirectory);
 }
 %end
