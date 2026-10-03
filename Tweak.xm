@@ -116,6 +116,17 @@
 //       对不上 —— M15 实测按钮浅色画面 vs 卡片深蓝画面的不协调根因）；
 //       独立素材模式维持继承 card.*。
 //
+//  v2.2.12 宽清除胶囊铺装 + 预览小卡还原（用户实测 M16 截图）：
+//    ① 宽清除胶囊：短滑形态的「清除」是宽胶囊（类名未知，不是
+//       PLPlatterActionButton），一直灰原生 —— 候选判定加几何兜底
+//       （祖先在通知体系 + 高 40~90 + 类名无容器词）；
+//    ② 把关收紧配套：无文字时只有已知按钮类才继续（PLPlatterActionButton
+//       且在 cell 内铺继承、NCToggleControl 还原），未知类无文字一律还原
+//       原生 —— 几何兜底放进来的普通内容视图不会被误铺；
+//    ③ 预览小卡还原：折叠区的堆叠预览小方块类名也含 NCNotification*Cell，
+//       v2.2.11 放宽误铺了素材 —— 卡片扫描加宽度过滤（>200pt 才铺），
+//       已误铺的自动清掉恢复原生（"和小窗口不同步"的来源）。
+//
 //  v2.2.7 挂载架构终极重构（v2.2.6 实测 M11 复盘）：
 //    M11 实锤：zPosition+置顶双保险仍救不回文字 —— 文字容器根本不在
 //    contentView 子树里（图片消息类 cell 的层级与文字消息不同），
@@ -970,10 +981,30 @@ static BOOL LNBIsCandidateActionButton(UIView *v) {
     if ([cls isEqualToString:@"UIImageView"])    return NO;
     if ([cls isEqualToString:@"UILabel"])        return NO;
 
-    // 其它自定义按钮兜底：类名含 Button 且祖先在通知体系内
-    if ([cls containsString:@"Button"]) {
+    // 其它自定义按钮兜底：类名含 Button/Platter/Action 且祖先在通知体系内
+    if ([cls containsString:@"Button"] || [cls containsString:@"Platter"] ||
+        [cls containsString:@"Action"]) {
         for (UIView *p = v.superview; p; p = p.superview) {
             if ([NSStringFromClass(p.class) containsString:@"NCNotification"]) return YES;
+        }
+    }
+    // 【v2.2.12】几何兜底：M16 实锤短滑形态的宽「清除」胶囊（类名未知，
+    // 不是 PLPlatterActionButton）一直是灰原生 —— 只要祖先在通知体系内、
+    // 尺寸是按钮量级（高 40~90）且类名无容器词就当候选；铺什么由
+    // LNBApplyButtonBackground 的文字分类把关（无文字+未知类 → 还原原生，
+    // 不会误伤普通内容视图）。
+    if (sz.height >= 40.0 && sz.height <= 90.0 && sz.width >= 40.0) {
+        BOOL containerWord = [cls containsString:@"Cell"] ||
+                             [cls containsString:@"Section"] ||
+                             [cls containsString:@"Header"] ||
+                             [cls containsString:@"Presenting"] ||
+                             [cls containsString:@"Stack"] ||
+                             [cls containsString:@"ContentView"] ||
+                             [cls containsString:@"Container"];
+        if (!containerWord) {
+            for (UIView *p = v.superview; p; p = p.superview) {
+                if ([NSStringFromClass(p.class) containsString:@"NCNotification"]) return YES;
+            }
         }
     }
     return NO;
@@ -1025,15 +1056,17 @@ static void LNBApplyButtonBackground(UIView *btn) {
                       [label containsString:@"删除"]);   // v2.2.7：左滑按钮可能叫"删除"
     BOOL isClear   = hasClear && !hasOption;   // 「清除」用 supp2.*
 
-    // 【v2.2.10】无归属按钮分流（M14 实测修正 v2.2.9）：
-    //   · NCToggleControl（折叠开关 ^）：还原原生 —— 朋友视频顶部就是灰胶囊；
-    //   · 无文字且不在通知 cell 内（顶部折叠展开钮、右上角堆叠钮 —— 也是
-    //     PLPlatterActionButton）：还原原生 —— v2.2.9"无文字一律铺"误伤了
-    //     它们，用户点名"折叠那里不需要替换背景"；
-    //   · 无文字但在 cell 内（左滑纯图标操作按钮）：继续走素材继承链。
+    // 【v2.2.12】无归属按钮分流（收紧把关）：
+    //   · 有「选项/清除/删除」文字 → 不进这里，一律走素材链（宽清除胶囊、
+    //     方形按钮全覆盖，M16 截图实锤宽胶囊也是清除按钮）；
+    //   · 无文字：NCToggleControl（折叠开关）还原原生；PLPlatterActionButton
+    //     且在 cell 内（纯图标左滑按钮）继续铺继承；其余未知类（含 v2.2.12
+    //     几何兜底放进来的普通视图）一律还原原生 —— 防误铺。
     if (!hasOption && !hasClear) {
-        BOOL toggle = [NSStringFromClass(btn.class) isEqualToString:@"NCToggleControl"];
-        if (toggle || !LNBInSlideCell(btn)) {
+        NSString *bcls = NSStringFromClass(btn.class);
+        BOOL isToggle  = [bcls isEqualToString:@"NCToggleControl"];
+        BOOL isPlatter = [bcls isEqualToString:@"PLPlatterActionButton"];
+        if (isToggle || !isPlatter || !LNBInSlideCell(btn)) {
             LNBSetButtonSeeThrough(btn, NO);
             UIView *staleBg = [btn viewWithTag:kActionBGViewTag];
             if (staleBg) { LNBBGView *sb = (LNBBGView *)staleBg; [sb stopSyncLink]; [staleBg removeFromSuperview]; }
@@ -1375,8 +1408,17 @@ static void LNBScanAndApplyCards(UIView *root) {
         NSString *cls = NSStringFromClass(v.class);
         BOOL isCardCell = [cls isEqualToString:@"NCNotificationListCell"] ||
                           ([cls hasPrefix:@"NCNotification"] && [cls containsString:@"Cell"]);
+        // 【v2.2.12】宽度过滤：折叠区的堆叠预览小方块（~60pt 宽）类名也含
+        // NCNotification*Cell，v2.2.11 放宽后误铺了素材（M16 截图实锤）——
+        // 完整通知 cell 宽度 ≥300pt，小方块直接跳过，恢复原生。
         if (isCardCell) {
-            LNBApplyCardBackground(v);
+            if (v.bounds.size.width > 200.0) {
+                LNBApplyCardBackground(v);
+            } else {
+                UIView *old = [v viewWithTag:kCardBGViewTag];
+                if (old) [old removeFromSuperview];
+                LNBSetCardMaterialsHidden(v, NO);
+            }
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
     }
@@ -1433,6 +1475,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.11 loaded — 独立通知铺装 + 按钮继承整屏素材（挖洞模式同源）", kBGDirectory);
+    LNBTLog(@"v2.2.12 loaded — 宽清除胶囊铺装（几何兜底）+ 预览小卡还原原生", kBGDirectory);
 }
 %end
