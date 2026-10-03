@@ -314,7 +314,9 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
                                @"suppModuleEnabled": @YES,
                                @"suppAlpha":         @1.0,
                                @"videoMuted":        @YES,
-                               @"videoVolume":       @0.6};
+                               @"videoVolume":       @0.6,
+                               @"cardAudioEnabled":  @NO,
+                               @"suppAudioEnabled":  @NO};
     for (NSString *key in defaults) {
         if ([d objectForKey:key] == nil) [d setObject:defaults[key] forKey:key];
     }
@@ -404,14 +406,20 @@ static PSSpecifier *LNBButton(id target, NSString *label, SEL sel, NSString *act
                                   @"就是和卡片同款的素材，文字浮在上面）；"
                                   @"单独选了素材则优先用按钮自己的。")];
         [specs addObject:LNBSwitch(self, @"按钮背景开关", @"suppModuleEnabled")];
+        [specs addObject:LNBSwitch(self, @"按钮素材声音", @"suppAudioEnabled")];
         [specs addObject:LNBButton(self, @"选择「选项」按钮图片", @selector(lnbPickSuppImage:), @"pickSuppImage")];
         [specs addObject:LNBButton(self, @"选择「选项」按钮视频", @selector(lnbPickSuppVideo:), @"pickSuppVideo")];
         [specs addObject:LNBButton(self, @"选择「清除」按钮图片", @selector(lnbPickSupp2Image:), @"pickSupp2Image")];
         [specs addObject:LNBButton(self, @"选择「清除」按钮视频", @selector(lnbPickSupp2Video:), @"pickSupp2Video")];
 
         // ---- 4. 声音 ----
-        [specs addObject:LNBGroup(@"声音", @"背景视频默认静音；打开后按下方音量播放。")];
-        [specs addObject:LNBSwitch(self, @"静音", @"videoMuted")];
+        [specs addObject:LNBGroup(@"声音",
+                                  @"素材视频与音乐混音播放（互不打断、音乐不暂停）。"
+                                  @"\n「卡片素材声音」/「按钮素材声音」：打开后素材原声按下方音量播放，"
+                                  @"默认关闭；「整屏素材静音」管整屏背景层。")];
+        [specs addObject:LNBSwitch(self, @"卡片素材声音", @"cardAudioEnabled")];
+        [specs addObject:LNBSwitch(self, @"按钮素材声音", @"suppAudioEnabled")];
+        [specs addObject:LNBSwitch(self, @"整屏素材静音", @"videoMuted")];
         [specs addObject:LNBSlider(self, @"音量", @"videoVolume", 0.0, 1.0)];
 
         // ---- 5. 其它 ----

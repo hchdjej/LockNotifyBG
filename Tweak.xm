@@ -68,6 +68,18 @@
 //       旧模式 —— 参考视频卡片根本没有独立视频层。
 //    全屏层也改走共享播放器（进程内唯一解码器，卡片暗化板零解码）。
 //
+//  v2.2.8 音频治理（用户实测：素材有声+音乐暂停/视频卡死；关开关删素材
+//    后声音还在放）：
+//    ① 播放器池初始化即设 AVAudioSession ambient+mixWithOthers ——
+//       素材视频与音乐混音共存，互不打断（打断=音乐暂停的根因）；
+//    ② 声音开关细分：卡片素材声音（默认关）/ 按钮素材声音（默认关）/
+//       整屏素材静音（videoMuted，沿用），LNBBGView.audioProfile 区分
+//       三种用途，apply 与 reload（本地通知）时按 profile 重设 muted；
+//    ③ 池治理挂进 reload：总开关关闭 → LNBPoolShutdown 全停播销毁；
+//       素材文件被删除 → LNBPoolPruneMissing 销毁对应播放器
+//      （AVPlayerItem 握着文件句柄会继续播——"删了还在响"的根因）；
+//    ④ LNBBGView dealloc 移除通知监听，杜绝泄漏。
+//
 //  v2.2.7 挂载架构终极重构（v2.2.6 实测 M11 复盘）：
 //    M11 实锤：zPosition+置顶双保险仍救不回文字 —— 文字容器根本不在
 //    contentView 子树里（图片消息类 cell 的层级与文字消息不同），
@@ -198,6 +210,8 @@ static const void *kLNBBtnSeeThrough = &kLNBBtnSeeThrough;
 
 // 面板把设置镜像落盘到 prefs.plist（跨进程最稳通道，v1.x 实证），
 // 改动时面板发 Darwin 通知，这里监听后重读 —— 所有修改即时生效。
+static void LNBPoolShutdown(void);        // 【v2.2.8】前向声明：全池停播销毁
+static void LNBPoolPruneMissing(void);    // 【v2.2.8】前向声明：销毁素材已删除的播放器
 @interface LNBPrefs : NSObject
 @property (nonatomic, assign) BOOL enabled;             // 总开关（默认 YES）
 @property (nonatomic, assign) BOOL globalEnabled;       // 整屏背景（默认 YES）
@@ -208,6 +222,8 @@ static const void *kLNBBtnSeeThrough = &kLNBBtnSeeThrough;
 @property (nonatomic, assign) CGFloat suppAlpha;        // 按钮素材不透明度（默认 1.0）
 @property (nonatomic, assign) BOOL videoMuted;          // 静音（默认 YES）
 @property (nonatomic, assign) double videoVolume;       // 音量（默认 0.6）
+@property (nonatomic, assign) BOOL cardAudioEnabled;    // 卡片素材声音（默认 NO，v2.2.8）
+@property (nonatomic, assign) BOOL suppAudioEnabled;    // 按钮素材声音（默认 NO，v2.2.8）
 + (instancetype)sharedInstance;
 - (void)reload;
 @end
@@ -241,6 +257,18 @@ static const void *kLNBBtnSeeThrough = &kLNBBtnSeeThrough;
     self.suppAlpha         = saved[@"suppAlpha"]         ? [saved[@"suppAlpha"] doubleValue]       : 1.0;
     self.videoMuted        = saved[@"videoMuted"]        ? [saved[@"videoMuted"] boolValue]        : YES;
     self.videoVolume       = saved[@"videoVolume"]       ? [saved[@"videoVolume"] doubleValue]     : 0.6;
+    self.cardAudioEnabled  = saved[@"cardAudioEnabled"]  ? [saved[@"cardAudioEnabled"] boolValue]  : NO;
+    self.suppAudioEnabled  = saved[@"suppAudioEnabled"]  ? [saved[@"suppAudioEnabled"] boolValue]  : NO;
+
+    // 【v2.2.8】池治理（面板改动 = reload = 立即生效，不再依赖锁屏 layout）：
+    //   · 插件总开关关闭 → 全池停播销毁（用户实测：关开关删素材后声音还在放）
+    //   · 素材文件被删除 → 销毁对应播放器（AVPlayerItem 握着句柄会继续播）
+    if (!self.enabled) {
+        LNBPoolShutdown();
+    } else {
+        LNBPoolPruneMissing();
+    }
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"LNBPrefsDidReload" object:nil];
 }
 
 @end
@@ -325,6 +353,8 @@ static NSMutableDictionary<NSString *, NSNumber *>     *lnbPoolSize   = nil;
 static NSMutableDictionary<NSString *, NSNumber *>     *lnbPoolMTime  = nil;
 static NSMutableDictionary<NSString *, id>             *lnbPoolEndObs = nil;
 
+static void LNBPoolDestroyEntry(NSString *path);   // 【v2.2.8】前向声明（Shutdown 用）
+
 static void LNBPoolInit(void) {
     if (!lnbPoolPlayer) {
         lnbPoolPlayer = [NSMutableDictionary dictionary];
@@ -332,6 +362,32 @@ static void LNBPoolInit(void) {
         lnbPoolSize   = [NSMutableDictionary dictionary];
         lnbPoolMTime  = [NSMutableDictionary dictionary];
         lnbPoolEndObs = [NSMutableDictionary dictionary];
+        // 【v2.2.8】混音模式：素材视频与音乐 App 共存——ambient + mixWithOthers
+        // 不打断正在播的歌、也不被歌打断（用户实测：放歌时音乐暂停/视频卡住不动）
+        @try {
+            AVAudioSession *s = [AVAudioSession sharedInstance];
+            [s setCategory:AVAudioSessionCategoryAmbient
+                      mode:AVAudioSessionModeDefault
+                   options:AVAudioSessionCategoryOptionMixWithOthers
+                     error:nil];
+            [s setActive:YES error:nil];
+        } @catch (NSException *e) { /* 环境不支持则忽略 */ }
+    }
+}
+
+// 【v2.2.8】全池停播销毁（插件总开关关闭时由 reload 触发）
+static void LNBPoolShutdown(void) {
+    if (!lnbPoolPlayer) return;
+    for (NSString *path in [lnbPoolPlayer allKeys]) {
+        LNBPoolDestroyEntry(path);
+    }
+}
+
+// 【v2.2.8】素材文件已被删除 → 销毁对应播放器（文件句柄还在播放）
+static void LNBPoolPruneMissing(void) {
+    if (!lnbPoolPlayer) return;
+    for (NSString *path in [lnbPoolPlayer allKeys].copy) {
+        if (!LNBFileExists(path)) LNBPoolDestroyEntry(path);
     }
 }
 
@@ -362,8 +418,9 @@ static void LNBPoolDestroyEntry(NSString *path) {
 
 static void LNBPoolApplyAudio(NSString *path, AVPlayer *p) {
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
-    p.muted  = prefs.videoMuted;
     p.volume = prefs.videoVolume;
+    // 【v2.2.8】muted 不在这里统一设——由各用途（卡片/按钮/整屏）的
+    // apply 按自己的声音开关设置（audioProfile），reload 时 bg 也会自刷
 }
 
 // 领播放器（同素材引用计数 +1；从空闲恢复时回片头）
@@ -375,6 +432,7 @@ static AVPlayer *LNBPoolAcquire(NSString *path) {
         AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
         p = [AVPlayer playerWithPlayerItem:item];
         p.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+        p.muted = YES;   // 【v2.2.8】默认静音，muted 由各用途的 apply 按开关设置
         NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
         lnbPoolSize[path]  = @([attrs fileSize]);
         lnbPoolMTime[path] = @([[attrs fileModificationDate] timeIntervalSince1970]);
@@ -423,6 +481,7 @@ static void LNBPoolDetach(NSString *path) {
 @property (nonatomic, strong) AVPlayerLayer *playerLayer;
 @property (nonatomic, strong) CALayer *dimOverlay;      // 素材暗化层（v2.2.4）
 @property (nonatomic, copy) NSString *attachedPath;    // 池内关联的素材路径（v2.2.0）
+@property (nonatomic, assign) NSInteger audioProfile;  // 0=卡片 1=按钮 2=整屏（v2.2.8）
 - (void)applyMediaWithVideo:(NSString *)vidName image:(NSString *)imgName;
 - (void)applyDimOnlyWithAlpha:(CGFloat)alpha;
 - (void)teardownMedia;
@@ -484,8 +543,32 @@ static void LNBPoolDetach(NSString *path) {
         _dimOverlay.hidden = YES;
         _dimOverlay.frame = self.bounds;
         [self.layer addSublayer:_dimOverlay];
+        // 【v2.2.8】偏好变化时按用途刷新静音状态（声音开关即时生效）
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(prefsDidReload)
+                                                     name:@"LNBPrefsDidReload"
+                                                   object:nil];
     }
     return self;
+}
+
+// 【v2.2.8】按 audioProfile 决定本 bg 的播放器是否静音
+- (void)updateMutedState {
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    AVPlayer *p = self.playerLayer.player;
+    if (!p) return;
+    BOOL mute;
+    switch (_audioProfile) {
+        case 1:  mute = !prefs.suppAudioEnabled; break;   // 按钮
+        case 2:  mute = prefs.videoMuted;        break;   // 整屏
+        default: mute = !prefs.cardAudioEnabled; break;   // 卡片
+    }
+    p.muted = mute;
+    p.volume = prefs.videoVolume;
+}
+
+- (void)prefsDidReload {
+    [self updateMutedState];
 }
 
 // 【v2.1.0 透明卡片模式】不放任何媒体，只做半透明暗化板。
@@ -524,6 +607,7 @@ static void LNBPoolDetach(NSString *path) {
     self.dimOverlay.opacity = dim;
     self.dimOverlay.hidden = (dim <= 0.005);
     self.dimOverlay.frame = self.bounds;
+    [self updateMutedState];   // 【v2.2.8】按用途刷新静音（卡片/按钮/整屏各自的开关）
     [self setNeedsLayout];
 }
 
@@ -607,6 +691,7 @@ static UIView *LNBFindSlideContainer(UIView *cell);       // 【v2.2.7】前向�
 - (void)dealloc {
     [_syncLink invalidate];
     _syncLink = nil;
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     if (_attachedPath) {
         LNBPoolDetach(_attachedPath);
         _attachedPath = nil;
@@ -916,6 +1001,7 @@ static void LNBApplyButtonBackground(UIView *btn) {
         bg = [[LNBBGView alloc] initWithFrame:btn.bounds];
         bg.tag = kActionBGViewTag;
     }
+    bg.audioProfile = 1;   // 【v2.2.8】按钮素材声音 = suppAudioEnabled 开关
     [bg removeFromSuperview];
     [btn insertSubview:bg atIndex:0];
     bg.layer.zPosition = -100.0;   // 【v2.2.6】按钮素材强制垫底保险
@@ -1138,6 +1224,7 @@ static void LNBEnsureListBackground(UIView *anchor) {
     if (!bg) {
         bg = [[LNBBGView alloc] initWithFrame:host.bounds];
         bg.tag = kGlobalBGViewTag;
+        bg.audioProfile = 2;   // 【v2.2.8】整屏素材声音 = videoMuted 开关
         bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         // 【v2.2.1】挂载诊断日志：下次实测 syslog 里直接看挂到哪了
         LNBTLog(@"整屏层挂载：host=%@ bounds=%@ 插入=%@",
@@ -1227,6 +1314,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.7 loaded — 素材目录 %@；挂 cell + zPosition-1000 + displayLink 跟随", kBGDirectory);
+    LNBTLog(@"v2.2.8 loaded — ambient 混音 + 声音开关细分 + reload 池治理", kBGDirectory);
 }
 %end
