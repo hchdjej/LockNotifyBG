@@ -154,6 +154,17 @@
 //       含 "NCNotification" 就放行 —— 已删除（宽清除胶囊由
 //       LNBInActionContainer 精确锁定，不再需要粗糙兜底）。
 //
+//  v2.2.16 安全模式 / 卡死根治（用户实测：装上仍卡死并进安全模式）：
+//    ① 头号根因：v2.2.10 给按钮 bg 也挂了 CADisplayLink，每帧一次回调；
+//       按钮数量多时每秒上千次回调，且回调里可能触发重函数 → 主线程雪崩
+//       + CADisplayLink 强引用 self 导致 bg 泄漏。改为按钮 bg 只用
+//       autoresizingMask 跟随（按钮 bounds 变化子视图自动伸缩），彻底不挂
+//       link；syncFrame 里非 cell 宿主一律 stopSyncLink；
+//    ② 候选判定加严：v2.2.15 用纯 inAction 早返回，动作容器内所有子孙
+//       （图标/分隔线/标签）都被当按钮铺素材 → 数量爆炸。改为动作容器内
+//       必须是"像按钮"的视图（已知按钮类 / 类名含 Button/Action / 高度
+//       30~90）才放行。
+//
 //  v2.2.7 挂载架构终极重构（v2.2.6 实测 M11 复盘）：
 //    M11 实锤：zPosition+置顶双保险仍救不回文字 —— 文字容器根本不在
 //    contentView 子树里（图片消息类 cell 的层级与文字消息不同），
@@ -589,19 +600,14 @@ static void LNBPoolDetach(NSString *path) {
 - (void)syncFrame {
     UIView *host = self.superview;
     if (!host || !host.window) { [self stopSyncLink]; return; }
-    // 【v2.2.11】cell 宿主判定同步放宽（堆叠外独立通知类名不同）
+
+    // 【v2.2.16】只有卡片 bg（挂 cell）会挂 displayLink；按钮 bg 已改为
+    // autoresizing 跟随、不挂 link。非 cell 宿主直接停掉，杜绝残留回调。
     NSString *hcls = NSStringFromClass(host.class);
     BOOL isCardHost = [hcls isEqualToString:@"NCNotificationListCell"] ||
                       ([hcls hasPrefix:@"NCNotification"] && [hcls containsString:@"Cell"]);
-    if (!isCardHost) {
-        CGRect t = host.bounds;
-        if (t.size.width < 1.0 || t.size.height < 1.0) return;
-        if (!CGAffineTransformIsIdentity(self.transform)) self.transform = CGAffineTransformIdentity;
-        if (!CGSizeEqualToSize(self.frame.size, t.size) ||
-            fabs(self.frame.origin.x - t.origin.x) > 0.01 ||
-            fabs(self.frame.origin.y - t.origin.y) > 0.01) self.frame = t;
-        return;
-    }
+    if (!isCardHost) { [self stopSyncLink]; return; }
+
     UIView *slide = LNBFindSlideContainer(host);
     if (!slide) slide = host;
     CGRect target = (slide == host) ? host.bounds
@@ -1047,6 +1053,10 @@ static BOOL LNBIsCandidateActionButton(UIView *v) {
     for (UIView *p = v.superview; p; p = p.superview) {
         NSString *pc = NSStringFromClass(p.class);
         if (!reachedNC) {
+            // 【v2.2.16】只认"直接父级或紧邻父级"是动作容器 —— v2.2.15 用
+            // 纯 inAction 放行，导致容器内所有子孙（图标/分隔线/标签）都被
+            // 当按钮铺素材并挂 displayLink，数量爆炸 = 卡死+安全模式根因。
+            // 操作按钮是容器的直接子视图（v1.4.x 实证），逐层判一次即可。
             if ([pc containsString:@"ActionButtonsPresenting"]) inAction = YES;
             if ([pc hasPrefix:@"NCNotification"]) reachedNC = YES;
         }
@@ -1059,7 +1069,14 @@ static BOOL LNBIsCandidateActionButton(UIView *v) {
     }
 
     if (inPreview) return NO;               // 预览小卡内一律不碰
-    if (inAction)  return YES;              // 左滑操作按钮（含宽清除胶囊）铁证
+    // 动作容器内：必须是「像按钮」的视图才放行（v2.2.16 加严）
+    if (inAction) {
+        BOOL looksButton = isToggle || isPlatter ||
+                           [cls containsString:@"Button"] ||
+                           [cls containsString:@"Action"] ||
+                           (sz.height >= 30.0 && sz.height <= 90.0);
+        return looksButton ? YES : NO;
+    }
     if (isToggle)  return NO;               // 折叠开关保持原生
     if (isPlatter && inCell) return YES;    // 纯图标左滑按钮
     if (isPlatter) return NO;               // cell 外的 Platter（折叠区）保持原生
@@ -1201,7 +1218,8 @@ static void LNBApplyButtonBackground(UIView *btn) {
             bg.layer.zPosition = -100.0;
             bg.alpha = prefs.suppAlpha;
             bg.audioProfile = 1;
-            [bg startSyncLink];   // frame 交给逐帧跟随收敛
+            // 【v2.2.16】按钮 bg 不挂 displayLink（autoresizing 跟随即可）
+            if (bg.frame.size.width < 1.0 || bg.frame.size.height < 1.0) bg.frame = btn.bounds;
             return;
         }
     }
@@ -1211,10 +1229,17 @@ static void LNBApplyButtonBackground(UIView *btn) {
     }
     bg.audioProfile = 1;   // 【v2.2.8】按钮素材声音 = suppAudioEnabled 开关
     objc_setAssociatedObject(bg, &kLNBBtnMediaKey, wantKey, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // 【v2.2.16】按钮 bg 改用 autoresizing 跟随，不再挂 displayLink：
+    //   按钮是普通 UIButton，bounds 变化时子视图随 autoresizing 自动伸缩，
+    //   frame 也随 superview 平移 —— 无需逐帧投影。
+    //   v2.2.15 给每个按钮 bg 挂 displayLink（每帧一次 CADisplayLink 回调
+    //   + 可能触发 LNBFindSlideContainer），是卡死+安全模式的头号嫌疑。
+    [bg stopSyncLink];
+    bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    bg.frame = btn.bounds;
     [bg removeFromSuperview];
     [btn insertSubview:bg atIndex:0];
     bg.layer.zPosition = -100.0;   // 【v2.2.6】按钮素材强制垫底保险
-    [bg startSyncLink];   // 【v2.2.10】滑出动画全程贴住按钮 bounds（M14 卡动/不显示根因）
 
     CGFloat cr = btn.layer.cornerRadius;
     if (cr <= 0.5) {
@@ -1541,6 +1566,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.15 loaded — 修复锁屏卡死（祖先链单次爬取+节流回调）+ 折叠区彻底原生", kBGDirectory);
+    LNBTLog(@"v2.2.16 loaded — 按钮 bg 去掉 displayLink（autoresizing 跟随）+ 候选判定加严（修复安全模式）", kBGDirectory);
 }
 %end
