@@ -68,6 +68,15 @@
 //       旧模式 —— 参考视频卡片根本没有独立视频层。
 //    全屏层也改走共享播放器（进程内唯一解码器，卡片暗化板零解码）。
 //
+//  v2.2.3 素材垫底修正（v2.2.2 实测 M4 vs M5 对比复盘）：
+//    挖洞/全屏已对齐朋友（红发壁纸全屏连续 ✓），但独立素材模式下
+//    紫色素材把卡片标题/正文/头像全部盖死（朋友视频 M5 里文字清晰
+//    浮在素材上）。根因：bg 固定挂 contentView atIndex:0，但 iOS 17
+//    通知 cell 的内容不在常规子链上层。修法：LNBContentInsertIndex
+//    收集 slide 内所有 UILabel/UIImageView，爬到直接子视图层取最靠前
+//    的 index —— 素材/暗化板永远垫在内容之下；已挂载的层级漂移也补了
+//    重垫逻辑。
+//
 //  v2.2.2 回归朋友效果的本源（v2.2.1 实测复盘）：
 //    用户实测暴露两个问题：① 整屏层挂载仍不稳（紫色素材只铺了通知区域，
 //    时钟/下半屏还是壁纸）；② card 素材被兜底拿去铺"半截屏幕"→ 视觉全乱。
@@ -585,6 +594,32 @@ static UIView *LNBFindSlideContainer(UIView *cell) {
     return best;
 }
 
+// 【v2.2.3】素材必须垫在内容之下（朋友视频 M5 实证：文字/头像浮在素材上）。
+// 在 slide 子树里收集所有含 UILabel/UIImageView 的视图，沿 superview
+// 爬到 slide 的直接子视图层，取其中最靠前的 index —— bg 插到这个
+// index，标题/正文/时间/头像必然浮在素材之上。找不到内容 → 0 兜底。
+static NSInteger LNBContentInsertIndex(UIView *slide) {
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:slide];
+    NSInteger steps = 0, best = 0;
+    BOOL has = NO;
+    while (stack.count > 0 && steps < 768) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        steps++;
+        if (v != slide && !v.hidden &&
+            ([v isKindOfClass:[UILabel class]] || [v isKindOfClass:[UIImageView class]])) {
+            UIView *p = v;
+            while (p.superview && p.superview != slide) p = p.superview;
+            if (p.superview == slide) {
+                NSInteger i = (NSInteger)[slide.subviews indexOfObject:p];
+                if (i != NSNotFound && (!has || i < best)) { best = i; has = YES; }
+            }
+        }
+        for (UIView *sub in v.subviews) [stack addObject:sub];
+    }
+    return has ? best : 0;
+}
+
 // 给一条通知卡片挂背景。
 // 【v2.1.1】背景挂进滑动容器（cell.contentView 体系），目标 frame =
 // cell.bounds 在容器坐标系里的投影 —— 尺寸精确锁定卡片可视区
@@ -643,9 +678,16 @@ static void LNBApplyCardBackground(UIView *cell) {
         bg = [[LNBBGView alloc] initWithFrame:target];
         bg.tag = kCardBGViewTag;
     }
+    // 【v2.2.3】插入点 = 内容锚点之下：素材垫底，文字/头像浮在素材上
+    //（v2.2.2 固定 atIndex:0 在真机上被实测打脸 —— 内容不在 contentView
+    // 常规子链上层，紫色素材直接盖死了标题/正文/头像，M4 视频实证）。
+    NSInteger wantIdx = LNBContentInsertIndex(slide);
     if (bg.superview != slide) {
         [bg removeFromSuperview];
-        [slide insertSubview:bg atIndex:0];
+        [slide insertSubview:bg atIndex:wantIdx];
+    } else if ((NSInteger)[slide.subviews indexOfObject:bg] > wantIdx) {
+        // 已挂载但层级漂移（内容容器重建后 bg 被顶到内容之上）→ 重新垫底
+        [slide insertSubview:bg atIndex:wantIdx];
     }
     objc_setAssociatedObject(bg, kLNBTargetFrameKey, [NSValue valueWithCGRect:target],
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1111,6 +1153,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.2 loaded — 素材目录 %@；卡片挖洞透壁纸（朋友效果本源），global 仅作可选整屏层", kBGDirectory);
+    LNBTLog(@"v2.2.3 loaded — 素材目录 %@；素材垫底（文字/头像浮在素材上），挖洞透壁纸", kBGDirectory);
 }
 %end
