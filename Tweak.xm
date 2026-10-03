@@ -80,6 +80,17 @@
 //      （AVPlayerItem 握着文件句柄会继续播——"删了还在响"的根因）；
 //    ④ LNBBGView dealloc 移除通知监听，杜绝泄漏。
 //
+//  v2.2.9 左滑按钮素材修复（用户实测 M13：卡片已完美，选项/删除按钮
+//    仍显示灰色原生）：
+//    ① 铺素材分支保持透出化 —— 之前铺素材时 LNBSetButtonSeeThrough(NO)
+//       把按钮原生材质还原了，材质 subview 盖在 bg（index 0）之上，
+//       素材被白胶囊盖死 = M13 根因；改为 YES（材质已藏+底色已清），
+//       素材垫底、文字/图标浮上，与卡片同一模式；
+//    ② 无归属按钮分流修正：NCToggleControl（折叠开关）还原原生灰胶囊
+//       （朋友视频顶部就是灰胶囊）；PLPlatterActionButton（左滑选项/
+//       删除）即使无文字也继续走素材继承链 —— v2.2.6 的"无归属一律
+//       还原原生"误伤了它们（纯图标左滑按钮）。
+//
 //  v2.2.7 挂载架构终极重构（v2.2.6 实测 M11 复盘）：
 //    M11 实锤：zPosition+置顶双保险仍救不回文字 —— 文字容器根本不在
 //    contentView 子树里（图片消息类 cell 的层级与文字消息不同），
@@ -961,12 +972,16 @@ static void LNBApplyButtonBackground(UIView *btn) {
                       [label containsString:@"删除"]);   // v2.2.7：左滑按钮可能叫"删除"
     BOOL isClear   = hasClear && !hasOption;   // 「清除」用 supp2.*
 
-    // 【v2.2.6】无归属按钮（折叠开关 ^ 等）：还原原生，不铺素材 ——
-    // 朋友视频顶部按钮就是原生灰胶囊；v2.2.5 继承链让折叠开关也铺上了
-    // 卡片素材（用户实测顶部多出圆形素材按钮），这里回归 v1.4.5 定论。
+    // 【v2.2.6→v2.2.9】无归属按钮分流：
+    //   · NCToggleControl（折叠开关 ^）：还原原生 —— 朋友视频顶部就是灰胶囊；
+    //   · PLPlatterActionButton 等左滑操作按钮：即使无文字（纯图标按钮）
+    //     也继续走素材继承链 —— 朋友视频里左滑按钮全部铺素材；
+    //     v2.2.6 的"无归属一律还原原生"误伤了它们（M13 实锤清除按钮灰原生）。
     if (!hasOption && !hasClear) {
-        LNBSetButtonSeeThrough(btn, NO);
-        return;
+        if ([NSStringFromClass(btn.class) isEqualToString:@"NCToggleControl"]) {
+            LNBSetButtonSeeThrough(btn, NO);
+            return;
+        }
     }
 
     // 素材回退链：清除 supp2.* → supp.*；选项 supp.* → supp2.*（反向兜底）
@@ -994,8 +1009,10 @@ static void LNBApplyButtonBackground(UIView *btn) {
         return;
     }
 
-    // 有素材：铺圆角媒体层（插 index 0，按钮文字/图标天然浮上）
-    LNBSetButtonSeeThrough(btn, NO);
+    // 有素材：铺圆角媒体层（插 index 0，按钮文字/图标天然浮上）。
+    // 【v2.2.9】必须保持透出化：还原按钮材质会盖住 bg（材质 subview 在素材层之上），
+    // M13 实锤清除按钮显示灰色原生的根因。材质已藏、底色已清 → 素材垫底、文字浮上。
+    LNBSetButtonSeeThrough(btn, YES);
     LNBBGView *bg = (LNBBGView *)[btn viewWithTag:kActionBGViewTag];
     if (!bg) {
         bg = [[LNBBGView alloc] initWithFrame:btn.bounds];
@@ -1314,6 +1331,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.8 loaded — ambient 混音 + 声音开关细分 + reload 池治理", kBGDirectory);
+    LNBTLog(@"v2.2.9 loaded — 左滑按钮素材修复（透出化保持）", kBGDirectory);
 }
 %end
