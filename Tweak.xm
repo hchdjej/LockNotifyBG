@@ -577,6 +577,9 @@ static void LNBPoolDetach(NSString *path) {
 - (void)stopSyncLink;
 @end
 
+// 【v2.2.21】前向声明：按钮每帧快速维护（定义在按钮章节，displayLink 心跳调用）
+static void LNBMaintainActiveButtons(void);
+
 @implementation LNBBGView {
     CADisplayLink *_syncLink;   // 【v2.2.7】挂 cell 后逐帧跟随滑动容器投影
 }
@@ -599,6 +602,17 @@ static void LNBPoolDetach(NSString *path) {
 // 里）时，直接贴住宿主 bounds —— 左滑滑出动画中按钮 bounds 从 0 长到全尺寸，
 // bg 若停留在创建瞬间的快照就会出现"素材不显示/卡动"（M14 实测）。
 - (void)syncFrame {
+    // 【v2.2.21】按钮每帧维护心跳：卡片 bg 的 displayLink 每帧都在跑，
+    // 顺带驱动活跃按钮的补藏/收敛/补挂 —— 左滑中系统重建按钮材质后
+    // 同一帧内就被压回，素材不再闪灰。闸门 8ms：多个卡片 bg 共存时
+    // 一帧内多次回调只放行一次。
+    static CFTimeInterval lnbMaintLast = 0;
+    CFTimeInterval mnow = CACurrentMediaTime();
+    if (mnow - lnbMaintLast > 0.008) {
+        lnbMaintLast = mnow;
+        LNBMaintainActiveButtons();
+    }
+
     UIView *host = self.superview;
     if (!host || !host.window) { [self stopSyncLink]; return; }
 
@@ -1093,22 +1107,29 @@ static BOOL LNBIsCandidateActionButton(UIView *v) {
 
 // 按钮"透出化"：藏材质 + 清底色 → 透出底下的整屏画面（参考视频效果）。
 // 原底色用 UIColor 快照记账，开关关闭时还原。
+// 【v2.2.21】on 分支不再因 flag 已置位而早退：左滑过程中系统会持续重建/
+// 复位按钮的毛玻璃材质与底色（实测紫色素材在原生灰之间反复横跳的根因），
+// 必须每次调用都补藏补清，才能在系统重建的同一帧内压回去。
 static void LNBSetButtonSeeThrough(UIView *btn, BOOL on) {
     BOOL cur = [objc_getAssociatedObject(btn, kLNBBtnSeeThrough) boolValue];
-    if (on == cur) return;
     if (on) {
-        LNBSetCardMaterialsHidden(btn, YES);
-        CGColorRef cg = btn.layer.backgroundColor;
-        UIColor *snap = cg ? [UIColor colorWithCGColor:cg] : nil;
-        objc_setAssociatedObject(btn, kLNBBtnOrigBgKey, snap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        btn.layer.backgroundColor = [UIColor clearColor].CGColor;
-        objc_setAssociatedObject(btn, kLNBBtnSeeThrough, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    } else {
-        UIColor *snap = objc_getAssociatedObject(btn, kLNBBtnOrigBgKey);
-        btn.layer.backgroundColor = snap.CGColor;
-        LNBSetCardMaterialsHidden(btn, NO);
-        objc_setAssociatedObject(btn, kLNBBtnSeeThrough, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!cur) {
+            CGColorRef cg = btn.layer.backgroundColor;
+            UIColor *snap = cg ? [UIColor colorWithCGColor:cg] : nil;
+            objc_setAssociatedObject(btn, kLNBBtnOrigBgKey, snap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(btn, kLNBBtnSeeThrough, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        LNBSetCardMaterialsHidden(btn, YES);   // 每次都补藏（幂等，重建才实际生效）
+        if (btn.layer.backgroundColor && !CGColorEqualToColor(btn.layer.backgroundColor, [UIColor clearColor].CGColor)) {
+            btn.layer.backgroundColor = [UIColor clearColor].CGColor;   // 每次都补清
+        }
+        return;
     }
+    if (!cur) return;
+    UIColor *snap = objc_getAssociatedObject(btn, kLNBBtnOrigBgKey);
+    btn.layer.backgroundColor = snap.CGColor;
+    LNBSetCardMaterialsHidden(btn, NO);
+    objc_setAssociatedObject(btn, kLNBBtnSeeThrough, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // 【v2.2.19】按钮素材层"延迟挂载" —— 崩溃根因的唯一修复点。
@@ -1170,6 +1191,46 @@ static void LNBClearButtonBG(UIView *btn) {
     }
 }
 
+// 【v2.2.21】活跃按钮集合（弱引用）—— 每帧快速维护的名单。
+// 全树扫描 0.25s 一次只负责"发现"；发现过的按钮进入本集合，之后每帧
+// 只对集合内少数几个按钮做幂等补藏/frame 收敛/补挂（O(按钮数)，零树遍历）。
+// 背景：左滑中系统会不断重建按钮材质、甚至在宽胶囊↔方块之间换按钮本体，
+// 0.25s 的节奏跟不上 = 素材在原生灰之间闪（"卡顿跟不上滑动"实测根因）。
+static NSHashTable *LNBActiveButtons(void) {
+    static NSHashTable *t = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        t = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory |
+                                            NSPointerFunctionsObjectPointerPersonality];
+    });
+    return t;
+}
+
+// 每帧快速维护：由 cell/listView layoutSubviews 与卡片 bg 的 displayLink
+// 心跳驱动。集合为空时零开销（锁屏静止无左滑时的常态）。
+static void LNBApplyButtonBackground(UIView *btn);   // 【v2.2.21】前向声明
+static void LNBMaintainActiveButtons(void) {
+    NSHashTable *set = LNBActiveButtons();
+    if (set.count == 0) return;
+    LNBPrefs *prefs = [LNBPrefs sharedInstance];
+    if (!prefs.enabled || !prefs.suppModuleEnabled) return;
+    NSArray<UIView *> *snap = set.allObjects;
+    for (UIView *btn in snap) {
+        if (!btn.window) continue;                    // 未上屏/已摘除：跳过（弱表自动清亡）
+        LNBApplyButtonBackground(btn);                // 幂等全流程：补藏材质/收敛 frame/补挂 bg
+        // 新兄弟按钮发现：滑动中系统会把宽清除胶囊换成方块按钮（新视图不进
+        // 全树扫描的 0.25s 节奏）—— 旧按钮的父容器（动作按钮容器）直接子视图
+        // 逐个判定，新按钮同一帧就被铺上。容器子视图只有 2~4 个，代价可忽略。
+        UIView *parent = btn.superview;
+        if (parent) {
+            for (UIView *sub in parent.subviews) {
+                if (sub == btn || [set containsObject:sub]) continue;
+                if (LNBIsCandidateActionButton(sub)) LNBApplyButtonBackground(sub);
+            }
+        }
+    }
+}
+
 // 给单个按钮挂背景：
 //   归属（v1.4.5 定论，先判「选项」再判「清除」，折叠跳过独立素材）：
 //     含「选项」不含「清除」 → supp.*；含「清除」 → supp2.*（缺省回退 supp.*）
@@ -1185,6 +1246,7 @@ static void LNBApplyButtonBackground(UIView *btn) {
     if (!wantOn) {
         LNBSetButtonSeeThrough(btn, NO);
         LNBClearButtonBG(btn);   // 【v2.2.19】含未挂载窗口期的 bg
+        [LNBActiveButtons() removeObject:btn];   // 【v2.2.21】退出每帧维护名单
         return;
     }
 
@@ -1211,6 +1273,7 @@ static void LNBApplyButtonBackground(UIView *btn) {
         if (isToggle || (!inAction && (!isPlatter || !LNBInSlideCellWide(btn)))) {
             LNBSetButtonSeeThrough(btn, NO);
             LNBClearButtonBG(btn);   // 【v2.2.19】含未挂载窗口期的 bg
+            [LNBActiveButtons() removeObject:btn];   // 【v2.2.21】退出每帧维护名单
             return;
         }
     }
@@ -1236,6 +1299,7 @@ static void LNBApplyButtonBackground(UIView *btn) {
         // 素材被删掉时旧 bg 也要清掉（v2.2.8 池治理的同款思路）
         LNBSetButtonSeeThrough(btn, YES);
         LNBClearButtonBG(btn);   // 【v2.2.19】含未挂载窗口期的 bg
+        [LNBActiveButtons() addObject:btn];   // 【v2.2.21】进入每帧维护名单
         return;
     }
 
@@ -1243,6 +1307,7 @@ static void LNBApplyButtonBackground(UIView *btn) {
     // 【v2.2.9】必须保持透出化：还原按钮材质会盖住 bg（材质 subview 在素材层之上），
     // M13 实锤清除按钮显示灰色原生的根因。材质已藏、底色已清 → 素材垫底、文字浮上。
     LNBSetButtonSeeThrough(btn, YES);
+    [LNBActiveButtons() addObject:btn];   // 【v2.2.21】进入每帧维护名单
     // 【v2.2.19】bg 归属改记在按钮的关联对象上，而不是只靠 viewWithTag 找：
     //   插入被延后后，bg 会有"已创建但还没挂上"的窗口期 —— 此时
     //   [btn viewWithTag:] 找不到它，下一轮扫描（0.25s 后）就会再 new 一个，
@@ -1579,6 +1644,7 @@ static void LNBScanAndApplyCards(UIView *root) {
     LNBEnsureListBackground((UIView *)self);
     LNBScanAndApplyCards((UIView *)self);
     LNBScanButtonsIfNeeded((UIView *)self);
+    LNBMaintainActiveButtons();   // 【v2.2.21】每帧快速维护（补藏/收敛/补挂/发现新按钮）
 }
 %end
 
@@ -1622,6 +1688,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.20 loaded — 删除按钮素材继承链（没选就不铺纯透出）+ 挂载瞬间/每轮扫描收敛 frame（修卡顿跟不上滑动）", kBGDirectory);
+    LNBTLog(@"v2.2.21 loaded — 按钮每帧快速维护（displayLink 心跳驱动：同帧补藏系统重建材质+新按钮即发现，根治滑动闪灰卡顿）", kBGDirectory);
 }
 %end
