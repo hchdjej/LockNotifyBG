@@ -68,6 +68,18 @@
 //       旧模式 —— 参考视频卡片根本没有独立视频层。
 //    全屏层也改走共享播放器（进程内唯一解码器，卡片暗化板零解码）。
 //
+//  v2.2.7 挂载架构终极重构（v2.2.6 实测 M11 复盘）：
+//    M11 实锤：zPosition+置顶双保险仍救不回文字 —— 文字容器根本不在
+//    contentView 子树里（图片消息类 cell 的层级与文字消息不同），
+//    bg 挂在 contentView 里无论怎么调都被 slide 整体盖住。
+//    终极方案：
+//    ① bg 直接挂 cell + zPosition=-1000 —— 跨容器垫底，cell 的所有
+//       子树（无论文字藏哪个容器）必然浮在素材之上；
+//    ② CADisplayLink 逐帧把 bg.frame 收敛到"滑动容器 bounds 在 cell
+//       坐标系的投影"—— 左滑平移/展开动画全程跟随（displayLink 在
+//       bg 离开窗口/释放时自动停止，无泄漏）；
+//    ③ 左滑"删除"字样纳入清除按钮判定。
+//
 //  v2.2.6 垫底失效修复 + 折叠回归原生（v2.2.5 实测 M9 复盘）：
 //    ① M9 实锤：卡片素材盖死全部文字（时间区放大零文字痕迹），而
 //       insertSubview:index 在图片消息类 cell 上失效。改用双保险：
@@ -415,9 +427,43 @@ static void LNBPoolDetach(NSString *path) {
 - (void)applyDimOnlyWithAlpha:(CGFloat)alpha;
 - (void)teardownMedia;
 - (void)syncToHostIfNeeded;
+- (void)startSyncLink;    // 【v2.2.7】挂 cell 后的逐帧跟随（CADisplayLink）
+- (void)stopSyncLink;
 @end
 
-@implementation LNBBGView
+@implementation LNBBGView {
+    CADisplayLink *_syncLink;   // 【v2.2.7】挂 cell 后逐帧跟随滑动容器投影
+}
+
+- (void)startSyncLink {
+    if (_syncLink) return;   // CADisplayLink 无 valid 属性，invalidate 时已置 nil
+    _syncLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(syncFrame)];
+    [_syncLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+- (void)stopSyncLink {
+    [_syncLink invalidate];
+    _syncLink = nil;
+}
+
+// 每帧：bg 挂在 cell 上，frame 收敛到"滑动容器 bounds 在 cell 坐标系的投影"
+// —— 左滑平移、展开动画全部跟随（M11 实锤：slide 挂载在图片消息 cell 上
+// 层级失效，挂 cell + zPosition=-1000 跨容器垫底后需自己负责跟随）。
+- (void)syncFrame {
+    UIView *cell = self.superview;
+    if (!cell || !cell.window) { [self stopSyncLink]; return; }
+    if (![NSStringFromClass(cell.class) isEqualToString:@"NCNotificationListCell"]) return;
+    UIView *slide = LNBFindSlideContainer(cell);
+    if (!slide) slide = cell;
+    CGRect target = (slide == cell) ? cell.bounds
+                                    : [slide convertRect:slide.bounds toView:cell];
+    if (target.size.width < 1.0 || target.size.height < 1.0) return;
+    if (!CGAffineTransformIsIdentity(self.transform)) self.transform = CGAffineTransformIdentity;
+    if (CGSizeEqualToSize(self.frame.size, target.size) &&
+        fabs(self.frame.origin.x - target.origin.x) < 0.01 &&
+        fabs(self.frame.origin.y - target.origin.y) < 0.01) return;
+    self.frame = target;
+}
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
@@ -544,26 +590,23 @@ static void LNBPoolDetach(NSString *path) {
 static __weak UIView *lnbListHostCache = nil;
 static UIView *LNBAnchorToLockRoot(UIView *anchor);       // 前向声明（定义在下方）
 static UIView *LNBGlobalBackgroundHost(UIView *anchor, UIView **outAnchorView);
+static UIView *LNBFindSlideContainer(UIView *cell);       // 【v2.2.7】前向声明
 
 - (void)layoutSubviews {
-    NSNumber *syncing = objc_getAssociatedObject(self, kLNBSyncingKey);
-    if (!syncing.boolValue) {
-        objc_setAssociatedObject(self, kLNBSyncingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [self syncToHostIfNeeded];
-        objc_setAssociatedObject(self, kLNBSyncingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
+    // 【v2.2.7】frame 由 syncFrame（CADisplayLink）驱动，这里只管子层布局
     [super layoutSubviews];
     if (!CGRectEqualToRect(_imageView.frame, self.bounds)) _imageView.frame = self.bounds;
-    if (!CGRectEqualToRect(_dimOverlay.frame, self.bounds)) _dimOverlay.frame = self.bounds;   // v2.2.4
+    if (!CGRectEqualToRect(_dimOverlay.frame, self.bounds)) _dimOverlay.frame = self.bounds;
 
     if (self.playerLayer) {
-        // 背景铺满自身 bounds（自身=滑动容器里的卡片层）。
-        // 左滑时随宿主内容一起平移，裁切交给滚动容器/屏幕边缘。
+        // 背景铺满自身 bounds（自身=cell 坐标系里滑动容器的投影）。
         self.playerLayer.frame = self.bounds;   // 无条件赋值，不做读回比较
     }
 }
 
 - (void)dealloc {
+    [_syncLink invalidate];
+    _syncLink = nil;
     if (_attachedPath) {
         LNBPoolDetach(_attachedPath);
         _attachedPath = nil;
@@ -640,28 +683,6 @@ static UIView *LNBFindSlideContainer(UIView *cell) {
     return best;
 }
 
-// 【v2.2.6】内容锚点容器收集：返回 slide 中包含 UILabel/UIImageView 的
-// "直接子视图"集合（去重）。M9 实测：insertSubview:index 方案在图片消息
-// 类 cell 上失效（素材盖死文字）—— 不再依赖 index，改用强制置顶+zPosition。
-static NSMutableSet *LNBCollectContentAnchors(UIView *slide) {
-    NSMutableSet *anchors = [NSMutableSet set];
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:slide];
-    NSInteger steps = 0;
-    while (stack.count > 0 && steps < 768) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        steps++;
-        if (v != slide && !v.hidden &&
-            ([v isKindOfClass:[UILabel class]] || [v isKindOfClass:[UIImageView class]])) {
-            UIView *p = v;
-            while (p.superview && p.superview != slide) p = p.superview;
-            if (p.superview == slide) [anchors addObject:p];
-        }
-        for (UIView *sub in v.subviews) [stack addObject:sub];
-    }
-    return anchors;
-}
-
 // 给一条通知卡片挂背景。
 // 【v2.1.1】背景挂进滑动容器（cell.contentView 体系），目标 frame =
 // cell.bounds 在容器坐标系里的投影 —— 尺寸精确锁定卡片可视区
@@ -705,33 +726,27 @@ static void LNBApplyCardBackground(UIView *cell) {
     // cell 本体不裁切：滑动中背景要能滑出 cell 边界，由屏幕边缘完成裁切
     cell.layer.masksToBounds = NO;
 
-    // 滑动容器与目标投影
+    // 滑动容器（仅用于逐帧投影计算；v2.2.7 起 bg 不再挂进它）
     UIView *slide = LNBFindSlideContainer(cell);
-    CGRect target;
-    if (slide && slide != cell) {
-        target = [cell convertRect:cell.bounds toView:slide];
-    } else {
-        slide = cell;
-        target = cell.bounds;
-    }
+    if (!slide) slide = cell;
 
     LNBBGView *bg = (LNBBGView *)[cell viewWithTag:kCardBGViewTag];
     if (!bg) {
-        bg = [[LNBBGView alloc] initWithFrame:target];
+        bg = [[LNBBGView alloc] initWithFrame:cell.bounds];
         bg.tag = kCardBGViewTag;
     }
-    // 【v2.2.6】垫底双保险（index 方案在 M9 图片消息 cell 上被实测打脸）：
-    // ① 含文字/图片的容器全部置顶 —— 内容无论藏在哪个容器必然浮出；
-    // ② bg zPosition=-100 —— CALayer 硬规则，兄弟之间永远画在最底。
-    NSMutableSet *anchors = LNBCollectContentAnchors(slide);
-    for (UIView *p in anchors) [slide bringSubviewToFront:p];
-    if (bg.superview != slide) {
+    // 【v2.2.7】bg 直接挂 cell + zPosition=-1000：
+    // M11 实锤 slide/contentView 挂载方案在图片消息 cell 上层级彻底失效
+    //（文字容器不在 contentView 子树里，slide 内怎么调 index/zPosition
+    // 都被 slide 整体盖住）。挂 cell + 负 zPosition = 跨容器垫底，
+    // cell 的所有子树（无论文字藏哪个容器）必然浮在素材之上；
+    // 滑动跟随交给 syncFrame 逐帧投影（CADisplayLink）。
+    if (bg.superview != cell) {
         [bg removeFromSuperview];
-        [slide insertSubview:bg atIndex:0];
+        [cell insertSubview:bg atIndex:0];
     }
-    bg.layer.zPosition = -100.0;
-    objc_setAssociatedObject(bg, kLNBTargetFrameKey, [NSValue valueWithCGRect:target],
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    bg.layer.zPosition = -1000.0;
+    [bg startSyncLink];
 
     // 圆角自补（保持原生卡片圆角观感）
     CGFloat radius = cell.layer.cornerRadius > 0 ? cell.layer.cornerRadius : 18.0;
@@ -857,7 +872,8 @@ static void LNBApplyButtonBackground(UIView *btn) {
     NSString *label = LNBGatherText(btn);
     NSString *lower = label.lowercaseString;
     BOOL hasOption = ([label containsString:@"选项"] || [lower containsString:@"option"]);
-    BOOL hasClear  = ([label containsString:@"清除"] || [lower containsString:@"clear"]);
+    BOOL hasClear  = ([label containsString:@"清除"] || [lower containsString:@"clear"] ||
+                      [label containsString:@"删除"]);   // v2.2.7：左滑按钮可能叫"删除"
     BOOL isClear   = hasClear && !hasOption;   // 「清除」用 supp2.*
 
     // 【v2.2.6】无归属按钮（折叠开关 ^ 等）：还原原生，不铺素材 ——
@@ -1211,6 +1227,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.6 loaded — 素材目录 %@；垫底双保险（置顶+zPosition）+ 折叠回归原生", kBGDirectory);
+    LNBTLog(@"v2.2.7 loaded — 素材目录 %@；挂 cell + zPosition-1000 + displayLink 跟随", kBGDirectory);
 }
 %end
