@@ -91,6 +91,22 @@
 //       删除）即使无文字也继续走素材继承链 —— v2.2.6 的"无归属一律
 //       还原原生"误伤了它们（纯图标左滑按钮）。
 //
+//  v2.2.10 左滑按钮三连修（用户实测 M14：折叠区被误铺、清除按钮滑动
+//    不显示、选项/清除慢滑动卡动）：
+//    ① 折叠区还原原生：v2.2.9"无文字 PLPlatterActionButton 一律铺"误伤了
+//       顶部折叠展开钮/右上角堆叠钮（同为无文字 PLPlatterActionButton，树
+//       浅层先被扫到）—— 无文字且不在 NCNotificationListCell 内 → 还原
+//       原生；无文字但在 cell 内（左滑纯图标按钮）→ 继续铺素材；
+//    ② 清除按钮扫不到：BFS 步上限 512 → 4096（深层 cell 的左滑按钮在
+//       512 步里扫不到 → 一直原生白胶囊），节流 0.25s → 0.10s（滑出后
+//       更快铺上），候选尺寸门槛 20 → 10（滑出早期宽度还在长）；
+//    ③ 卡动根治：按钮 bg 挂进 LNBBGView 的 CADisplayLink 跟随体系 ——
+//       syncFrame 增加"按钮宿主模式"（非 cell 宿主 → 每帧贴
+//       superview.bounds），滑出动画中按钮 bounds 从 0 长到全尺寸 bg
+//       全程贴合（此前 bg frame = 创建瞬间快照，无跟随 = 不显示/错位）；
+//    ④ 幂等防闪：素材没换不拆不重建 bg（此前每次扫描都 removeFromSuperview
+//       + 重挂播放器层 = 反复闪烁），旧 bg 清除移入各还原分支。
+//
 //  v2.2.7 挂载架构终极重构（v2.2.6 实测 M11 复盘）：
 //    M11 实锤：zPosition+置顶双保险仍救不回文字 —— 文字容器根本不在
 //    contentView 子树里（图片消息类 cell 的层级与文字消息不同），
@@ -196,6 +212,7 @@ static NSString *const kSupp2Image    = @"supp2.jpg";
 static const NSInteger kCardBGViewTag   = 0x4C4E4243;   // 'LNBC'
 static const NSInteger kGlobalBGViewTag = 0x4C4E4247;   // 'LNBG'
 static const NSInteger kActionBGViewTag = 0x4C4E4241;   // 'LNBA'（按钮独立素材层）
+static const char kLNBBtnMediaKey;                      // 【v2.2.10】按钮 bg 素材标识（幂等）
 
 // 【v2.2.0】设置面板域与跨进程同步（与 prefs 面板代码一致）
 static NSString *const kPrefsDomain        = @"com.hchdjej.locknotifybg";
@@ -519,14 +536,25 @@ static void LNBPoolDetach(NSString *path) {
 // 每帧：bg 挂在 cell 上，frame 收敛到"滑动容器 bounds 在 cell 坐标系的投影"
 // —— 左滑平移、展开动画全部跟随（M11 实锤：slide 挂载在图片消息 cell 上
 // 层级失效，挂 cell + zPosition=-1000 跨容器垫底后需自己负责跟随）。
+// 【v2.2.10】按钮宿主模式：superview 不是 cell（= 挂在 PLPlatterActionButton
+// 里）时，直接贴住宿主 bounds —— 左滑滑出动画中按钮 bounds 从 0 长到全尺寸，
+// bg 若停留在创建瞬间的快照就会出现"素材不显示/卡动"（M14 实测）。
 - (void)syncFrame {
-    UIView *cell = self.superview;
-    if (!cell || !cell.window) { [self stopSyncLink]; return; }
-    if (![NSStringFromClass(cell.class) isEqualToString:@"NCNotificationListCell"]) return;
-    UIView *slide = LNBFindSlideContainer(cell);
-    if (!slide) slide = cell;
-    CGRect target = (slide == cell) ? cell.bounds
-                                    : [slide convertRect:slide.bounds toView:cell];
+    UIView *host = self.superview;
+    if (!host || !host.window) { [self stopSyncLink]; return; }
+    if (![NSStringFromClass(host.class) isEqualToString:@"NCNotificationListCell"]) {
+        CGRect t = host.bounds;
+        if (t.size.width < 1.0 || t.size.height < 1.0) return;
+        if (!CGAffineTransformIsIdentity(self.transform)) self.transform = CGAffineTransformIdentity;
+        if (!CGSizeEqualToSize(self.frame.size, t.size) ||
+            fabs(self.frame.origin.x - t.origin.x) > 0.01 ||
+            fabs(self.frame.origin.y - t.origin.y) > 0.01) self.frame = t;
+        return;
+    }
+    UIView *slide = LNBFindSlideContainer(host);
+    if (!slide) slide = host;
+    CGRect target = (slide == host) ? host.bounds
+                                    : [slide convertRect:slide.bounds toView:host];
     if (target.size.width < 1.0 || target.size.height < 1.0) return;
     if (!CGAffineTransformIsIdentity(self.transform)) self.transform = CGAffineTransformIdentity;
     if (CGSizeEqualToSize(self.frame.size, target.size) &&
@@ -896,10 +924,21 @@ static NSString *LNBGatherText(UIView *root) {
 //   ✅ PLPlatterActionButton   77x66 "选项" / 73x66 "清除"
 //   ❌ PLActionButtonsPresentingView（容器，铺了会盖住子按钮）
 //   ❌ Coalescing / Pair / Header*（容器与标题）
+// 【v2.2.10】按钮是否在通知 cell 内 —— 区分左滑操作按钮（cell 内，
+// 朋友视频里铺素材）与顶部折叠区按钮（cell 外的 header 区，保持原生灰）。
+static BOOL LNBInSlideCell(UIView *v) {
+    for (UIView *p = v.superview; p; p = p.superview) {
+        NSString *c = NSStringFromClass(p.class);
+        if ([c isEqualToString:@"NCNotificationListCell"]) return YES;
+    }
+    return NO;
+}
+
 static BOOL LNBIsCandidateActionButton(UIView *v) {
     if (!v) return NO;
     CGSize sz = v.bounds.size;
-    if (sz.width < 20.0 || sz.height < 20.0) return NO;   // 未布局的 {0,0}
+    // 【v2.2.10】20 → 10：滑出动画早期按钮宽度还在长，早铺早跟随
+    if (sz.width < 10.0 || sz.height < 10.0) return NO;   // 未布局的 {0,0}
     if (sz.width > 260.0 || sz.height > 120.0) return NO;
 
     NSString *cls = NSStringFromClass(v.class);
@@ -956,12 +995,13 @@ static void LNBApplyButtonBackground(UIView *btn) {
     LNBPrefs *prefs = [LNBPrefs sharedInstance];
     BOOL wantOn = prefs.enabled && prefs.suppModuleEnabled;
 
-    // 先清掉本按钮上已铺的独立素材层
-    UIView *oldMedia = [btn viewWithTag:kActionBGViewTag];
-    if (oldMedia) [oldMedia removeFromSuperview];
+    // 【v2.2.10】旧 bg 的清除移到各还原分支里做（不能在函数开头无脑拆——
+    // 那会让下面的幂等检查永远落空，每次扫描都重挂播放器层 = 卡动闪烁）
 
     if (!wantOn) {
         LNBSetButtonSeeThrough(btn, NO);
+        UIView *staleBg = [btn viewWithTag:kActionBGViewTag];
+        if (staleBg) { LNBBGView *sb = (LNBBGView *)staleBg; [sb stopSyncLink]; [staleBg removeFromSuperview]; }
         return;
     }
 
@@ -972,14 +1012,18 @@ static void LNBApplyButtonBackground(UIView *btn) {
                       [label containsString:@"删除"]);   // v2.2.7：左滑按钮可能叫"删除"
     BOOL isClear   = hasClear && !hasOption;   // 「清除」用 supp2.*
 
-    // 【v2.2.6→v2.2.9】无归属按钮分流：
+    // 【v2.2.10】无归属按钮分流（M14 实测修正 v2.2.9）：
     //   · NCToggleControl（折叠开关 ^）：还原原生 —— 朋友视频顶部就是灰胶囊；
-    //   · PLPlatterActionButton 等左滑操作按钮：即使无文字（纯图标按钮）
-    //     也继续走素材继承链 —— 朋友视频里左滑按钮全部铺素材；
-    //     v2.2.6 的"无归属一律还原原生"误伤了它们（M13 实锤清除按钮灰原生）。
+    //   · 无文字且不在通知 cell 内（顶部折叠展开钮、右上角堆叠钮 —— 也是
+    //     PLPlatterActionButton）：还原原生 —— v2.2.9"无文字一律铺"误伤了
+    //     它们，用户点名"折叠那里不需要替换背景"；
+    //   · 无文字但在 cell 内（左滑纯图标操作按钮）：继续走素材继承链。
     if (!hasOption && !hasClear) {
-        if ([NSStringFromClass(btn.class) isEqualToString:@"NCToggleControl"]) {
+        BOOL toggle = [NSStringFromClass(btn.class) isEqualToString:@"NCToggleControl"];
+        if (toggle || !LNBInSlideCell(btn)) {
             LNBSetButtonSeeThrough(btn, NO);
+            UIView *staleBg = [btn viewWithTag:kActionBGViewTag];
+            if (staleBg) { LNBBGView *sb = (LNBBGView *)staleBg; [sb stopSyncLink]; [staleBg removeFromSuperview]; }
             return;
         }
     }
@@ -1004,8 +1048,11 @@ static void LNBApplyButtonBackground(UIView *btn) {
                     LNBFileExists(LNBPathForResource(imgName));
 
     if (!hasMedia) {
-        // 参考视频效果：按钮区域透出整屏画面，文字浮在上面
+        // 参考视频效果：按钮区域透出整屏画面，文字浮在上面；
+        // 素材被删掉时旧 bg 也要清掉（v2.2.8 池治理的同款思路）
         LNBSetButtonSeeThrough(btn, YES);
+        UIView *staleBg = [btn viewWithTag:kActionBGViewTag];
+        if (staleBg) { LNBBGView *sb = (LNBBGView *)staleBg; [sb stopSyncLink]; [staleBg removeFromSuperview]; }
         return;
     }
 
@@ -1014,14 +1061,34 @@ static void LNBApplyButtonBackground(UIView *btn) {
     // M13 实锤清除按钮显示灰色原生的根因。材质已藏、底色已清 → 素材垫底、文字浮上。
     LNBSetButtonSeeThrough(btn, YES);
     LNBBGView *bg = (LNBBGView *)[btn viewWithTag:kActionBGViewTag];
+    // 【v2.2.10】幂等：素材没换就不拆不重建 —— 之前每次扫描都
+    // removeFromSuperview + 重挂播放器层，慢滑动时反复闪烁 = "卡动"根因。
+    NSString *wantKey = LNBFileExists(LNBPathForResource(vidName))
+        ? LNBPathForResource(vidName)
+        : [@"img:" stringByAppendingString:LNBPathForResource(imgName)];
+    if (bg) {
+        NSString *curKey = objc_getAssociatedObject(bg, &kLNBBtnMediaKey);
+        if ([curKey isEqualToString:wantKey]) {
+            CGFloat cr0 = btn.layer.cornerRadius;
+            if (cr0 <= 0.5) cr0 = MIN(btn.bounds.size.width, btn.bounds.size.height) * 0.3;
+            bg.layer.cornerRadius = cr0;
+            bg.layer.zPosition = -100.0;
+            bg.alpha = prefs.suppAlpha;
+            bg.audioProfile = 1;
+            [bg startSyncLink];   // frame 交给逐帧跟随收敛
+            return;
+        }
+    }
     if (!bg) {
         bg = [[LNBBGView alloc] initWithFrame:btn.bounds];
         bg.tag = kActionBGViewTag;
     }
     bg.audioProfile = 1;   // 【v2.2.8】按钮素材声音 = suppAudioEnabled 开关
+    objc_setAssociatedObject(bg, &kLNBBtnMediaKey, wantKey, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [bg removeFromSuperview];
     [btn insertSubview:bg atIndex:0];
     bg.layer.zPosition = -100.0;   // 【v2.2.6】按钮素材强制垫底保险
+    [bg startSyncLink];   // 【v2.2.10】滑出动画全程贴住按钮 bounds（M14 卡动/不显示根因）
 
     CGFloat cr = btn.layer.cornerRadius;
     if (cr <= 0.5) {
@@ -1035,18 +1102,20 @@ static void LNBApplyButtonBackground(UIView *btn) {
                       image:(LNBFileExists(LNBPathForResource(vidName)) ? nil : imgName)];
 }
 
-// 按钮扫描（0.25s 节流）：在通知相关子树里找候选按钮逐个应用
+// 按钮扫描：【v2.2.10】0.25s→0.10s 节流（滑出后更快铺上）、512→4096 步
+// 上限（M14 实锤：深层 cell 的左滑按钮在 512 步 DFS 里扫不到 → 清除按钮
+// 一直原生白胶囊；浅层的顶部按钮反而先扫到被 v2.2.9 铺了素材）
 static CFTimeInterval lnbBtnScanLast = 0;
 
 static void LNBScanButtonsIfNeeded(UIView *root) {
     if (!root) return;
     CFTimeInterval now = CACurrentMediaTime();
-    if (now - lnbBtnScanLast < 0.25) return;
+    if (now - lnbBtnScanLast < 0.10) return;
     lnbBtnScanLast = now;
 
     NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
     NSInteger steps = 0;
-    while (stack.count > 0 && steps < 512) {
+    while (stack.count > 0 && steps < 4096) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
         steps++;
@@ -1331,6 +1400,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.9 loaded — 左滑按钮素材修复（透出化保持）", kBGDirectory);
+    LNBTLog(@"v2.2.10 loaded — 左滑按钮三连修（折叠区还原/扫描加深/跟随防闪）", kBGDirectory);
 }
 %end
