@@ -165,6 +165,13 @@
 //       必须是"像按钮"的视图（已知按钮类 / 类名含 Button/Action / 高度
 //       30~90）才放行。
 //
+//  v2.2.17 按钮素材不再继承卡片（用户明确：按钮没单独选素材就别铺，
+//    纯透出/原生）：
+//    删除 v2.2.5/v2.2.11 的"按钮没设素材 → 继承 card.*/global.*"回退链
+//    —— 那种"按钮自动和卡片同步"不是用户想要的效果。按钮素材现在完全由
+//    supp.*（选项）/ supp2.*（清除）决定，都没设 → 走透出化（整屏画面）
+//    或还原原生。
+//
 //  v2.2.7 挂载架构终极重构（v2.2.6 实测 M11 复盘）：
 //    M11 实锤：zPosition+置顶双保险仍救不回文字 —— 文字容器根本不在
 //    contentView 子树里（图片消息类 cell 的层级与文字消息不同），
@@ -1165,28 +1172,10 @@ static void LNBApplyButtonBackground(UIView *btn) {
         vidName = isClear ? kSuppVideo : kSupp2Video;
         imgName = isClear ? kSuppImage : kSupp2Image;
     }
-    // 【v2.2.5→v2.2.11】按钮没专设素材 → 继承：
-    // 挖洞模式（默认）下卡片透出的是整屏层画面 —— 继承终点改为 global.*
-    // （按钮画面与卡片画面同源同帧；继承 card.* 会和卡片内容对不上，
-    // M15 实测按钮浅色画面 vs 卡片深蓝画面的不协调根因）；
-    // 独立素材模式（关挖洞）卡片铺 card.* → 维持继承 card.*。
-    // global 也没有 → 回退 card.*；朋友视频里"清除"按钮铺的正是与卡片
-    // 同款的橙色鸭子素材，红字"清除"浮在上面。
-    if (!LNBFileExists(LNBPathForResource(vidName)) &&
-        !LNBFileExists(LNBPathForResource(imgName))) {
-        if (prefs.cardTransparent) {
-            vidName = kGlobalVideo;
-            imgName = kGlobalImage;
-            if (!LNBFileExists(LNBPathForResource(vidName)) &&
-                !LNBFileExists(LNBPathForResource(imgName))) {
-                vidName = kCardVideo;
-                imgName = kCardImage;
-            }
-        } else {
-            vidName = kCardVideo;
-            imgName = kCardImage;
-        }
-    }
+    // 【v2.2.17】取消"继承卡片/整屏素材"（用户明确：按钮没单独选素材就
+    // 不要铺任何素材，纯透出/原生）。原 v2.2.5/v2.2.11 的回退链（按钮没设
+    // → 拿 card.*/global.*）已删除 —— 那种"按钮和卡片自动同步"不是用户
+    // 想要的效果。按钮素材完全由 supp.* / supp2.* 决定，没有就不铺。
     BOOL hasMedia = LNBFileExists(LNBPathForResource(vidName)) ||
                     LNBFileExists(LNBPathForResource(imgName));
 
@@ -1566,6 +1555,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.16 loaded — 按钮 bg 去掉 displayLink（autoresizing 跟随）+ 候选判定加严（修复安全模式）", kBGDirectory);
+    LNBTLog(@"v2.2.17 loaded — 按钮素材不再继承卡片（没单独选就不铺，纯透出/原生）", kBGDirectory);
 }
 %end
