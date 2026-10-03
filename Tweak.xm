@@ -212,7 +212,7 @@ static NSString *const kSupp2Image    = @"supp2.jpg";
 static const NSInteger kCardBGViewTag   = 0x4C4E4243;   // 'LNBC'
 static const NSInteger kGlobalBGViewTag = 0x4C4E4247;   // 'LNBG'
 static const NSInteger kActionBGViewTag = 0x4C4E4241;   // 'LNBA'（按钮独立素材层）
-static const char kLNBBtnMediaKey;                      // 【v2.2.10】按钮 bg 素材标识（幂等）
+static char kLNBBtnMediaKey;                            // 【v2.2.10】按钮 bg 素材标识（幂等，关联键取地址）
 
 // 【v2.2.0】设置面板域与跨进程同步（与 prefs 面板代码一致）
 static NSString *const kPrefsDomain        = @"com.hchdjej.locknotifybg";
