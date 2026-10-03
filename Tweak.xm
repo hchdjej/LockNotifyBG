@@ -1139,11 +1139,17 @@ static void LNBDeferAttachButtonBG(UIView *btn, LNBBGView *bg) {
         if (g.superview == b) return;      // 已挂好 → 不重复插
         if (!b.window) return;             // 已离屏 → 不插（避免无效/危险操作）
         @try {
+            // 【v2.2.20】挂载瞬间取按钮"当前"bounds 作为 frame：
+            // bg 创建于扫描瞬间（左滑动画中按钮 bounds 可能只有一半大），
+            // 延迟一个 tick 后按钮早已长到位 —— 若沿用创建瞬间的旧 frame，
+            // 素材就带着错误尺寸挂上去且 autoresizing 不再有机会修正
+            //（父视图 bounds 已稳定，不再触发变化）= "素材跟不上滑动/卡顿"。
+            g.frame = b.bounds;
             [g removeFromSuperview];
             [b insertSubview:g atIndex:0];
             g.layer.zPosition = -100.0;
         } @catch (NSException *e) {
-            LNBTLog(@"[v2.2.19] button bg attach failed: %@", e.reason);
+            LNBTLog(@"[v2.2.20] button bg attach failed: %@", e.reason);
         }
     });
 }
@@ -1217,28 +1223,11 @@ static void LNBApplyButtonBackground(UIView *btn) {
         vidName = isClear ? kSuppVideo : kSupp2Video;
         imgName = isClear ? kSuppImage : kSupp2Image;
     }
-    // 【v2.2.5→v2.2.11】按钮没专设素材 → 继承：
-    // 挖洞模式（默认）下卡片透出的是整屏层画面 —— 继承终点改为 global.*
-    // （按钮画面与卡片画面同源同帧；继承 card.* 会和卡片内容对不上，
-    // M15 实测按钮浅色画面 vs 卡片深蓝画面的不协调根因）；
-    // 独立素材模式（关挖洞）卡片铺 card.* → 维持继承 card.*。
-    // global 也没有 → 回退 card.*；朋友视频里"清除"按钮铺的正是与卡片
-    // 同款的橙色鸭子素材，红字"清除"浮在上面。
-    if (!LNBFileExists(LNBPathForResource(vidName)) &&
-        !LNBFileExists(LNBPathForResource(imgName))) {
-        if (prefs.cardTransparent) {
-            vidName = kGlobalVideo;
-            imgName = kGlobalImage;
-            if (!LNBFileExists(LNBPathForResource(vidName)) &&
-                !LNBFileExists(LNBPathForResource(imgName))) {
-                vidName = kCardVideo;
-                imgName = kCardImage;
-            }
-        } else {
-            vidName = kCardVideo;
-            imgName = kCardImage;
-        }
-    }
+    // 【v2.2.20】删除 v2.2.5→v2.2.11 的"继承卡片/整屏素材"回退链
+    //（v2.2.17 删过一次；v2.2.19 以 v2.2.16 为基线重做时随基线带回来了）。
+    // 用户实测 v2.2.19：按钮没选素材却铺出与卡片同款画面（白猫）——
+    // 按钮素材完全由 supp.*（选项）/ supp2.*（清除）决定，没选就不铺，
+    // 走纯透出（透出整屏画面），绝不自动继承 card.*/global.*。
     BOOL hasMedia = LNBFileExists(LNBPathForResource(vidName)) ||
                     LNBFileExists(LNBPathForResource(imgName));
 
@@ -1278,7 +1267,13 @@ static void LNBApplyButtonBackground(UIView *btn) {
             bg.alpha = prefs.suppAlpha;
             bg.audioProfile = 1;
             // 【v2.2.16】按钮 bg 不挂 displayLink（autoresizing 跟随即可）
-            if (bg.frame.size.width < 1.0 || bg.frame.size.height < 1.0) bg.frame = btn.bounds;
+            // 【v2.2.20】frame 收敛：只要与按钮当前 bounds 不一致就校正。
+            // 旧逻辑只在 <1pt 时修 —— 延迟挂载窗口期内按钮长完尺寸，
+            // bg 带着中间态 frame 挂上后就永远停在半路（= 卡顿/跟不上滑动）。
+            if (!CGSizeEqualToSize(bg.frame.size, btn.bounds.size) ||
+                fabs(bg.frame.origin.x) > 0.01 || fabs(bg.frame.origin.y) > 0.01) {
+                bg.frame = btn.bounds;
+            }
             // 【v2.2.19】兜底：已创建但上轮延迟插入没落地（视图曾被摘出窗口）
             if (bg.superview != btn) LNBDeferAttachButtonBG(btn, bg);
             return;
@@ -1627,6 +1622,6 @@ static void LNBScanAndApplyCards(UIView *root) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
     [[LNBPrefs sharedInstance] reload];
-    LNBTLog(@"v2.2.19 loaded — 按钮素材层延迟挂载（修复放入素材即安全模式；卡片/整屏路径不动）", kBGDirectory);
+    LNBTLog(@"v2.2.20 loaded — 删除按钮素材继承链（没选就不铺纯透出）+ 挂载瞬间/每轮扫描收敛 frame（修卡顿跟不上滑动）", kBGDirectory);
 }
 %end
