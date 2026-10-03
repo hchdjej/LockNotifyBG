@@ -476,7 +476,8 @@ static void LNBPoolDetach(NSString *path) {
 // 列表宿主缓存（全屏背景层的挂载点，弱引用）。
 // 弱引用：列表销毁后自动失效，下次 layout 重新查找。
 static __weak UIView *lnbListHostCache = nil;
-static UIView *LNBGlobalBackgroundHost(UIView *anchor);   // 前向声明（定义在下方）
+static UIView *LNBAnchorToLockRoot(UIView *anchor);       // 前向声明（定义在下方）
+static UIView *LNBGlobalBackgroundHost(UIView *anchor, UIView **outAnchorView);
 
 - (void)layoutSubviews {
     NSNumber *syncing = objc_getAssociatedObject(self, kLNBSyncingKey);
@@ -835,13 +836,75 @@ static void LNBScanButtonsIfNeeded(UIView *root) {
 //      列表容器。取"最近"不取"最大"：避免爬到含壁纸子视图的锁屏根
 //      （插 index 0 会掉到壁纸下面）。列表容器的子视图全是通知内容，
 //      index 0 必在所有卡片之下、背景之上 —— 安全。
-static UIView *LNBGlobalBackgroundHost(UIView *anchor) {
-    for (UIWindow *window in [UIApplication sharedApplication].windows) {
+// 【v2.2.1 挂载点重构】v2.1.2/v2.2.0 实测：锁屏根查找经常落空或 z 位置
+// 不对，整屏层回退到 NC 列表宿主 → 只覆盖列表区域 → 卡片外是静态壁纸。
+// 新策略（按可靠度排序，找到即用）：
+//   ① 在 anchor 所在窗口里 BFS 找类名含 "wallpaper" 的视图 W
+//      （iOS 16 壁纸视图：CSModernWallpaperView / SBWallpaperView 一族），
+//      宿主 = W 的父视图，插入 = 壁纸正上方 —— 结构上必然：铺满（壁纸全屏）、
+//      可见（壁纸之上）、被内容盖住（时钟/通知 z 更高）、不在滚动容器内。
+//   ② 锁屏根 R（anchor 向上第一个 ≥0.9 屏祖先）内找"不含 anchor 的最大
+//      全屏子视图"B —— 大概率是壁纸分支，插入 = B 之上。
+//   ③ 锁屏根 R，atIndex 0。
+//   ④ 旧 NC 宿主兜底。
+// outAnchorView 输出"插入锚点"：非空 → aboveSubview:它；空 → atIndex:0。
+static UIView *LNBGlobalBackgroundHost(UIView *anchor, UIView **outAnchorView) {
+    if (outAnchorView) *outAnchorView = nil;
+
+    UIWindow *win = anchor.window;
+    NSArray<UIWindow *> *windows = win ? @[win] : [UIApplication sharedApplication].windows;
+
+    // ── 策略①：壁纸视图定位 ──
+    for (UIWindow *window in windows) {
         if (window.isHidden || window.alpha < 0.01) continue;
         NSMutableArray *queue = [NSMutableArray arrayWithObject:window];
-        while (queue.count > 0) {
+        NSInteger steps = 0;
+        while (queue.count > 0 && steps < 1024) {
             UIView *view = queue.firstObject;
             [queue removeObjectAtIndex:0];
+            steps++;
+            if (![view isKindOfClass:[LNBBGView class]] &&
+                [NSStringFromClass(view.class).lowercaseString containsString:@"wallpaper"] &&
+                view.superview) {
+                if (outAnchorView) *outAnchorView = view;
+                return view.superview;
+            }
+            for (UIView *sub in view.subviews) [queue addObject:sub];
+        }
+    }
+
+    // ── 策略②③：锁屏根 ──
+    UIView *root = LNBAnchorToLockRoot(anchor);
+    if (root) {
+        CGSize screen = root.bounds.size;
+        // ② 不含 anchor 的最大全屏子视图（疑似壁纸分支）
+        UIView *best = nil;
+        CGFloat bestArea = 0;
+        for (UIView *v in root.subviews) {
+            if (anchor && [anchor isDescendantOfView:v]) continue;
+            CGSize bs = v.bounds.size;
+            if (bs.width >= screen.width * 0.9 && bs.height >= screen.height * 0.9) {
+                CGFloat area = bs.width * bs.height;
+                if (area > bestArea) { best = v; bestArea = area; }
+            }
+        }
+        if (best) {
+            if (outAnchorView) *outAnchorView = best;
+            return root;
+        }
+        // ③ 锁屏根最底层
+        return root;
+    }
+
+    // ── 策略④：旧 NC 宿主兜底（v2.0.4 逻辑）──
+    for (UIWindow *window in windows) {
+        if (window.isHidden || window.alpha < 0.01) continue;
+        NSMutableArray *queue = [NSMutableArray arrayWithObject:window];
+        NSInteger steps = 0;
+        while (queue.count > 0 && steps < 1024) {
+            UIView *view = queue.firstObject;
+            [queue removeObjectAtIndex:0];
+            steps++;
             if ([NSStringFromClass(view.class) hasPrefix:@"NCNotificationList"]) {
                 UIView *host = view;
                 while (host.superview) {
@@ -855,7 +918,7 @@ static UIView *LNBGlobalBackgroundHost(UIView *anchor) {
             for (UIView *sub in view.subviews) [queue addObject:sub];
         }
     }
-    // ② 兜底：anchor 向上爬
+    // anchor 向上爬大祖先（原兜底）
     if (anchor) {
         CGSize screen = [UIScreen mainScreen].bounds.size;
         UIView *p = anchor;
@@ -929,10 +992,9 @@ static void LNBEnsureListBackground(UIView *anchor) {
         return;
     }
 
-    // 宿主：优先"锁屏根"（不在任何滚动/裁剪容器内，折叠/展开/滑动天然不动）；
-    // 找不到时回退旧查找（NC 宿主 / 大祖先）。
-    UIView *host = LNBAnchorToLockRoot(anchor);
-    if (!host) host = LNBGlobalBackgroundHost(anchor);
+    // 【v2.2.1】宿主多级查找（壁纸定位优先），并拿到插入锚点
+    UIView *anchorView = nil;
+    UIView *host = LNBGlobalBackgroundHost(anchor, &anchorView);
     if (!host) return;
 
     // 清理重复挂载（只保留宿主上这一份）
@@ -951,17 +1013,21 @@ static void LNBEnsureListBackground(UIView *anchor) {
         bg = [[LNBBGView alloc] initWithFrame:host.bounds];
         bg.tag = kGlobalBGViewTag;
         bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        // 【v2.2.1】挂载诊断日志：下次实测 syslog 里直接看挂到哪了
+        LNBTLog(@"整屏层挂载：host=%@ bounds=%@ 插入=%@",
+                NSStringFromClass(host.class),
+                NSStringFromCGRect(host.bounds),
+                anchorView ? [NSStringFromClass(anchorView.class) stringByAppendingString:@" 之上"] : @"index0");
     }
 
     // 每次复查都走一遍素材匹配（setupVideoWith 内部幂等：已挂对直接返回；
     // 文件被更换时 size/mtime 变化 → 自动重建播放器）
     [bg applyMediaWithVideo:fullVid image:fullImg];
 
-    // 插入位置：壁纸之上、锁屏内容之下
+    // 【v2.2.1】插入位置：锚点视图（壁纸）之上；无锚点 → 最底层
     if (bg.superview != host) {
         [bg removeFromSuperview];
-        UIView *wp = LNBFindWallpaperSubview(host);
-        if (wp) [host insertSubview:bg aboveSubview:wp];
+        if (anchorView && anchorView.superview == host) [host insertSubview:bg aboveSubview:anchorView];
         else    [host insertSubview:bg atIndex:0];
     }
 
